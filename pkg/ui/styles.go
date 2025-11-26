@@ -2,10 +2,11 @@ package ui
 
 import "github.com/charmbracelet/lipgloss"
 
+// Dracula-inspired color palette
 var (
-	// --- Palette ---
-	ColorPrimary     = lipgloss.Color("#BD93F9") // Draco Purple
-	ColorSecondary   = lipgloss.Color("#6272A4") // Comment Blue/Gray
+	// Core Colors
+	ColorPrimary     = lipgloss.Color("#BD93F9") // Purple
+	ColorSecondary   = lipgloss.Color("#6272A4") // Blue-Gray
 	ColorBg          = lipgloss.Color("#282A36") // Background
 	ColorBgDark      = lipgloss.Color("#1E1F29") // Darker Background
 	ColorBgHighlight = lipgloss.Color("#44475A") // Selection
@@ -24,10 +25,11 @@ var (
 	ColorTypeEpic    = lipgloss.Color("#BD93F9") // Purple
 	ColorTypeTask    = lipgloss.Color("#F1FA8C") // Yellow
 	ColorTypeChore   = lipgloss.Color("#8BE9FD") // Cyan
+)
 
-	// --- Styles ---
-
-	// Global Layout
+// Global Styles (using lipgloss.NewStyle() instead of deprecated patterns)
+var (
+	// App Layout
 	AppStyle = lipgloss.NewStyle().Padding(0, 0)
 
 	// Panels
@@ -48,8 +50,11 @@ var (
 			Border(lipgloss.HiddenBorder(), false, false, false, true).
 			BorderForeground(ColorBg)
 
-	SelectedItemStyle = ItemStyle.Copy().
+	SelectedItemStyle = lipgloss.NewStyle().
+				PaddingLeft(1).
+				PaddingRight(1).
 				Background(ColorBgHighlight).
+				Border(lipgloss.HiddenBorder(), false, false, false, true).
 				BorderForeground(ColorPrimary).
 				Bold(true)
 
@@ -87,6 +92,7 @@ var (
 			Padding(0, 1)
 )
 
+// GetStatusColor returns the color for a given status
 func GetStatusColor(s string) lipgloss.Color {
 	switch s {
 	case "open":
@@ -102,6 +108,7 @@ func GetStatusColor(s string) lipgloss.Color {
 	}
 }
 
+// GetTypeIcon returns the emoji and color for an issue type
 func GetTypeIcon(t string) (string, lipgloss.Color) {
 	switch t {
 	case "bug":
@@ -119,18 +126,19 @@ func GetTypeIcon(t string) (string, lipgloss.Color) {
 	}
 }
 
+// GetPriorityIcon returns the emoji for a priority level
 func GetPriorityIcon(p int) string {
 	switch p {
 	case 0:
-		return "🔥"
+		return "🔥" // Critical
 	case 1:
-		return "⚡"
+		return "⚡" // High
 	case 2:
-		return "🔹"
+		return "🔹" // Medium
 	case 3:
-		return "☕"
+		return "☕" // Low
 	case 4:
-		return "💤"
+		return "💤" // Backlog
 	default:
 		return ""
 	}
