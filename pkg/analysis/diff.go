@@ -165,22 +165,30 @@ func CompareSnapshots(from, to *Snapshot) *SnapshotDiff {
 		}
 
 		// Check for status changes
+		isStatusChange := false
 		if fromIssue.Status != model.StatusClosed && toIssue.Status == model.StatusClosed {
 			diff.ClosedIssues = append(diff.ClosedIssues, toIssue)
+			isStatusChange = true
 		} else if fromIssue.Status == model.StatusClosed && toIssue.Status != model.StatusClosed {
 			diff.ReopenedIssues = append(diff.ReopenedIssues, toIssue)
+			isStatusChange = true
 		}
 
 		// Check for other modifications
-		changes := detectChanges(fromIssue, toIssue)
-		if len(changes) > 0 {
-			diff.ModifiedIssues = append(diff.ModifiedIssues, ModifiedIssue{
-				IssueID:  id,
-				Title:    toIssue.Title,
-				Changes:  changes,
-				OldIssue: fromIssue,
-				NewIssue: toIssue,
-			})
+		// If status changed (Closed/Reopened), we treat it as a status transition, not a "Modification"
+		// unless there are OTHER field changes. For simplicity in this diff, we exclude them from ModifiedIssues
+		// to keep the lists disjoint and clearer for the user.
+		if !isStatusChange {
+			changes := detectChanges(fromIssue, toIssue)
+			if len(changes) > 0 {
+				diff.ModifiedIssues = append(diff.ModifiedIssues, ModifiedIssue{
+					IssueID:  id,
+					Title:    toIssue.Title,
+					Changes:  changes,
+					OldIssue: fromIssue,
+					NewIssue: toIssue,
+				})
+			}
 		}
 	}
 
