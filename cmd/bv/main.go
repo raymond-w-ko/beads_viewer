@@ -98,6 +98,10 @@ func main() {
 	forecastLabel := flag.String("forecast-label", "", "Filter forecast by label")
 	forecastSprint := flag.String("forecast-sprint", "", "Filter forecast by sprint ID")
 	forecastAgents := flag.Int("forecast-agents", 1, "Number of parallel agents for capacity calculation")
+	// Capacity simulation flags (bv-160)
+	robotCapacity := flag.Bool("robot-capacity", false, "Output capacity simulation and completion projection as JSON")
+	capacityAgents := flag.Int("agents", 1, "Number of parallel agents for capacity simulation")
+	capacityLabel := flag.String("capacity-label", "", "Filter capacity simulation by label")
 	// Static pages export flags (bv-73f)
 	exportPages := flag.String("export-pages", "", "Export static site to directory (e.g., ./bv-pages)")
 	pagesTitle := flag.String("pages-title", "", "Custom title for static site")
@@ -116,6 +120,9 @@ func main() {
 		_ = forecastLabel
 		_ = forecastSprint
 		_ = forecastAgents
+		_ = robotCapacity
+		_ = capacityAgents
+		_ = capacityLabel
 		_ = labelScope
 
 	envRobot := os.Getenv("BV_ROBOT") == "1"
@@ -222,6 +229,21 @@ func main() {
 		fmt.Println("      Example: bv --robot-forecast bv-123")
 		fmt.Println("      Example: bv --robot-forecast all --forecast-label=backend")
 		fmt.Println("      Example: bv --robot-forecast all --forecast-agents=2")
+		fmt.Println("")
+		fmt.Println("  --robot-capacity [--agents=N] [--capacity-label=X]")
+		fmt.Println("      Outputs capacity simulation and completion projection as JSON.")
+		fmt.Println("      Analyzes work remaining, parallelizability, and bottlenecks.")
+		fmt.Println("      Key fields:")
+		fmt.Println("        - total_minutes: Sum of estimated work across open issues")
+		fmt.Println("        - parallelizable_pct: Percentage that can be parallelized")
+		fmt.Println("        - serial_minutes: Work that must be done sequentially")
+		fmt.Println("        - estimated_days: Projected completion time with N agents")
+		fmt.Println("        - bottlenecks: Issues limiting parallelization")
+		fmt.Println("      Options:")
+		fmt.Println("        --agents=N           Number of parallel agents (default: 1)")
+		fmt.Println("        --capacity-label=X   Filter analysis to label's subgraph")
+		fmt.Println("      Example: bv --robot-capacity --agents=3")
+		fmt.Println("      Example: bv --robot-capacity --capacity-label=backend")
 		fmt.Println("")
 		fmt.Println("  --export-md <file>")
 		fmt.Println("      Generates a readable status report with Mermaid.js visualizations.")
@@ -1957,6 +1979,212 @@ func main() {
 		encoder.SetIndent("", "  ")
 		if outputErr = encoder.Encode(output); outputErr != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding forecast: %v\n", outputErr)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Handle --robot-capacity flag (bv-160)
+	if *robotCapacity {
+		// Build graph stats for analysis
+		analyzer := analysis.NewAnalyzer(issues)
+		graphStats := analyzer.Analyze()
+
+		// Filter issues by label if specified
+		targetIssues := issues
+		if *capacityLabel != "" {
+			filtered := make([]model.Issue, 0)
+			for _, iss := range issues {
+				for _, l := range iss.Labels {
+					if l == *capacityLabel {
+						filtered = append(filtered, iss)
+						break
+					}
+				}
+			}
+			targetIssues = filtered
+		}
+
+		// Calculate open issues only
+		openIssues := make([]model.Issue, 0)
+		issueMap := make(map[string]model.Issue)
+		for _, iss := range targetIssues {
+			issueMap[iss.ID] = iss
+			if iss.Status != model.StatusClosed {
+				openIssues = append(openIssues, iss)
+			}
+		}
+
+		now := time.Now()
+		agents := *capacityAgents
+		if agents <= 0 {
+			agents = 1
+		}
+
+		// Calculate total work remaining
+		medianMinutes := 60 // default
+		totalMinutes := 0
+		for _, iss := range openIssues {
+			eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, iss.ID, 1, now)
+			if err == nil {
+				totalMinutes += eta.EstimatedMinutes
+			}
+		}
+
+		// Analyze parallelizability by finding dependency chains
+		// Serial work = longest chain (critical path)
+		// Parallelizable = work that can run concurrently
+
+		// Build dependency adjacency for open issues
+		blockedBy := make(map[string][]string)  // issue -> its blockers
+		blocks := make(map[string][]string)     // issue -> issues it blocks
+		for _, iss := range openIssues {
+			for _, dep := range iss.Dependencies {
+				if dep == nil {
+					continue
+				}
+				depID := dep.DependsOnID
+				if _, exists := issueMap[depID]; exists {
+					blockedBy[iss.ID] = append(blockedBy[iss.ID], depID)
+					blocks[depID] = append(blocks[depID], iss.ID)
+				}
+			}
+		}
+
+		// Find issues with no blockers (can start immediately)
+		actionable := make([]string, 0)
+		for _, iss := range openIssues {
+			hasOpenBlocker := false
+			for _, depID := range blockedBy[iss.ID] {
+				if dep, ok := issueMap[depID]; ok && dep.Status != model.StatusClosed {
+					hasOpenBlocker = true
+					break
+				}
+			}
+			if !hasOpenBlocker {
+				actionable = append(actionable, iss.ID)
+			}
+		}
+
+		// Calculate critical path (longest chain)
+		var longestChain []string
+		var dfs func(id string, path []string)
+		visited := make(map[string]bool)
+		dfs = func(id string, path []string) {
+			if visited[id] {
+				return
+			}
+			visited[id] = true
+			path = append(path, id)
+			if len(path) > len(longestChain) {
+				longestChain = make([]string, len(path))
+				copy(longestChain, path)
+			}
+			for _, nextID := range blocks[id] {
+				if dep, ok := issueMap[nextID]; ok && dep.Status != model.StatusClosed {
+					dfs(nextID, path)
+				}
+			}
+			visited[id] = false
+		}
+		for _, startID := range actionable {
+			dfs(startID, nil)
+		}
+
+		// Calculate serial minutes (work on critical path)
+		serialMinutes := 0
+		for _, id := range longestChain {
+			eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, id, 1, now)
+			if err == nil {
+				serialMinutes += eta.EstimatedMinutes
+			}
+		}
+
+		// Parallelizable percentage
+		parallelizablePct := 0.0
+		if totalMinutes > 0 {
+			parallelizablePct = float64(totalMinutes-serialMinutes) / float64(totalMinutes) * 100
+		}
+
+		// Calculate estimated completion with N agents
+		// Serial work must be done sequentially, parallel work can be divided
+		parallelMinutes := totalMinutes - serialMinutes
+		effectiveMinutes := serialMinutes + parallelMinutes/agents
+		estimatedDays := float64(effectiveMinutes) / (60.0 * 8.0) // 8hr workday
+
+		// Find bottlenecks (issues blocking the most other issues)
+		type Bottleneck struct {
+			ID          string   `json:"id"`
+			Title       string   `json:"title"`
+			BlocksCount int      `json:"blocks_count"`
+			Blocks      []string `json:"blocks,omitempty"`
+		}
+		bottlenecks := make([]Bottleneck, 0)
+		for _, iss := range openIssues {
+			if len(blocks[iss.ID]) > 1 {
+				blockedIssues := blocks[iss.ID]
+				bottlenecks = append(bottlenecks, Bottleneck{
+					ID:          iss.ID,
+					Title:       iss.Title,
+					BlocksCount: len(blockedIssues),
+					Blocks:      blockedIssues,
+				})
+			}
+		}
+		// Sort by blocks count descending
+		sort.Slice(bottlenecks, func(i, j int) bool {
+			return bottlenecks[i].BlocksCount > bottlenecks[j].BlocksCount
+		})
+		if len(bottlenecks) > 5 {
+			bottlenecks = bottlenecks[:5]
+		}
+
+		// Build output
+		type CapacityOutput struct {
+			GeneratedAt       time.Time    `json:"generated_at"`
+			Agents            int          `json:"agents"`
+			Label             string       `json:"label,omitempty"`
+			OpenIssueCount    int          `json:"open_issue_count"`
+			TotalMinutes      int          `json:"total_minutes"`
+			TotalDays         float64      `json:"total_days"`
+			SerialMinutes     int          `json:"serial_minutes"`
+			ParallelMinutes   int          `json:"parallel_minutes"`
+			ParallelizablePct float64      `json:"parallelizable_pct"`
+			EstimatedDays     float64      `json:"estimated_days"`
+			CriticalPathLen   int          `json:"critical_path_length"`
+			CriticalPath      []string     `json:"critical_path,omitempty"`
+			ActionableCount   int          `json:"actionable_count"`
+			Actionable        []string     `json:"actionable,omitempty"`
+			Bottlenecks       []Bottleneck `json:"bottlenecks,omitempty"`
+		}
+
+		output := CapacityOutput{
+			GeneratedAt:       now.UTC(),
+			Agents:            agents,
+			OpenIssueCount:    len(openIssues),
+			TotalMinutes:      totalMinutes,
+			TotalDays:         float64(totalMinutes) / (60.0 * 8.0),
+			SerialMinutes:     serialMinutes,
+			ParallelMinutes:   parallelMinutes,
+			ParallelizablePct: parallelizablePct,
+			EstimatedDays:     estimatedDays,
+			CriticalPathLen:   len(longestChain),
+			CriticalPath:      longestChain,
+			ActionableCount:   len(actionable),
+			Actionable:        actionable,
+			Bottlenecks:       bottlenecks,
+		}
+		if *capacityLabel != "" {
+			output.Label = *capacityLabel
+		}
+
+		// Suppress unused variable warning
+		_ = medianMinutes
+
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(output); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding capacity: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
