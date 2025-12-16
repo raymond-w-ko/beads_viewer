@@ -577,6 +577,17 @@ func generateRecommendation(score ImpactScore, unblocksCount int, thresholds Rec
 		signalStrength += score.Breakdown.UrgencyNorm
 	}
 
+	// Check risk signal (bv-82)
+	if score.Breakdown.RiskNorm > 0.4 {
+		if score.Breakdown.RiskExplanation != "" {
+			reasoning = append(reasoning, score.Breakdown.RiskExplanation)
+		} else {
+			reasoning = append(reasoning, "Elevated risk/volatility")
+		}
+		signals++
+		signalStrength += score.Breakdown.RiskNorm
+	}
+
 	// No signals = no recommendation needed
 	if signals == 0 {
 		return nil
@@ -645,8 +656,8 @@ func priorityToScore(priority int) float64 {
 
 // calculateConfidence determines how confident we are in the recommendation
 func calculateConfidence(signals int, strength float64, scoreDelta float64, thresholds RecommendationThresholds) float64 {
-	// Base confidence from number of signals (max 6: PageRank, Betweenness, unblocks, staleness, time-to-impact, urgency)
-	signalConfidence := float64(signals) / 6.0
+	// Base confidence from number of signals (max 7: PageRank, Betweenness, unblocks, staleness, time-to-impact, urgency, risk)
+	signalConfidence := float64(signals) / 7.0
 	if signalConfidence > 1.0 {
 		signalConfidence = 1.0
 	}
