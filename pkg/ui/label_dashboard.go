@@ -2,10 +2,12 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // LabelDashboardModel renders a lightweight table of label health
@@ -28,6 +30,31 @@ func (m *LabelDashboardModel) SetSize(width, height int) {
 
 func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
 	m.labels = labels
+	// Sort by health level (critical first), then blocked desc, then health asc, then name
+	sort.SliceStable(m.labels, func(i, j int) bool {
+		li, lj := m.labels[i], m.labels[j]
+		levelRank := func(l string) int {
+			switch l {
+			case analysis.HealthLevelCritical:
+				return 0
+			case analysis.HealthLevelWarning:
+				return 1
+			default:
+				return 2
+			}
+		}
+		ri, rj := levelRank(li.HealthLevel), levelRank(lj.HealthLevel)
+		if ri != rj {
+			return ri < rj
+		}
+		if li.Blocked != lj.Blocked {
+			return li.Blocked > lj.Blocked
+		}
+		if li.Health != lj.Health {
+			return li.Health < lj.Health
+		}
+		return li.Label < lj.Label
+	})
 	if m.cursor >= len(labels) {
 		m.cursor = len(labels) - 1
 		if m.cursor < 0 {
@@ -76,13 +103,7 @@ func (m LabelDashboardModel) View() string {
 	b.WriteString("\n")
 
 	for i, lh := range m.labels {
-		row := []string{
-			lh.Label,
-			fmt.Sprintf("%3d (%s)", lh.Health, lh.HealthLevel),
-			fmt.Sprintf("%d", lh.Blocked),
-			fmt.Sprintf("%d/%d", lh.Velocity.ClosedLast7Days, lh.Velocity.ClosedLast30Days),
-			fmt.Sprintf("%d", lh.Freshness.StaleCount),
-		}
+		row := m.getRowCells(lh)
 		selected := i == m.cursor
 		b.WriteString(m.renderRow(row, widths, false, selected))
 		if i != len(m.labels)-1 {
@@ -93,22 +114,28 @@ func (m LabelDashboardModel) View() string {
 	return b.String()
 }
 
+// getRowCells returns the fully rendered (colored) cells for a label row
+func (m LabelDashboardModel) getRowCells(lh analysis.LabelHealth) []string {
+	return []string{
+		m.renderLabelCell(lh),
+		m.renderHealthCell(lh),
+		m.renderBlockedCell(lh),
+		fmt.Sprintf("%d/%d", lh.Velocity.ClosedLast7Days, lh.Velocity.ClosedLast30Days),
+		fmt.Sprintf("%d", lh.Freshness.StaleCount),
+	}
+}
+
 func (m LabelDashboardModel) computeColumnWidths(headers []string) []int {
 	widths := make([]int, len(headers))
 	for i, h := range headers {
-		widths[i] = len(h)
+		widths[i] = lipgloss.Width(h)
 	}
 	for _, lh := range m.labels {
-		cells := []string{
-			lh.Label,
-			fmt.Sprintf("%3d (%s)", lh.Health, lh.HealthLevel),
-			fmt.Sprintf("%d", lh.Blocked),
-			fmt.Sprintf("%d/%d", lh.Velocity.ClosedLast7Days, lh.Velocity.ClosedLast30Days),
-			fmt.Sprintf("%d", lh.Freshness.StaleCount),
-		}
+		cells := m.getRowCells(lh)
 		for i, c := range cells {
-			if len(c) > widths[i] {
-				widths[i] = len(c)
+			w := lipgloss.Width(c)
+			if w > widths[i] {
+				widths[i] = w
 			}
 		}
 	}
@@ -132,9 +159,11 @@ func (m LabelDashboardModel) computeColumnWidths(headers []string) []int {
 func (m LabelDashboardModel) renderRow(cells []string, widths []int, header bool, selected bool) string {
 	var parts []string
 	for i, cell := range cells {
-		cell = localTruncate(cell, widths[i])
-		cell = padRight(cell, widths[i])
-		parts = append(parts, cell)
+		// Use lipgloss to handle width (padding) and max width (truncation)
+		// Note: MaxWidth might wrap, so we ensure no newlines are introduced if possible,
+		// but standard table cells usually single line.
+		style := lipgloss.NewStyle().Width(widths[i]).MaxWidth(widths[i])
+		parts = append(parts, style.Render(cell))
 	}
 	row := strings.Join(parts, " ")
 	if header {
@@ -146,20 +175,47 @@ func (m LabelDashboardModel) renderRow(cells []string, widths []int, header bool
 	return m.theme.Base.Render(row)
 }
 
-func padRight(s string, width int) string {
-	if len(s) >= width {
-		return s
+func (m LabelDashboardModel) renderLabelCell(lh analysis.LabelHealth) string {
+	indicator := ""
+	if lh.HealthLevel == analysis.HealthLevelCritical {
+		indicator = " !"
+	} else if lh.Blocked > 0 {
+		indicator = " ⛔"
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return lh.Label + indicator
 }
 
-// localTruncate avoids clobbering the pkg-level truncate used elsewhere
-func localTruncate(s string, width int) string {
-	if width <= 0 || len(s) <= width {
-		return s
+func (m LabelDashboardModel) renderHealthCell(lh analysis.LabelHealth) string {
+	barWidth := 10
+	filled := int(float64(barWidth) * float64(lh.Health) / 100.0)
+	if filled < 0 {
+		filled = 0
 	}
-	if width <= 1 {
-		return s[:width]
+	if filled > barWidth {
+		filled = barWidth
 	}
-	return s[:width-1] + "…"
+	filledStr := strings.Repeat("█", filled)
+	blankStr := strings.Repeat("░", barWidth-filled)
+	bar := filledStr + blankStr
+
+	style := m.theme.Base
+	switch lh.HealthLevel {
+	case analysis.HealthLevelHealthy:
+		style = style.Foreground(m.theme.Open)
+	case analysis.HealthLevelWarning:
+		style = style.Foreground(m.theme.Feature) // orange-ish
+	default:
+		style = style.Foreground(m.theme.Blocked)
+	}
+
+	return fmt.Sprintf("%3d %s", lh.Health, style.Render(bar))
 }
+
+func (m LabelDashboardModel) renderBlockedCell(lh analysis.LabelHealth) string {
+	if lh.Blocked == 0 {
+		return "0"
+	}
+	return m.theme.Base.Foreground(m.theme.Blocked).Bold(true).Render(fmt.Sprintf("%d", lh.Blocked))
+}
+
+
