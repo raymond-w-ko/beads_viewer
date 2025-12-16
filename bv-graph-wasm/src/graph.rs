@@ -485,6 +485,53 @@ impl DiGraph {
         let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
         open_blocker_count(self, node, &closed)
     }
+
+    // ========================================================================
+    // What-If simulation (cascade impact analysis)
+    // ========================================================================
+
+    /// What-if analysis: compute cascade impact of closing a node.
+    /// Returns JSON with direct_unblocks, transitive_unblocks, unblocked_ids, cascade_ids, parallel_gain.
+    /// closed_set is an array of bytes where non-zero means closed.
+    #[wasm_bindgen(js_name = whatIfClose)]
+    pub fn what_if_close(&self, node: usize, closed_set: &[u8]) -> JsValue {
+        use crate::whatif::what_if_close;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let result = what_if_close(self, node, &closed);
+        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+
+    /// Batch what-if: compute impact of closing multiple nodes together.
+    /// Returns JSON with combined cascade impact.
+    #[wasm_bindgen(js_name = whatIfCloseBatch)]
+    pub fn what_if_close_batch(&self, nodes: &[usize], closed_set: &[u8]) -> JsValue {
+        use crate::whatif::what_if_close_batch;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let result = what_if_close_batch(self, nodes, &closed);
+        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+
+    /// Top N issues by cascade impact.
+    /// Only considers currently actionable nodes.
+    /// Returns JSON array of {node, result} sorted by transitive_unblocks.
+    #[wasm_bindgen(js_name = topWhatIf)]
+    pub fn top_what_if(&self, closed_set: &[u8], limit: usize) -> JsValue {
+        use crate::whatif::top_what_if;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let results = top_what_if(self, &closed, limit);
+        serde_wasm_bindgen::to_value(&results).unwrap_or(JsValue::NULL)
+    }
+
+    /// All issues with cascade impact, sorted by impact.
+    /// Considers all open nodes (not just actionable).
+    /// Returns JSON array of {node, result} sorted by transitive_unblocks.
+    #[wasm_bindgen(js_name = allWhatIf)]
+    pub fn all_what_if(&self, closed_set: &[u8], limit: usize) -> JsValue {
+        use crate::whatif::all_what_if;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let results = all_what_if(self, &closed, limit);
+        serde_wasm_bindgen::to_value(&results).unwrap_or(JsValue::NULL)
+    }
 }
 
 // Internal methods (not exposed to WASM)
