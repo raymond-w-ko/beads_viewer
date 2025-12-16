@@ -90,6 +90,9 @@ func main() {
 	historySince := flag.String("history-since", "", "Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01')")
 	historyLimit := flag.Int("history-limit", 500, "Max commits to analyze (0 = unlimited)")
 	minConfidence := flag.Float64("min-confidence", 0.0, "Filter correlations by minimum confidence (0.0-1.0)")
+	// Sprint flags (bv-156)
+	robotSprintList := flag.Bool("robot-sprint-list", false, "Output sprints as JSON")
+	robotSprintShow := flag.String("robot-sprint-show", "", "Output specific sprint details as JSON")
 	// Static pages export flags (bv-73f)
 	exportPages := flag.String("export-pages", "", "Export static site to directory (e.g., ./bv-pages)")
 	pagesTitle := flag.String("pages-title", "", "Custom title for static site")
@@ -186,6 +189,19 @@ func main() {
 		fmt.Println("      - --min-confidence <0.0-1.0>: Filter by minimum confidence score")
 		fmt.Println("      Example: bv --robot-history --history-since '30 days ago'")
 		fmt.Println("      Example: bv --robot-history --min-confidence 0.7")
+		fmt.Println("")
+		fmt.Println("  --robot-sprint-list")
+		fmt.Println("      Outputs all sprints as JSON for planning and forecasting.")
+		fmt.Println("      Key fields:")
+		fmt.Println("      - generated_at: Timestamp of the output")
+		fmt.Println("      - sprint_count: Number of sprints")
+		fmt.Println("      - sprints: Array of sprint objects (id, name, start_date, end_date, bead_ids)")
+		fmt.Println("      Example: bv --robot-sprint-list")
+		fmt.Println("")
+		fmt.Println("  --robot-sprint-show <id>")
+		fmt.Println("      Outputs details for a specific sprint as JSON.")
+		fmt.Println("      Returns the full sprint object with all fields.")
+		fmt.Println("      Example: bv --robot-sprint-show sprint-1")
 		fmt.Println("")
 		fmt.Println("  --export-md <file>")
 		fmt.Println("      Generates a readable status report with Mermaid.js visualizations.")
@@ -1710,6 +1726,61 @@ func main() {
 		if err := encoder.Encode(report); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding history report: %v\n", err)
 			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Handle --robot-sprint-list and --robot-sprint-show flags (bv-156)
+	if *robotSprintList || *robotSprintShow != "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		sprints, err := loader.LoadSprints(cwd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading sprints: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *robotSprintShow != "" {
+			// Find specific sprint
+			var found *model.Sprint
+			for i := range sprints {
+				if sprints[i].ID == *robotSprintShow {
+					found = &sprints[i]
+					break
+				}
+			}
+			if found == nil {
+				fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotSprintShow)
+				os.Exit(1)
+			}
+			// Output single sprint as JSON
+			encoder := json.NewEncoder(os.Stdout)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(found); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding sprint: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			// Output all sprints as JSON
+			output := struct {
+				GeneratedAt time.Time      `json:"generated_at"`
+				SprintCount int            `json:"sprint_count"`
+				Sprints     []model.Sprint `json:"sprints"`
+			}{
+				GeneratedAt: time.Now().UTC(),
+				SprintCount: len(sprints),
+				Sprints:     sprints,
+			}
+			encoder := json.NewEncoder(os.Stdout)
+			encoder.SetIndent("", "  ")
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding sprints: %v\n", err)
+				os.Exit(1)
+			}
 		}
 		os.Exit(0)
 	}
