@@ -1612,7 +1612,7 @@ func TestComputeAllLabelHealthIntegration(t *testing.T) {
 		{ID: "bv-6", Labels: []string{"critical"}, Status: model.StatusOpen, UpdatedAt: old},
 	}
 
-	result := ComputeAllLabelHealth(issues, cfg, now)
+	result := ComputeAllLabelHealth(issues, cfg, now, nil)
 
 	// Should have all labels
 	if len(result.Labels) != 3 {

@@ -44,7 +44,8 @@ func ComputeAttentionView(issues []model.Issue, width int) (string, error) {
 	}
 	for i := 0; i < limit; i++ {
 		s := result.Labels[i]
-	reason := fmt.Sprintf("blocked=%d stale=%d vel=%.2f", s.BlockImpact, s.StaleCount, s.VelocityFactor)
+		// Use BlockedCount (int) instead of BlockImpact (float)
+		reason := fmt.Sprintf("blocked=%d stale=%d vel=%.1f", s.BlockedCount, s.StaleCount, s.VelocityFactor)
 		row([]string{
 			fmt.Sprintf("%d", i+1),
 			s.Label,

@@ -537,16 +537,17 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	sort.Strings(labels.Labels)
 
 	// Precompute stats once for efficiency if not provided
-	var fullStats GraphStats
+	var fullStats *GraphStats
 	if stats != nil {
-		fullStats = *stats
+		fullStats = stats
 	} else {
 		analyzer := NewAnalyzer(issues)
-		fullStats = analyzer.Analyze()
+		s := analyzer.Analyze()
+		fullStats = &s
 	}
 
 	for _, label := range labels.Labels {
-		health := ComputeLabelHealthForLabel(label, issues, cfg, now, &fullStats)
+		health := ComputeLabelHealthForLabel(label, issues, cfg, now, fullStats)
 		result.Labels = append(result.Labels, health)
 		summary := LabelSummary{
 			Label:          label,
