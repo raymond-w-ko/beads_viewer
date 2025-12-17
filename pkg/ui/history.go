@@ -1523,7 +1523,8 @@ func (h *HistoryModel) renderCommitDetail(commit correlation.CorrelatedCommit, w
 		authorStyle.Render(commit.Author),
 		dateStr,
 	)
-	if width > 10 && len(authorLine) > width-2 {
+	// Use lipgloss.Width for accurate visual width (handles ANSI escape codes)
+	if width > 10 && lipgloss.Width(authorLine) > width-2 {
 		// Truncate author name if needed
 		maxAuthor := width - 30
 		if maxAuthor < 10 {
@@ -1692,13 +1693,14 @@ func authorInitials(name string) string {
 		return "??"
 	}
 	if len(parts) == 1 {
-		// Single name - take first two chars
-		if len(parts[0]) >= 2 {
-			return strings.ToUpper(parts[0][:2])
+		// Single name - take first two runes (Unicode-safe)
+		runes := []rune(parts[0])
+		if len(runes) >= 2 {
+			return strings.ToUpper(string(runes[:2]))
 		}
-		return strings.ToUpper(parts[0])
+		return strings.ToUpper(string(runes))
 	}
-	// Multi-part name - first char of first and last parts
+	// Multi-part name - first rune of first and last parts
 	first := string([]rune(parts[0])[0])
 	last := string([]rune(parts[len(parts)-1])[0])
 	return strings.ToUpper(first + last)
