@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -128,6 +129,21 @@ func (m TutorialModel) View() string {
 	// Header
 	header := m.renderHeader(currentPage, len(pages))
 	b.WriteString(header)
+	b.WriteString("\n")
+
+	// Separator line
+	sepStyle := r.NewStyle().Foreground(m.theme.Border)
+	b.WriteString(sepStyle.Render(strings.Repeat("─", contentWidth+4)))
+	b.WriteString("\n")
+
+	// Page title and section
+	pageTitleStyle := r.NewStyle().Bold(true).Foreground(m.theme.Primary)
+	sectionStyle := r.NewStyle().Foreground(m.theme.Subtext).Italic(true)
+	pageTitle := pageTitleStyle.Render(currentPage.Title)
+	if currentPage.Section != "" {
+		pageTitle += sectionStyle.Render(" — " + currentPage.Section)
+	}
+	b.WriteString(pageTitle)
 	b.WriteString("\n\n")
 
 	// Content area (with optional TOC)
@@ -158,7 +174,7 @@ func (m TutorialModel) View() string {
 	return modalStyle.Render(b.String())
 }
 
-// renderHeader renders the tutorial header with title and page indicator.
+// renderHeader renders the tutorial header with title and progress bar.
 func (m TutorialModel) renderHeader(page TutorialPage, totalPages int) string {
 	r := m.theme.Renderer
 
@@ -166,19 +182,35 @@ func (m TutorialModel) renderHeader(page TutorialPage, totalPages int) string {
 		Bold(true).
 		Foreground(m.theme.Primary)
 
-	subtitleStyle := r.NewStyle().
-		Foreground(m.theme.Subtext)
+	// Progress indicator: [2/15] ███░░░
+	pageNum := m.currentPage + 1
+	progressText := r.NewStyle().
+		Foreground(m.theme.Subtext).
+		Render(fmt.Sprintf("[%d/%d]", pageNum, totalPages))
 
-	pageIndicator := r.NewStyle().
-		Foreground(m.theme.Muted).
-		Render(strings.Repeat("●", m.currentPage+1) + strings.Repeat("○", totalPages-m.currentPage-1))
-
-	title := titleStyle.Render("📚 " + page.Title)
-	if page.Section != "" {
-		title += subtitleStyle.Render(" — " + page.Section)
+	// Visual progress bar
+	barWidth := 10
+	filledWidth := 0
+	if totalPages > 0 {
+		filledWidth = (pageNum * barWidth) / totalPages
 	}
+	if filledWidth > barWidth {
+		filledWidth = barWidth
+	}
+	progressBar := r.NewStyle().
+		Foreground(m.theme.Open). // Using Open (green) for progress
+		Render(strings.Repeat("█", filledWidth)) +
+		r.NewStyle().
+			Foreground(m.theme.Muted).
+			Render(strings.Repeat("░", barWidth-filledWidth))
 
-	return lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", pageIndicator)
+	// Title
+	title := titleStyle.Render("📚 beads_viewer Tutorial")
+
+	// Calculate spacing to align progress to the right
+	headerContent := title + "  " + progressText + " " + progressBar
+
+	return headerContent
 }
 
 // renderContent renders the page content with scroll handling.
@@ -242,12 +274,19 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 		Bold(true).
 		Foreground(m.theme.Primary)
 
+	sectionStyle := r.NewStyle().
+		Foreground(m.theme.Secondary).
+		Bold(true)
+
 	itemStyle := r.NewStyle().
 		Foreground(m.theme.Subtext)
 
 	selectedStyle := r.NewStyle().
 		Bold(true).
 		Foreground(m.theme.Primary)
+
+	viewedStyle := r.NewStyle().
+		Foreground(m.theme.Open)
 
 	var b strings.Builder
 	b.WriteString(headerStyle.Render("Contents"))
@@ -259,25 +298,31 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 		if page.Section != currentSection && page.Section != "" {
 			currentSection = page.Section
 			b.WriteString("\n")
-			b.WriteString(r.NewStyle().Foreground(m.theme.Muted).Italic(true).Render(currentSection))
+			b.WriteString(sectionStyle.Render("▸ " + currentSection))
 			b.WriteString("\n")
 		}
 
-		// Page entry
-		prefix := "  "
+		// Page entry with indentation under section
+		prefix := "   "
 		style := itemStyle
 		if i == m.currentPage {
-			prefix = "▶ "
+			prefix = " ▶ "
 			style = selectedStyle
+		}
+
+		// Truncate long titles
+		title := page.Title
+		if len(title) > 14 {
+			title = title[:12] + "…"
 		}
 
 		// Viewed indicator
 		viewed := ""
 		if m.progress[page.ID] {
-			viewed = " ✓"
+			viewed = viewedStyle.Render(" ✓")
 		}
 
-		b.WriteString(style.Render(prefix + page.Title + viewed))
+		b.WriteString(style.Render(prefix+title) + viewed)
 		b.WriteString("\n")
 	}
 
@@ -288,19 +333,27 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 func (m TutorialModel) renderFooter(totalPages int) string {
 	r := m.theme.Renderer
 
-	hintStyle := r.NewStyle().
-		Foreground(m.theme.Subtext).
-		Italic(true)
+	keyStyle := r.NewStyle().
+		Bold(true).
+		Foreground(m.theme.Primary)
 
+	descStyle := r.NewStyle().
+		Foreground(m.theme.Subtext)
+
+	sepStyle := r.NewStyle().
+		Foreground(m.theme.Muted)
+
+	// Build hints with styled keys
 	hints := []string{
-		"←/→ pages",
-		"j/k scroll",
-		"t TOC",
-		"1-9 jump",
-		"Esc close",
+		keyStyle.Render("←/→") + descStyle.Render(" pages"),
+		keyStyle.Render("j/k") + descStyle.Render(" scroll"),
+		keyStyle.Render("t") + descStyle.Render(" TOC"),
+		keyStyle.Render("1-9") + descStyle.Render(" jump"),
+		keyStyle.Render("Esc") + descStyle.Render(" close"),
 	}
 
-	return hintStyle.Render(strings.Join(hints, " • "))
+	sep := sepStyle.Render(" │ ")
+	return strings.Join(hints, sep)
 }
 
 // renderEmptyState renders a message when no pages are available.

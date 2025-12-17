@@ -491,3 +491,118 @@ func TestDefaultTutorialPages(t *testing.T) {
 		}
 	}
 }
+
+// Tests for UI Layout & Chrome (bv-h6rq)
+
+func TestTutorialViewProgressBar(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+
+	view := m.View()
+
+	// Should contain progress indicator format [1/N]
+	if !strings.Contains(view, "[1/") {
+		t.Error("View should contain progress indicator [1/N] format")
+	}
+
+	// Should contain progress bar characters
+	if !strings.Contains(view, "█") {
+		t.Error("View should contain filled progress bar character")
+	}
+
+	// Navigate to page 2 and verify progress updates
+	m.NextPage()
+	view = m.View()
+	if !strings.Contains(view, "[2/") {
+		t.Error("View should show [2/N] on second page")
+	}
+}
+
+func TestTutorialViewHeader(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+
+	view := m.View()
+
+	// Should contain app title
+	if !strings.Contains(view, "beads_viewer Tutorial") {
+		t.Error("View should contain app title 'beads_viewer Tutorial'")
+	}
+
+	// Should contain separator line
+	if !strings.Contains(view, "─") {
+		t.Error("View should contain separator line")
+	}
+}
+
+func TestTutorialViewFooter(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+
+	view := m.View()
+
+	// Should contain styled key hints
+	if !strings.Contains(view, "←/→") {
+		t.Error("View should contain page navigation hint")
+	}
+	if !strings.Contains(view, "j/k") {
+		t.Error("View should contain scroll hint")
+	}
+	if !strings.Contains(view, "TOC") {
+		t.Error("View should contain TOC hint")
+	}
+	if !strings.Contains(view, "Esc") {
+		t.Error("View should contain close hint")
+	}
+}
+
+func TestTutorialTOCSectionIndicators(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+	m.tocVisible = true
+
+	view := m.View()
+
+	// Should contain section indicator
+	if !strings.Contains(view, "▸") {
+		t.Error("TOC should contain section indicator ▸")
+	}
+
+	// Should contain current page indicator
+	if !strings.Contains(view, "▶") {
+		t.Error("TOC should contain current page indicator ▶")
+	}
+}
+
+func TestTutorialTOCProgressCheckmarks(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+	m.tocVisible = true
+
+	// Mark intro as viewed
+	m.MarkViewed("intro")
+
+	view := m.View()
+
+	// Should contain checkmark for viewed page
+	if !strings.Contains(view, "✓") {
+		t.Error("TOC should show checkmark for viewed pages")
+	}
+}
+
+func TestTutorialPageTitleDisplay(t *testing.T) {
+	m := newTestTutorialModel()
+	m.SetSize(80, 24)
+
+	view := m.View()
+
+	// Should show current page title
+	if !strings.Contains(view, "Welcome to bv") {
+		t.Error("View should contain current page title")
+	}
+
+	// Should show section info
+	if !strings.Contains(view, "Getting Started") {
+		t.Error("View should contain section name")
+	}
+}
