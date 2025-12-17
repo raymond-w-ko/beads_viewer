@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // DefaultIndexPath returns the default semantic index path under the given project directory.
@@ -35,16 +36,31 @@ func (s IndexSyncStats) Changed() bool {
 }
 
 // LoadOrNewVectorIndex loads an existing vector index if present, otherwise creates a new one.
-// The returned boolean indicates whether a file was loaded.
+// If loading fails due to corruption, it backs up the corrupt file and returns a new empty index.
 func LoadOrNewVectorIndex(path string, dim int) (*VectorIndex, bool, error) {
 	idx, err := LoadVectorIndex(path)
 	if err == nil {
 		return idx, true, nil
 	}
-	if !os.IsNotExist(err) {
-		return nil, false, fmt.Errorf("load vector index: %w", err)
+	
+	if os.IsNotExist(err) {
+		return NewVectorIndex(dim), false, nil
 	}
-	return NewVectorIndex(dim), false, nil
+
+	// File exists but failed to load - likely corrupt
+	// Attempt to back it up
+	backupPath := path + ".corrupt-" + fmt.Sprintf("%d", time.Now().Unix())
+	if renameErr := os.Rename(path, backupPath); renameErr == nil {
+		// Successfully backed up, return new index
+		// Note: We return error as nil here because we recovered, but the caller might want to know?
+		// We'll return false for loaded, and nil for error, effectively resetting.
+		// Ideally we'd log this, but this function is low-level.
+		// Let's rely on the fact that 'loaded=false' implies we started fresh.
+		return NewVectorIndex(dim), false, nil
+	}
+
+	// If rename failed (e.g. permissions), we return the original error
+	return nil, false, fmt.Errorf("load vector index (and backup failed): %w", err)
 }
 
 // SyncVectorIndex updates idx to match docs using embedder, incrementally embedding only changed items.
