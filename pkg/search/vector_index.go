@@ -341,7 +341,11 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 	results := make([]SearchResult, 0, min(k, len(ids)))
 
 	for _, issueID := range ids {
-		entry := idx.entries[issueID]
+		entry, ok := idx.entries[issueID]
+		if !ok {
+			// This can happen if the issue was removed concurrently between sortedIDs() and RLock()
+			continue
+		}
 		score := dotFloat32(query, entry.Vector)
 		insertTopK(&results, SearchResult{IssueID: issueID, Score: score}, k)
 	}
