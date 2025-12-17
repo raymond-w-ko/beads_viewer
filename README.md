@@ -78,7 +78,7 @@ Don't just read the title. `bv` gives you the full picture:
 
 ### 🛠️ Quick Actions
 *   **Export:** Press `E` to export all issues to a timestamped Markdown file with Mermaid diagrams.
-*   **Graph Snapshot (CLI):** `bv --export-graph graph.svg` (or `.png`) writes a static image of the current dependency graph plus a mini summary block (data hash, node/edge counts, top bottleneck). Honors recipes/workspace filters and supports spacing presets via `--graph-preset compact|roomy`.
+*   **Graph Export (CLI):** `bv --robot-graph` outputs the dependency graph as JSON, DOT (Graphviz), or Mermaid format. Use `--graph-format=dot` for rendering with Graphviz, or `--graph-root=ID --graph-depth=3` to extract focused subgraphs.
 *   **Copy:** Press `C` to copy the selected issue as formatted Markdown to your clipboard.
 *   **Edit:** Press `O` to open the `.beads/beads.jsonl` file in your preferred GUI editor.
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison.
@@ -523,20 +523,52 @@ graph TD
 
 ---
 
-## 📸 Graph Snapshot Export (PNG/SVG)
+## 📸 Graph Export (`--robot-graph`)
 
-Need a quick, shareable picture of the dependency graph for another agent or a status deck? Run:
+Export the dependency graph in multiple formats for visualization, documentation, or integration with other tools:
 
 ```bash
-bv --export-graph out/graph.svg         # format inferred from extension
-bv --export-graph out/graph.png --graph-preset roomy
+bv --robot-graph                              # JSON (default)
+bv --robot-graph --graph-format=dot           # Graphviz DOT
+bv --robot-graph --graph-format=mermaid       # Mermaid diagram
+
+# Focused subgraph extraction
+bv --robot-graph --graph-root=bv-123          # Subgraph from specific root
+bv --robot-graph --graph-root=bv-123 --graph-depth=3  # Limited depth
 ```
 
-Features:
-- **Self-contained summary block:** embeds `data_hash`, node/edge counts, and the top bottleneck so artifacts can be correlated with robot outputs.
-- **Recipe-aware:** applies the same filters you passed via `--recipe`/`--workspace`, keeping exports scoped.
-- **Legend + colors:** status-colored nodes (open/in-progress/blocked/closed) and a concise legend so agents understand the encoding without rereading this README.
-- **Deterministic layout:** stable ordering by critical-path level then PageRank, so two exports for the same data hash look identical.
+### Output Formats
+
+| Format | Use Case | Rendering |
+|--------|----------|-----------|
+| `json` | Programmatic processing, custom visualization | Parse with jq or code |
+| `dot` | High-quality static images | `dot -Tpng file.dot -o graph.png` |
+| `mermaid` | Embed in Markdown, GitHub rendering | Paste into docs |
+
+### Subgraph Extraction
+
+For large projects, extract focused views around specific issues:
+
+- **`--graph-root=ID`**: Start from a specific issue and include all its dependencies and dependents
+- **`--graph-depth=N`**: Limit traversal to N levels (0 = unlimited)
+
+### JSON Schema
+
+```json
+{
+  "nodes": [
+    { "id": "bv-123", "title": "Fix auth", "status": "open", "priority": 1 }
+  ],
+  "edges": [
+    { "from": "bv-124", "to": "bv-123", "type": "blocks" }
+  ],
+  "metadata": {
+    "data_hash": "abc123",
+    "node_count": 45,
+    "edge_count": 62
+  }
+}
+```
 
 ---
 
@@ -1353,7 +1385,11 @@ Launches an interactive wizard that guides you through:
 ```bash
 bv --export-pages ./bv-pages                    # Export to directory
 bv --export-pages ./bv-pages --pages-title "Sprint 42 Status"
-bv --export-pages ./bv-pages --pages-include-closed
+bv --export-pages ./bv-pages --pages-exclude-closed   # Omit closed issues
+bv --export-pages ./bv-pages --pages-exclude-history  # Omit git history
+
+# Preview an existing bundle without regenerating
+bv --preview-pages ./bv-pages                   # Serve at localhost:9000
 ```
 
 ### What Gets Generated
@@ -1389,6 +1425,77 @@ bv --export-pages ./bv-pages --pages-include-closed
 
 ---
 
+## 🚨 Alerts System: Proactive Health Monitoring
+
+The Alerts System surfaces potential problems before they become blockers. It combines **drift detection** (changes from baseline) with **proactive analysis** (pattern-based warnings).
+
+### Alert Types
+
+| Type | Trigger | Severity | Example |
+|------|---------|----------|---------|
+| `stale_issue` | No updates in 30+ days | Warning | "BV-123 hasn't been touched since Oct 15" |
+| `blocking_cascade` | Issue blocks 5+ others | Critical | "AUTH-001 is blocking 8 downstream tasks" |
+| `priority_mismatch` | Low priority but high PageRank | Warning | "BV-456 has P3 but ranks #2 in PageRank" |
+| `cycle_introduced` | New circular dependency | Critical | "Cycle detected: A → B → C → A" |
+| `scope_creep` | 20%+ increase in open issues | Info | "Open issues grew from 45 to 58 this week" |
+
+### TUI Integration
+
+Press `!` to open the **Alerts Panel**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  🚨 ALERTS (3 active)                               [!] close │
+├─────────────────────────────────────────────────────────────┤
+│  ⚠️  WARNING: bv-123 stale for 45 days                       │
+│  🔴 CRITICAL: bv-456 blocks 8 tasks (cascade risk)           │
+│  ℹ️  INFO: Open issues increased 23% this sprint             │
+├─────────────────────────────────────────────────────────────┤
+│  j/k navigate • Enter jump to issue • d dismiss • q close   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Robot Integration
+
+```bash
+# Get all alerts as JSON
+bv --robot-alerts
+
+# Filter by severity (info, warning, critical)
+bv --robot-alerts --severity=critical
+
+# Filter by type
+bv --robot-alerts --alert-type=blocking_cascade
+
+# Filter by affected label
+bv --robot-alerts --alert-label=backend
+```
+
+### Output Schema
+
+```json
+{
+  "alerts": [
+    {
+      "type": "blocking_cascade",
+      "severity": "critical",
+      "issue_id": "bv-456",
+      "message": "Blocks 8 downstream tasks",
+      "blocked_ids": ["bv-101", "bv-102", "..."],
+      "suggested_action": "Prioritize completion or break into smaller tasks"
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "critical": 1,
+    "warning": 1,
+    "info": 1
+  }
+}
+```
+
+---
+
 ## 🤖 Complete CLI Reference
 
 Beyond the interactive TUI, `bv` provides a comprehensive **command-line interface** for scripting, automation, and AI agent integration.
@@ -1421,6 +1528,10 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-suggest` | Hygiene suggestions (deps/dupes/labels/cycles) | Project cleanup automation |
 | `--robot-diff` | JSON diff (with `--diff-since`) | Change tracking |
 | `--robot-recipes` | Available recipe list | Recipe discovery |
+| `--robot-graph` | Dependency graph as JSON/DOT/Mermaid | Graph visualization & export |
+| `--robot-forecast` | ETA predictions per issue | Completion timeline estimates |
+| `--robot-capacity` | Team capacity simulation | Resource planning |
+| `--robot-alerts` | Drift + proactive warnings | Health monitoring |
 | `--robot-help` | Detailed AI agent documentation | Agent onboarding |
 
 ### Time-Travel Commands
@@ -1463,6 +1574,103 @@ bv --recipe .beads/recipes/sprint.yaml
 ```bash
 # Generate Markdown report with Mermaid diagrams
 bv --export-md report.md
+
+# Export priority brief (focused summary)
+bv --priority-brief brief.md
+
+# Export complete agent brief bundle
+bv --agent-brief ./agent-bundle/
+# Creates: triage.json, insights.json, brief.md, helpers.md
+```
+
+### ETA Forecasting & Capacity Planning
+
+```bash
+# Forecast completion ETA for a specific issue
+bv --robot-forecast bv-123
+
+# Forecast all open issues with filtering
+bv --robot-forecast all --forecast-label=backend
+bv --robot-forecast all --forecast-sprint=sprint-1
+bv --robot-forecast all --forecast-agents=2     # Multi-agent parallelism
+
+# Capacity simulation: when will everything be done?
+bv --robot-capacity                              # Default: 1 agent
+bv --robot-capacity --agents=3                   # 3 parallel agents
+bv --robot-capacity --capacity-label=frontend    # Scoped to label
+```
+
+### Alerts & Health Monitoring
+
+```bash
+# Get all alerts (drift warnings + proactive health checks)
+bv --robot-alerts
+
+# Filter by severity
+bv --robot-alerts --severity=critical
+bv --robot-alerts --severity=warning
+
+# Filter by alert type
+bv --robot-alerts --alert-type=stale_issue
+bv --robot-alerts --alert-type=blocking_cascade
+
+# Filter by label scope
+bv --robot-alerts --alert-label=backend
+```
+
+### Triage Grouping (Multi-Agent Coordination)
+
+```bash
+# Group recommendations by execution track (parallel work streams)
+bv --robot-triage --robot-triage-by-track
+
+# Group recommendations by label (domain-focused agents)
+bv --robot-triage --robot-triage-by-label
+```
+
+### Shell Script Emission
+
+Generate executable shell scripts from recommendations for automated workflows:
+
+```bash
+# Emit bash script for top 5 recommendations
+bv --robot-triage --emit-script --script-limit=5
+
+# Different shell formats
+bv --robot-triage --emit-script --script-format=fish
+bv --robot-triage --emit-script --script-format=zsh
+```
+
+### Feedback System (Adaptive Recommendations)
+
+The feedback system learns from your accept/ignore decisions to tune recommendation weights:
+
+```bash
+# Record positive feedback (you worked on this recommendation)
+bv --feedback-accept bv-123
+
+# Record negative feedback (you skipped this recommendation)
+bv --feedback-ignore bv-456
+
+# View current feedback state and weight adjustments
+bv --feedback-show
+
+# Reset feedback to defaults
+bv --feedback-reset
+```
+
+### Baseline & Drift Detection
+
+```bash
+# Save current state as baseline
+bv --save-baseline "Pre-release v2.0"
+
+# Show baseline information
+bv --baseline-info
+
+# Check for drift from baseline
+bv --check-drift                    # Exit codes: 0=OK, 1=critical, 2=warning
+bv --check-drift --robot-drift      # JSON output
 ```
 
 ### Semantic Search
@@ -1902,6 +2110,7 @@ bv
 | | `C` | Copy Issue to Clipboard |
 | | `O` | Open in Editor |
 | **Global** | `?` | Toggle Help Overlay |
+| | `!` | Toggle **Alerts Panel** (proactive warnings) |
 | | `F5` | Recipe Picker |
 | | `w` | Repo Picker (workspace mode) |
 
