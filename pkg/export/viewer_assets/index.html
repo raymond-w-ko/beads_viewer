@@ -1339,9 +1339,119 @@
          class="fixed inset-0 z-40 bg-gray-50 dark:bg-gray-900"
          style="top: 64px;">
 
-      <!-- Graph Canvas - Full viewport -->
-      <div id="graph-container" class="w-full h-full">
+      <!-- Graph Canvas - Full viewport (shrinks when detail pane open) -->
+      <div id="graph-container"
+           class="h-full transition-all duration-300"
+           :class="graphDetailNode ? 'w-[calc(100%-400px)]' : 'w-full'">
         <p class="text-gray-500 dark:text-gray-400 text-center py-8">Graph visualization loading...</p>
+      </div>
+
+      <!-- Detail Pane - Slides in from right when node selected -->
+      <div x-show="graphDetailNode"
+           x-transition:enter="transition ease-out duration-300"
+           x-transition:enter-start="translate-x-full"
+           x-transition:enter-end="translate-x-0"
+           x-transition:leave="transition ease-in duration-200"
+           x-transition:leave-start="translate-x-0"
+           x-transition:leave-end="translate-x-full"
+           class="fixed right-0 top-0 w-[400px] h-full bg-white dark:bg-gray-800 shadow-xl border-l border-gray-200 dark:border-gray-700 overflow-hidden z-50"
+           style="top: 64px;">
+
+        <!-- Detail Header -->
+        <div class="sticky top-0 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+              <span class="px-2 py-0.5 text-xs font-mono rounded"
+                    :class="{
+                      'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300': graphDetailNode?.status === 'open',
+                      'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300': graphDetailNode?.status === 'in_progress',
+                      'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300': graphDetailNode?.status === 'blocked',
+                      'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400': graphDetailNode?.status === 'closed'
+                    }"
+                    x-text="graphDetailNode?.status?.replace('_', ' ')"></span>
+              <code class="text-xs text-gray-500 dark:text-gray-400 truncate" x-text="graphDetailNode?.id"></code>
+            </div>
+            <button @click="graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250)"
+                    class="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+          <h2 class="text-lg font-semibold mt-2 text-gray-900 dark:text-white line-clamp-2" x-text="graphDetailNode?.title"></h2>
+        </div>
+
+        <!-- Detail Content -->
+        <div class="overflow-y-auto h-[calc(100%-140px)] px-4 py-3">
+          <!-- Metadata Grid -->
+          <div class="grid grid-cols-2 gap-3 mb-4 text-sm">
+            <div>
+              <span class="text-gray-500 dark:text-gray-400 text-xs">Priority</span>
+              <div class="font-medium" x-text="'P' + (graphDetailNode?.priority ?? 2)"></div>
+            </div>
+            <div>
+              <span class="text-gray-500 dark:text-gray-400 text-xs">Type</span>
+              <div class="font-medium capitalize" x-text="graphDetailNode?.type || 'task'"></div>
+            </div>
+            <div x-show="graphDetailNode?.assignee">
+              <span class="text-gray-500 dark:text-gray-400 text-xs">Assignee</span>
+              <div class="font-medium" x-text="graphDetailNode?.assignee"></div>
+            </div>
+            <div x-show="graphDetailNode?.blockerCount > 0 || graphDetailNode?.dependentCount > 0">
+              <span class="text-gray-500 dark:text-gray-400 text-xs">Dependencies</span>
+              <div class="font-medium">
+                <span x-show="graphDetailNode?.blockerCount > 0" class="text-red-600 dark:text-red-400" x-text="'⛔ ' + graphDetailNode?.blockerCount + ' blockers'"></span>
+                <span x-show="graphDetailNode?.blockerCount > 0 && graphDetailNode?.dependentCount > 0"> · </span>
+                <span x-show="graphDetailNode?.dependentCount > 0" class="text-blue-600 dark:text-blue-400" x-text="'📤 blocks ' + graphDetailNode?.dependentCount"></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Labels -->
+          <div x-show="graphDetailNode?.labels?.length > 0" class="mb-4">
+            <span class="text-gray-500 dark:text-gray-400 text-xs block mb-1">Labels</span>
+            <div class="flex flex-wrap gap-1">
+              <template x-for="label in (graphDetailNode?.labels || [])">
+                <span class="px-2 py-0.5 text-xs rounded-full bg-beads-100 text-beads-700 dark:bg-beads-900 dark:text-beads-300" x-text="label"></span>
+              </template>
+            </div>
+          </div>
+
+          <!-- Graph Metrics -->
+          <div x-show="graphDetailNode?.pagerank || graphDetailNode?.betweenness" class="mb-4 p-3 bg-gray-50 dark:bg-gray-900 rounded-lg">
+            <span class="text-gray-500 dark:text-gray-400 text-xs block mb-2">Graph Metrics</span>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <div x-show="graphDetailNode?.pagerank">
+                <span class="text-gray-500">PageRank:</span>
+                <span class="font-mono" x-text="graphDetailNode?.pagerank?.toFixed(4)"></span>
+              </div>
+              <div x-show="graphDetailNode?.betweenness">
+                <span class="text-gray-500">Betweenness:</span>
+                <span class="font-mono" x-text="graphDetailNode?.betweenness?.toFixed(4)"></span>
+              </div>
+              <div x-show="graphDetailNode?.inCycle" class="col-span-2">
+                <span class="text-orange-600 dark:text-orange-400">⚠️ Part of dependency cycle</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Markdown Content -->
+          <div class="border-t border-gray-200 dark:border-gray-700 pt-4">
+            <span class="text-gray-500 dark:text-gray-400 text-xs block mb-2">Description</span>
+            <div id="graph-detail-content"
+                 class="prose prose-sm dark:prose-invert max-w-none prose-headings:text-base prose-p:my-2"
+                 x-html="graphDetailNode?.description ? (typeof marked !== 'undefined' ? marked.parse(graphDetailNode.description) : graphDetailNode.description) : '<p class=\'text-gray-400 italic\'>No description</p>'">
+            </div>
+          </div>
+        </div>
+
+        <!-- Detail Footer -->
+        <div class="absolute bottom-0 left-0 right-0 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 px-4 py-2">
+          <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+            <span x-show="graphDetailNode?.createdAt">Created <span x-text="new Date(graphDetailNode?.createdAt).toLocaleDateString()"></span></span>
+            <span x-show="graphDetailNode?.updatedAt">Updated <span x-text="new Date(graphDetailNode?.updatedAt).toLocaleDateString()"></span></span>
+          </div>
+        </div>
       </div>
 
       <!-- Floating Control Panel -->

@@ -243,7 +243,7 @@ class GraphStore {
             priority: null,
             labels: [],
             search: '',
-            showClosed: false
+            showClosed: true  // Default to showing all issues in static export
         };
 
         // Config
@@ -280,6 +280,19 @@ class GraphStore {
 }
 
 const store = new GraphStore();
+
+/**
+ * Helper to force ForceGraph to redraw
+ * ForceGraph doesn't have a .refresh() method - we trigger redraw by
+ * calling .graphData() with the current data which forces a re-render
+ */
+function refreshGraph() {
+    if (!store.graph) return;
+    const currentData = store.graph.graphData();
+    if (currentData) {
+        store.graph.graphData(currentData);
+    }
+}
 
 // ============================================================================
 // LABEL CLUSTERING STATE
@@ -444,8 +457,8 @@ function drawClusterHulls(ctx, globalScale) {
             cx /= hull.length;
             cy /= hull.length;
 
-            // Draw label text
-            const fontSize = Math.max(12, 16 / globalScale);
+            // Draw label text (capped to prevent oversized fonts when zoomed out)
+            const fontSize = Math.min(24, Math.max(12, 16 / globalScale));
             ctx.font = `bold ${fontSize}px 'JetBrains Mono', monospace`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
@@ -640,7 +653,34 @@ export async function initGraph(containerId, options = {}) {
 // DATA LOADING
 // ============================================================================
 
-export function loadData(issues, dependencies) {
+// Pre-computed layout cache
+let precomputedLayout = null;
+
+/**
+ * Load pre-computed graph layout for instant rendering.
+ * This fetches the compact layout file (~30KB) which contains positions and metrics.
+ * @returns {Promise<object|null>} Layout data or null if not available
+ */
+export async function loadPrecomputedLayout() {
+    try {
+        const response = await fetch('data/graph_layout.json');
+        if (!response.ok) return null;
+        precomputedLayout = await response.json();
+        console.log(`[bv-graph] Pre-computed layout: ${precomputedLayout.node_count} nodes`);
+        return precomputedLayout;
+    } catch (e) {
+        console.log('[bv-graph] No pre-computed layout, will use dynamic simulation');
+        return null;
+    }
+}
+
+/**
+ * Load data with optional pre-computed layout for instant rendering.
+ * @param {Array} issues - Issue objects from SQLite
+ * @param {Array} dependencies - Dependency objects from SQLite
+ * @param {object} [layout] - Optional pre-computed layout
+ */
+export function loadData(issues, dependencies, layout = precomputedLayout) {
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
@@ -651,35 +691,68 @@ export function loadData(issues, dependencies) {
         store.nodeIndexMap.set(issue.id, idx);
     });
 
-    // Build WASM graph and compute metrics
+    // Merge pre-computed metrics if available
+    if (layout?.metrics) {
+        issues.forEach(issue => {
+            const m = layout.metrics[issue.id];
+            if (m) {
+                issue._precomputed = {
+                    pagerank: m[0],
+                    betweenness: m[1],
+                    inDegree: m[2],
+                    outDegree: m[3],
+                    inCycle: m[4] === 1
+                };
+            }
+        });
+    }
+
+    // Build WASM graph structure (always, for cycle navigator etc.)
+    // Only skip metric computation if we have pre-computed metrics
     if (store.wasmReady) {
         buildWasmGraph();
-        computeMetrics();
+        if (!layout?.metrics) {
+            computeMetrics();
+        } else {
+            console.log('[bv-graph] Using pre-computed metrics, skipping WASM computation');
+            // Convert pre-computed cycle IDs to WASM indices for cycle navigator compatibility
+            if (layout.cycles && store.wasmGraph) {
+                const cyclesAsIndices = layout.cycles.map(cycle =>
+                    cycle.map(id => store.wasmGraph.nodeIdx(id)).filter(idx => idx !== undefined)
+                ).filter(cycle => cycle.length > 0);
+                store.metrics.cycles = { cycles: cyclesAsIndices, count: cyclesAsIndices.length };
+            }
+        }
     }
 
     // Build label color map for galaxy view
     buildLabelColorMap();
 
-    // Prepare graph data
-    const graphData = prepareGraphData();
+    // Prepare graph data with optional pre-computed positions
+    const graphData = prepareGraphData(layout);
 
     // Update graph
     store.graph.graphData(graphData);
 
-    // Auto-fit after layout settles
-    setTimeout(() => store.graph.zoomToFit(400, 50), 500);
+    // Fit immediately if pre-computed, otherwise wait for simulation
+    if (layout?.positions) {
+        store.graph.zoomToFit(200, 50);
+    } else {
+        setTimeout(() => store.graph.zoomToFit(400, 50), 500);
+    }
 
     // Emit event
     dispatchEvent('dataLoaded', {
         nodeCount: graphData.nodes.length,
         linkCount: graphData.links.length,
-        metrics: store.metrics
+        metrics: store.metrics,
+        precomputed: !!layout
     });
 
     return graphData;
 }
 
-function prepareGraphData() {
+function prepareGraphData(layout = null) {
     const { issues, dependencies, filters, metrics } = store;
 
     // Filter nodes
@@ -723,6 +796,8 @@ function prepareGraphData() {
     // Enrich nodes with computed data
     nodes = nodes.map(issue => {
         const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
+        const pre = issue._precomputed; // Pre-computed metrics from layout
+        const pos = layout?.positions?.[issue.id]; // Pre-computed position
 
         return {
             id: issue.id,
@@ -736,25 +811,28 @@ function prepareGraphData() {
             createdAt: issue.created_at,
             updatedAt: issue.updated_at,
 
-            // Computed metrics
-            pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,
-            betweenness: idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0,
+            // Computed metrics (prefer pre-computed)
+            pagerank: pre?.pagerank ?? (idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0),
+            betweenness: pre?.betweenness ?? (idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0),
             criticalDepth: idx !== undefined && metrics.criticalPath ? metrics.criticalPath[idx] : 0,
             eigenvector: idx !== undefined && metrics.eigenvector ? metrics.eigenvector[idx] : 0,
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
+            inCycle: pre?.inCycle ?? false,
 
-            // Dependency counts
-            blockerCount: dependencies.filter(d => d.issue_id === issue.id).length,
-            dependentCount: dependencies.filter(d => d.depends_on_id === issue.id).length,
+            // Dependency counts (prefer pre-computed)
+            blockerCount: pre?.inDegree ?? dependencies.filter(d => d.issue_id === issue.id).length,
+            dependentCount: pre?.outDegree ?? dependencies.filter(d => d.depends_on_id === issue.id).length,
 
-            // UI state
-            fx: null,
-            fy: null
+            // Position: pre-computed uses fx/fy to skip simulation
+            x: pos ? pos[0] : undefined,
+            y: pos ? pos[1] : undefined,
+            fx: pos ? pos[0] : null,
+            fy: pos ? pos[1] : null
         };
     });
 
-    // Mark cycle nodes
-    if (metrics.cycles?.cycles) {
+    // Mark cycle nodes (if not from pre-computed)
+    if (!layout?.cycles && metrics.cycles?.cycles) {
         const cycleNodes = new Set(metrics.cycles.cycles.flat());
         nodes.forEach(node => {
             const idx = store.wasmGraph?.nodeIdx(node.id);
@@ -878,7 +956,7 @@ function drawNode(node, ctx, globalScale) {
 
     // Priority indicator (flame for P0/P1)
     if (node.priority <= 1 && globalScale > 0.4) {
-        ctx.font = `${Math.max(8, 12 / globalScale)}px sans-serif`;
+        ctx.font = `${Math.min(16, Math.max(8, 12 / globalScale))}px sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
         ctx.shadowBlur = 0;
@@ -887,7 +965,7 @@ function drawNode(node, ctx, globalScale) {
 
     // Cycle warning
     if (node.inCycle && globalScale > 0.4) {
-        ctx.font = `${Math.max(8, 10 / globalScale)}px sans-serif`;
+        ctx.font = `${Math.min(14, Math.max(8, 10 / globalScale))}px sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
         ctx.fillText('\u26A0\uFE0F', node.x, node.y + size + 2);
@@ -895,7 +973,7 @@ function drawNode(node, ctx, globalScale) {
 
     // Label (when zoomed in)
     if (store.config.showLabels && globalScale > store.config.labelZoomThreshold) {
-        const fontSize = Math.max(10, 12 / globalScale);
+        const fontSize = Math.min(16, Math.max(10, 12 / globalScale));
         ctx.font = `${fontSize}px 'JetBrains Mono', monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
@@ -1224,7 +1302,7 @@ function animateWhatIfCascade(sourceNode, result) {
         sourceGraphNode._whatIfState = 'closing';
     }
 
-    store.graph.refresh();
+    refreshGraph();
     dispatchEvent('whatIfStart', { node: sourceNode, result });
 
     // Phase 2: Ripple out to unblocked nodes with staggered animation
@@ -1254,7 +1332,7 @@ function animateWhatIfCascade(sourceNode, result) {
                 }
             });
 
-            store.graph.refresh();
+            refreshGraph();
             dispatchEvent('whatIfUnblock', { nodeId: id, index: i, total: unblockedIds.length });
         }, delay + i * 150);
     });
@@ -1416,7 +1494,7 @@ export function animateCriticalPath(animate = true) {
         // Just highlight all at once
         criticalPathState.path.forEach(id => store.highlightedNodes.add(id));
         highlightCriticalPathLinks();
-        store.graph.refresh();
+        refreshGraph();
         showCriticalPathSummary();
     }
 
@@ -1460,7 +1538,7 @@ function animateCriticalPathTraversal() {
             store.highlightedLinks.add(`${nodeId}-${prevNodeId}`); // Both directions
         }
 
-        store.graph.refresh();
+        refreshGraph();
         dispatchEvent('criticalPathStep', {
             nodeId,
             step: criticalPathState.currentStep,
@@ -1581,7 +1659,7 @@ export function selectNode(node) {
         store.highlightedNodes.add(node.id);
     }
 
-    store.graph.refresh();
+    refreshGraph();
     dispatchEvent('selectionChange', { node });
 }
 
@@ -1590,13 +1668,13 @@ export function clearSelection() {
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
     store.focusedPath = null;
-    store.graph.refresh();
+    refreshGraph();
     dispatchEvent('selectionChange', { node: null });
 }
 
 export function highlightNodes(nodeIds) {
     store.highlightedNodes = new Set(nodeIds);
-    store.graph.refresh();
+    refreshGraph();
 }
 
 export function highlightDependencyPath(node) {
@@ -1631,7 +1709,7 @@ export function highlightDependencyPath(node) {
     });
 
     store.focusedPath = { center: node.id, blockers, dependents };
-    store.graph.refresh();
+    refreshGraph();
 
     dispatchEvent('pathHighlight', { node, blockerCount: blockers.length, dependentCount: dependents.length });
 }
@@ -1643,7 +1721,7 @@ export function highlightCriticalPath() {
     store.highlightedNodes = new Set(
         criticalNodes.map(idx => store.wasmGraph.nodeId(idx)).filter(Boolean)
     );
-    store.graph.refresh();
+    refreshGraph();
 
     dispatchEvent('criticalPathHighlight', { nodeCount: criticalNodes.length });
 }
@@ -1655,7 +1733,7 @@ export function highlightCycles() {
     store.highlightedNodes = new Set(
         [...cycleNodeIndices].map(idx => store.wasmGraph?.nodeId(idx)).filter(Boolean)
     );
-    store.graph.refresh();
+    refreshGraph();
 
     dispatchEvent('cycleHighlight', { cycleCount: store.metrics.cycles.count });
 }
@@ -1910,7 +1988,7 @@ export function clearFilters() {
         priority: null,
         labels: [],
         search: '',
-        showClosed: false
+        showClosed: true  // Reset to showing all issues
     };
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
@@ -2067,7 +2145,7 @@ function applyLabelGalaxyLayout() {
     // Schedule hull computation after layout settles
     setTimeout(() => {
         computeClusterHulls();
-        store.graph.refresh();
+        refreshGraph();
     }, 1000);
 
     dispatchEvent('labelGalaxyActivated', {

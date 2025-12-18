@@ -1779,6 +1779,7 @@ function beadsApp() {
     forceGraphLoading: false,
     forceGraphError: null,
     forceGraphModule: null,
+    graphDetailNode: null, // Currently selected node for detail pane
 
     // Critical path highlighting
     showCriticalPath: false,
@@ -2112,13 +2113,43 @@ function beadsApp() {
           this.forceGraphModule = await import('./graph.js');
         }
 
+        // Load pre-computed layout for instant rendering (~30KB)
+        let precomputedLayout = null;
+        if (this.forceGraphModule.loadPrecomputedLayout) {
+          try {
+            precomputedLayout = await this.forceGraphModule.loadPrecomputedLayout();
+            if (precomputedLayout) {
+              console.log('[ForceGraph] Pre-computed layout loaded - instant rendering enabled');
+            }
+          } catch (layoutErr) {
+            console.log('[ForceGraph] No pre-computed layout, using dynamic simulation');
+          }
+        }
+
         if (!this.forceGraphReady) {
           await this.forceGraphModule.initGraph('graph-container');
           this.forceGraphReady = true;
+
+          // Register event listeners once (inside forceGraphReady check to avoid duplicates)
+          // Events are dispatched on document, so listen there
+          document.addEventListener('bv-graph:nodeClick', (e) => {
+            const node = e.detail?.node;
+            if (node) {
+              this.graphDetailNode = node;
+              console.log('[Viewer] Node selected for detail:', node.id);
+              // Resize graph after detail pane opens (wait for transition)
+              setTimeout(() => this.resizeForceGraph(), 350);
+            }
+          });
+          document.addEventListener('bv-graph:backgroundClick', () => {
+            this.graphDetailNode = null;
+            // Resize graph after detail pane closes
+            setTimeout(() => this.resizeForceGraph(), 250);
+          });
         }
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
-        this.forceGraphModule.loadData(issues, dependencies);
+        this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
 
         // Try to load history data for time-travel feature (bv-z38b)
         try {
@@ -2154,6 +2185,22 @@ function beadsApp() {
         }
       } finally {
         this.forceGraphLoading = false;
+      }
+    },
+
+    /**
+     * Resize the ForceGraph canvas to fit its container
+     * Called when detail pane opens/closes to adjust graph area
+     */
+    resizeForceGraph() {
+      if (!this.forceGraphModule || !this.forceGraphReady) return;
+
+      const container = document.getElementById('graph-container');
+      const graph = this.forceGraphModule.getGraph?.();
+
+      if (container && graph && typeof graph.width === 'function') {
+        graph.width(container.clientWidth);
+        graph.height(container.clientHeight);
       }
     },
 

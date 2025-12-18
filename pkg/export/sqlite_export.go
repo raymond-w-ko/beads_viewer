@@ -147,6 +147,11 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		}
 	}
 
+	// Write pre-computed graph layout for fast client-side rendering
+	if err := e.writeGraphLayout(dataDir); err != nil {
+		return fmt.Errorf("write graph layout: %w", err)
+	}
+
 	// Chunk if needed
 	if err := e.chunkIfNeeded(outputDir, dbPath); err != nil {
 		return fmt.Errorf("chunk database: %w", err)
@@ -614,4 +619,135 @@ func stringSliceContains(slice []string, val string) bool {
 		}
 	}
 	return false
+}
+
+// GraphLayout is a compact representation of pre-computed graph layout data.
+// This is much smaller than full node data (~30KB vs ~200KB) for fast initial load.
+type GraphLayout struct {
+	Positions   map[string][2]float64 `json:"positions"`
+	Metrics     map[string][5]float64 `json:"metrics"`
+	Links       [][2]string           `json:"links"`
+	Cycles      [][]string            `json:"cycles,omitempty"`
+	Version     string                `json:"version"`
+	GeneratedAt string                `json:"generated_at"`
+	NodeCount   int                   `json:"node_count"`
+	EdgeCount   int                   `json:"edge_count"`
+}
+
+// writeGraphLayout generates compact pre-computed graph layout data.
+func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
+	blockedBy := make(map[string][]string)
+	blocks := make(map[string][]string)
+
+	for _, dep := range e.Deps {
+		if dep.Type.IsBlocking() {
+			blockedBy[dep.IssueID] = append(blockedBy[dep.IssueID], dep.DependsOnID)
+			blocks[dep.DependsOnID] = append(blocks[dep.DependsOnID], dep.IssueID)
+		}
+	}
+
+	depth := make(map[string]int)
+	var roots []string
+	for _, issue := range e.Issues {
+		if len(blockedBy[issue.ID]) == 0 {
+			roots = append(roots, issue.ID)
+			depth[issue.ID] = 0
+		}
+	}
+
+	queue := roots
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		currentDepth := depth[current]
+		for _, child := range blocks[current] {
+			if _, visited := depth[child]; !visited {
+				depth[child] = currentDepth + 1
+				queue = append(queue, child)
+			} else if depth[child] < currentDepth+1 {
+				depth[child] = currentDepth + 1
+			}
+		}
+	}
+
+	for _, issue := range e.Issues {
+		if _, visited := depth[issue.ID]; !visited {
+			depth[issue.ID] = 0
+		}
+	}
+
+	depthGroups := make(map[int][]string)
+	maxDepth := 0
+	for id, d := range depth {
+		depthGroups[d] = append(depthGroups[d], id)
+		if d > maxDepth {
+			maxDepth = d
+		}
+	}
+
+	positions := make(map[string][2]float64)
+	xSpacing := 200.0
+	ySpacing := 80.0
+
+	for d := 0; d <= maxDepth; d++ {
+		nodesAtDepth := depthGroups[d]
+		count := len(nodesAtDepth)
+		startY := -float64(count-1) * ySpacing / 2
+		for i, id := range nodesAtDepth {
+			positions[id] = [2]float64{
+				float64(d) * xSpacing,
+				startY + float64(i)*ySpacing,
+			}
+		}
+	}
+
+	cycleNodes := make(map[string]bool)
+	var cycles [][]string
+	if e.Stats != nil {
+		cycles = e.Stats.Cycles()
+		for _, cycle := range cycles {
+			for _, id := range cycle {
+				cycleNodes[id] = true
+			}
+		}
+	}
+
+	metrics := make(map[string][5]float64)
+	for _, issue := range e.Issues {
+		var pr, bt float64
+		if e.Stats != nil {
+			pr = e.Stats.GetPageRankScore(issue.ID)
+			bt = e.Stats.GetBetweennessScore(issue.ID)
+		}
+		inCycle := 0.0
+		if cycleNodes[issue.ID] {
+			inCycle = 1.0
+		}
+		metrics[issue.ID] = [5]float64{
+			pr, bt,
+			float64(len(blockedBy[issue.ID])),
+			float64(len(blocks[issue.ID])),
+			inCycle,
+		}
+	}
+
+	var links [][2]string
+	for _, dep := range e.Deps {
+		if dep.Type.IsBlocking() {
+			links = append(links, [2]string{dep.DependsOnID, dep.IssueID})
+		}
+	}
+
+	layout := GraphLayout{
+		Positions:   positions,
+		Metrics:     metrics,
+		Links:       links,
+		Cycles:      cycles,
+		Version:     "1.0.0",
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		NodeCount:   len(e.Issues),
+		EdgeCount:   len(links),
+	}
+
+	return writeJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
 }
