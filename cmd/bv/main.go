@@ -128,6 +128,11 @@ func main() {
 	robotFileRelations := flag.String("robot-file-relations", "", "Output files that frequently co-change with the given file path")
 	relationsThreshold := flag.Float64("relations-threshold", 0.5, "Minimum correlation threshold (0.0-1.0) for related files")
 	relationsLimit := flag.Int("relations-limit", 10, "Max related files to show")
+	// Related work discovery flag (bv-jtdl)
+	robotRelatedWork := flag.String("robot-related", "", "Output beads related to a specific bead ID as JSON")
+	relatedMinRelevance := flag.Int("related-min-relevance", 20, "Minimum relevance score (0-100) for related work")
+	relatedMaxResults := flag.Int("related-max-results", 10, "Max results per category for related work")
+	relatedIncludeClosed := flag.Bool("related-include-closed", false, "Include closed beads in related work results")
 	// Blocker chain analysis flag (bv-nlo0)
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
 	// Impact network graph flag (bv-48kr)
@@ -213,6 +218,7 @@ func main() {
 		*fileHotspots ||
 		*robotImpact != "" ||
 		*robotFileRelations != "" ||
+		*robotRelatedWork != "" ||
 		*robotBlockerChain != "" ||
 		*robotImpactNetwork != "" ||
 		*robotSprintList ||
@@ -372,6 +378,24 @@ func main() {
 		fmt.Println("      - --relations-limit <n>: Max related files to return (default 10)")
 		fmt.Println("      Example: bv --robot-file-relations pkg/auth/token.go")
 		fmt.Println("      Example: bv --robot-file-relations pkg/auth/token.go --relations-threshold 0.3")
+		fmt.Println("")
+		fmt.Println("  --robot-related <bead-id>")
+		fmt.Println("      Outputs beads related to a specific bead as JSON.")
+		fmt.Println("      Discovers related work across multiple dimensions:")
+		fmt.Println("      - file_overlap: Beads touching the same files")
+		fmt.Println("      - commit_overlap: Beads sharing commits")
+		fmt.Println("      - dependency_cluster: Beads in the same dependency graph area")
+		fmt.Println("      - concurrent: Beads active in overlapping time windows")
+		fmt.Println("      Key fields per related bead:")
+		fmt.Println("      - relevance: 0-100 score indicating strength of relationship")
+		fmt.Println("      - reason: Human-readable explanation of the connection")
+		fmt.Println("      - shared_files/shared_commits: Evidence of overlap")
+		fmt.Println("      Options:")
+		fmt.Println("      - --related-min-relevance <0-100>: Min relevance score (default 20)")
+		fmt.Println("      - --related-max-results <n>: Max results per category (default 10)")
+		fmt.Println("      - --related-include-closed: Include closed beads")
+		fmt.Println("      Example: bv --robot-related bv-abc1")
+		fmt.Println("      Example: bv --robot-related bv-abc1 --related-include-closed")
 		fmt.Println("")
 		fmt.Println("  --robot-sprint-list")
 		fmt.Println("      Outputs all sprints as JSON for planning and forecasting.")
@@ -3260,6 +3284,97 @@ func main() {
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding file relations: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Handle --robot-related flag (bv-jtdl)
+	if *robotRelatedWork != "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := correlation.ValidateRepository(cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		issues, err := loader.LoadIssues(cwd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+			os.Exit(1)
+		}
+
+		beadsDir, err := loader.GetBeadsDir("")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+			os.Exit(1)
+		}
+		beadsPath, err := loader.FindJSONLPath(beadsDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+			os.Exit(1)
+		}
+
+		beadInfos := make([]correlation.BeadInfo, len(issues))
+		for i, issue := range issues {
+			beadInfos[i] = correlation.BeadInfo{
+				ID:     issue.ID,
+				Title:  issue.Title,
+				Status: string(issue.Status),
+			}
+		}
+
+		correlatorObj := correlation.NewCorrelator(cwd, beadsPath)
+		report, err := correlatorObj.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+			Limit: *historyLimit,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Build dependency graph from issues
+		depGraph := make(map[string][]string)
+		for _, issue := range issues {
+			for _, dep := range issue.Dependencies {
+				depGraph[issue.ID] = append(depGraph[issue.ID], dep.DependsOnID)
+			}
+		}
+
+		// Configure options
+		opts := correlation.RelatedWorkOptions{
+			MinRelevance:      *relatedMinRelevance,
+			MaxResults:        *relatedMaxResults,
+			ConcurrencyWindow: 7 * 24 * time.Hour,
+			IncludeClosed:     *relatedIncludeClosed,
+			DependencyGraph:   depGraph,
+		}
+
+		result := report.FindRelatedWork(*robotRelatedWork, opts)
+		if result == nil {
+			fmt.Fprintf(os.Stderr, "Bead not found in history: %s\n", *robotRelatedWork)
+			os.Exit(1)
+		}
+
+		// Add data hash to output
+		type RelatedWorkOutput struct {
+			*correlation.RelatedWorkResult
+			DataHash string `json:"data_hash"`
+		}
+
+		output := RelatedWorkOutput{
+			RelatedWorkResult: result,
+			DataHash:          report.DataHash,
+		}
+
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(output); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding related work: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(0)

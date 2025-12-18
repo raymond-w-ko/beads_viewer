@@ -115,3 +115,4 @@ func (t Theme) GetTypeIcon(typ string) (string, lipgloss.AdaptiveColor) {
 		return "•", t.Subtext
 	}
 }
+
