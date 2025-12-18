@@ -1242,10 +1242,7 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 					detailStyle := r.NewStyle().Foreground(t.Subtext)
 					// Truncate detail if needed
 					maxDetail := width - 22
-					detail := entry.Detail
-					if len(detail) > maxDetail && maxDetail > 3 {
-						detail = detail[:maxDetail-3] + "..."
-					}
+					detail := truncateRunesHelper(entry.Detail, maxDetail, "...")
 					b.WriteString(detailStyle.Render(detail))
 				}
 			} else {
@@ -1268,12 +1265,10 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 				confStyle := r.NewStyle().Foreground(confColor)
 				b.WriteString(confStyle.Render(fmt.Sprintf("%d%%", confPct)))
 
-				// Truncate message
+				// Truncate message (UTF-8 safe using runewidth)
 				maxMsg := width - 28
 				msg := strings.Split(entry.Detail, "\n")[0] // First line only
-				if len(msg) > maxMsg && maxMsg > 3 {
-					msg = msg[:maxMsg-3] + "..."
-				}
+				msg = truncateRunesHelper(msg, maxMsg, "...")
 				if msg != "" {
 					b.WriteString("\n")
 					b.WriteString(timestampStyle.Render(""))
@@ -1412,10 +1407,8 @@ func (h *HistoryModel) renderCompactTimeline(hist correlation.BeadHistory, maxWi
 		}
 	}
 
-	// Truncate if needed
-	if len(result) > maxWidth && maxWidth > 3 {
-		result = result[:maxWidth-3] + "..."
-	}
+	// Truncate if needed (UTF-8 safe using runewidth)
+	result = truncateRunesHelper(result, maxWidth, "...")
 
 	return result
 }
