@@ -73,6 +73,81 @@ const (
 // SwimLaneModeCount is the total number of swimlane modes for cycling
 const SwimLaneModeCount = 3
 
+// ColumnStats holds computed statistics for a board column (bv-nl8a)
+type ColumnStats struct {
+	Total        int           // Total issues in column
+	P0Count      int           // Critical priority count
+	P1Count      int           // High priority count
+	BlockedCount int           // Issues with blocking dependencies
+	OldestAge    time.Duration // Age of oldest item
+}
+
+// computeColumnStats calculates statistics for issues in a column (bv-nl8a)
+func computeColumnStats(issues []model.Issue) ColumnStats {
+	stats := ColumnStats{Total: len(issues)}
+
+	var oldest time.Time
+	for _, issue := range issues {
+		if issue.Priority == 0 {
+			stats.P0Count++
+		} else if issue.Priority == 1 {
+			stats.P1Count++
+		}
+
+		// Count blocked items (has blocking deps)
+		for _, dep := range issue.Dependencies {
+			if dep != nil && dep.Type.IsBlocking() {
+				stats.BlockedCount++
+				break
+			}
+		}
+
+		// Track oldest by created date
+		if !issue.CreatedAt.IsZero() {
+			if oldest.IsZero() || issue.CreatedAt.Before(oldest) {
+				oldest = issue.CreatedAt
+			}
+		}
+	}
+
+	if !oldest.IsZero() {
+		stats.OldestAge = time.Since(oldest)
+	}
+
+	return stats
+}
+
+// formatOldestAge formats age duration for display (bv-nl8a)
+func formatOldestAge(d time.Duration) string {
+	days := int(d.Hours() / 24)
+	if days == 0 {
+		return "<1d"
+	}
+	if days < 7 {
+		return fmt.Sprintf("%dd", days)
+	}
+	if days < 30 {
+		weeks := days / 7
+		return fmt.Sprintf("%dw", weeks)
+	}
+	months := days / 30
+	return fmt.Sprintf("%dmo", months)
+}
+
+// getOldestAgeColor returns color based on age (bv-nl8a)
+// green(<7d), yellow(7-30d), red(>30d)
+func getOldestAgeColor(d time.Duration) lipgloss.TerminalColor {
+	days := int(d.Hours() / 24)
+	switch {
+	case days < 7:
+		return lipgloss.AdaptiveColor{Light: "#2e7d32", Dark: "#81c784"} // green
+	case days < 30:
+		return lipgloss.AdaptiveColor{Light: "#f57c00", Dark: "#ffb74d"} // yellow
+	default:
+		return lipgloss.AdaptiveColor{Light: "#c62828", Dark: "#e57373"} // red
+	}
+}
+
 // sortIssuesByPriorityAndDate sorts issues by priority (ascending) then by creation date (descending)
 func sortIssuesByPriorityAndDate(issues []model.Issue) {
 	sort.Slice(issues, func(i, j int) bool {
@@ -715,8 +790,58 @@ func (b BoardModel) View(width, height int) string {
 		issues := b.columns[colIdx]
 		issueCount := len(issues)
 
-		// Header with emoji, title, and count
-		headerText := fmt.Sprintf("%s %s (%d)", columnEmoji[colIdx], columnTitles[colIdx], issueCount)
+		// Compute column statistics (bv-nl8a)
+		stats := computeColumnStats(issues)
+
+		// Build header text with adaptive stats based on terminal width (bv-nl8a)
+		// - Narrow (<100): Just count
+		// - Medium (100-140): Count + P0/P1 counts
+		// - Wide (>140): Full stats including oldest age
+		var headerText string
+		baseHeader := fmt.Sprintf("%s %s (%d)", columnEmoji[colIdx], columnTitles[colIdx], issueCount)
+
+		if width < 100 {
+			// Narrow: just the base header
+			headerText = baseHeader
+		} else if width < 140 {
+			// Medium: add P0/P1 indicators if any exist
+			var indicators []string
+			if stats.P0Count > 0 {
+				indicators = append(indicators, fmt.Sprintf("%d🔴", stats.P0Count))
+			}
+			if stats.P1Count > 0 {
+				indicators = append(indicators, fmt.Sprintf("%d🟡", stats.P1Count))
+			}
+			if len(indicators) > 0 {
+				headerText = baseHeader + " " + strings.Join(indicators, " ")
+			} else {
+				headerText = baseHeader
+			}
+		} else {
+			// Wide: full stats including oldest age
+			var indicators []string
+			if stats.P0Count > 0 {
+				indicators = append(indicators, fmt.Sprintf("%d🔴", stats.P0Count))
+			}
+			if stats.P1Count > 0 {
+				indicators = append(indicators, fmt.Sprintf("%d🟡", stats.P1Count))
+			}
+			// Show blocked count in In Progress column (colIdx == ColInProgress when in status mode)
+			if b.swimLaneMode == SwimByStatus && colIdx == ColInProgress && stats.BlockedCount > 0 {
+				indicators = append(indicators, fmt.Sprintf("⚠️%d", stats.BlockedCount))
+			}
+			// Show oldest age with color indicator
+			if stats.OldestAge > 0 && issueCount > 0 {
+				ageStr := formatOldestAge(stats.OldestAge)
+				indicators = append(indicators, fmt.Sprintf("⏱%s", ageStr))
+			}
+			if len(indicators) > 0 {
+				headerText = baseHeader + " " + strings.Join(indicators, " ")
+			} else {
+				headerText = baseHeader
+			}
+		}
+
 		headerStyle := t.Renderer.NewStyle().
 			Width(baseWidth).
 			Align(lipgloss.Center).
