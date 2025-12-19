@@ -1912,6 +1912,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.focused = focusList
 				}
+				return m, nil
 
 			case "g":
 				// Toggle graph view
@@ -1951,7 +1952,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.focused == focusInsights {
 					m.focused = focusList
 				} else {
-					m.focused = focusInsights
 					m.isGraphView = false
 					m.isBoardView = false
 					m.isActionableView = false
