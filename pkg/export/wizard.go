@@ -77,7 +77,8 @@ func isTerminal() bool {
 
 // newForm creates a form with appropriate settings based on TTY detection
 func newForm(groups ...*huh.Group) *huh.Form {
-	form := huh.NewForm(groups...).WithTheme(huh.ThemeDracula())
+	// Use base theme which adapts better to light terminals
+	form := huh.NewForm(groups...).WithTheme(huh.ThemeBase())
 	if !isTerminal() {
 		form = form.WithAccessible(true)
 	}

@@ -74,20 +74,20 @@ func GetHeatmapColor(score float64, t Theme) lipgloss.TerminalColor {
 }
 
 // HeatmapGradientColors defines the color gradient for enhanced heatmap (bv-t4yg)
-// Ordered from cold (low count) to hot (high count)
-var HeatmapGradientColors = []lipgloss.Color{
-	lipgloss.Color("#1a1a2e"), // 0: dark blue/gray - empty
-	lipgloss.Color("#16213e"), // 1: navy - very few
-	lipgloss.Color("#0f4c75"), // 2: blue - few
-	lipgloss.Color("#3282b8"), // 3: light blue - some
-	lipgloss.Color("#bbe1fa"), // 4: pale blue - moderate (transition)
-	lipgloss.Color("#f7dc6f"), // 5: gold - above average
-	lipgloss.Color("#e94560"), // 6: coral - many
-	lipgloss.Color("#ff2e63"), // 7: hot pink/red - hot
+// Ordered from cold (low count) to hot (high count) - adaptive for light/dark mode
+var HeatmapGradientColors = []lipgloss.AdaptiveColor{
+	{Light: "#F5F5F5", Dark: "#1a1a2e"}, // 0: empty (light gray / dark blue)
+	{Light: "#E3F2FD", Dark: "#16213e"}, // 1: very few (light blue / navy)
+	{Light: "#BBDEFB", Dark: "#0f4c75"}, // 2: few (lighter blue / blue)
+	{Light: "#90CAF9", Dark: "#3282b8"}, // 3: some (medium blue / light blue)
+	{Light: "#FFF9C4", Dark: "#bbe1fa"}, // 4: moderate (light yellow / pale blue)
+	{Light: "#FFE082", Dark: "#f7dc6f"}, // 5: above average (amber / gold)
+	{Light: "#FFAB91", Dark: "#e94560"}, // 6: many (light orange / coral)
+	{Light: "#EF5350", Dark: "#ff2e63"}, // 7: hot (red / hot pink)
 }
 
 // GetHeatGradientColor returns an interpolated color for heatmap intensity (0-1) (bv-t4yg)
-func GetHeatGradientColor(intensity float64, t Theme) lipgloss.Color {
+func GetHeatGradientColor(intensity float64, t Theme) lipgloss.AdaptiveColor {
 	if intensity <= 0 {
 		return HeatmapGradientColors[0]
 	}
@@ -106,23 +106,36 @@ func GetHeatGradientColor(intensity float64, t Theme) lipgloss.Color {
 
 // GetHeatGradientColorBg returns a background-friendly color for heatmap cell (bv-t4yg)
 // Returns both the background color and appropriate foreground for contrast
-func GetHeatGradientColorBg(intensity float64) (bg lipgloss.Color, fg lipgloss.Color) {
+// Now adaptive for light/dark mode
+func GetHeatGradientColorBg(intensity float64) (bg lipgloss.AdaptiveColor, fg lipgloss.AdaptiveColor) {
 	if intensity <= 0 {
-		return lipgloss.Color("#1a1a2e"), lipgloss.Color("#6272a4") // Dark bg, muted fg
+		// Empty cell: subtle background
+		return lipgloss.AdaptiveColor{Light: "#F5F5F5", Dark: "#1a1a2e"},
+			lipgloss.AdaptiveColor{Light: "#888888", Dark: "#6272a4"}
 	}
 
 	// Select background color based on intensity
 	switch {
 	case intensity >= 0.8:
-		return lipgloss.Color("#ff2e63"), lipgloss.Color("#ffffff") // Hot pink, white text
+		// Hot: red/pink with contrasting text
+		return lipgloss.AdaptiveColor{Light: "#EF5350", Dark: "#ff2e63"},
+			lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#ffffff"}
 	case intensity >= 0.6:
-		return lipgloss.Color("#e94560"), lipgloss.Color("#ffffff") // Coral, white text
+		// Warm: coral/orange
+		return lipgloss.AdaptiveColor{Light: "#FFAB91", Dark: "#e94560"},
+			lipgloss.AdaptiveColor{Light: "#000000", Dark: "#ffffff"}
 	case intensity >= 0.4:
-		return lipgloss.Color("#f7dc6f"), lipgloss.Color("#1a1a2e") // Gold, dark text
+		// Medium: gold/amber
+		return lipgloss.AdaptiveColor{Light: "#FFE082", Dark: "#f7dc6f"},
+			lipgloss.AdaptiveColor{Light: "#000000", Dark: "#1a1a2e"}
 	case intensity >= 0.2:
-		return lipgloss.Color("#3282b8"), lipgloss.Color("#ffffff") // Blue, white text
+		// Cool: blue
+		return lipgloss.AdaptiveColor{Light: "#90CAF9", Dark: "#3282b8"},
+			lipgloss.AdaptiveColor{Light: "#000000", Dark: "#ffffff"}
 	default:
-		return lipgloss.Color("#16213e"), lipgloss.Color("#bbe1fa") // Navy, light text
+		// Cold: light blue/navy
+		return lipgloss.AdaptiveColor{Light: "#E3F2FD", Dark: "#16213e"},
+			lipgloss.AdaptiveColor{Light: "#555555", Dark: "#bbe1fa"}
 	}
 }
 
@@ -141,7 +154,8 @@ var RepoColors = []lipgloss.Color{
 // GetRepoColor returns a consistent color for a repo prefix based on hash
 func GetRepoColor(prefix string) lipgloss.Color {
 	if prefix == "" {
-		return ColorMuted
+		// Return a neutral muted color for empty prefix
+		return lipgloss.Color("#888888")
 	}
 	// Simple hash based on prefix characters
 	hash := 0
