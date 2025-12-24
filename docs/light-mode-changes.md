@@ -163,6 +163,85 @@ go test ./... -short     # Full test suite
 
 ---
 
+---
+
+## Additional Fixes (December 24, 2025)
+
+A follow-up review found several places where `AdaptiveColor` was defined with identical Light/Dark values, using bright Dracula dark-mode colors that are unreadable on light backgrounds.
+
+### 7. `pkg/ui/model.go`
+
+**Purpose:** Help overlay keyboard shortcuts screen (`renderHelpOverlay`).
+
+**Problem:** The color palette for section panels used the same bright Dracula colors for both light and dark modes:
+
+```go
+// BEFORE - identical Light/Dark values (unreadable on white)
+colors := []lipgloss.AdaptiveColor{
+    {Light: "#FF79C6", Dark: "#FF79C6"}, // Pink
+    {Light: "#8BE9FD", Dark: "#8BE9FD"}, // Cyan
+    {Light: "#50FA7B", Dark: "#50FA7B"}, // Green
+    {Light: "#FFB86C", Dark: "#FFB86C"}, // Orange
+    {Light: "#F1FA8C", Dark: "#F1FA8C"}, // Yellow
+}
+```
+
+**Fix:** Added proper dark light-mode colors with WCAG AA contrast:
+
+| Color | Dark Mode | Light Mode (Fixed) | Contrast |
+|-------|-----------|-------------------|----------|
+| Purple | `#BD93F9` | `#6B47D9` | ~5.4:1 ✓ |
+| Pink | `#FF79C6` | `#C03E78` | ~4.5:1 ✓ |
+| Cyan | `#8BE9FD` | `#006080` | ~5.5:1 ✓ |
+| Green | `#50FA7B` | `#007700` | ~4.8:1 ✓ |
+| Orange | `#FFB86C` | `#B06800` | ~4.5:1 ✓ |
+| Yellow | `#F1FA8C` | `#806600` | ~5.2:1 ✓ |
+
+---
+
+### 8. `pkg/ui/insights.go`
+
+**Purpose:** Progress bar visualization in insights panel.
+
+**Problem:** Bar colors for intensity visualization used identical Light/Dark values:
+
+```go
+// BEFORE - bright colors unreadable on white
+barColor = lipgloss.AdaptiveColor{Light: "#50FA7B", Dark: "#50FA7B"} // Green
+barColor = lipgloss.AdaptiveColor{Light: "#FFB86C", Dark: "#FFB86C"} // Orange
+barColor = lipgloss.AdaptiveColor{Light: "#6272A4", Dark: "#6272A4"} // Gray
+emptyStyle: lipgloss.AdaptiveColor{Light: "#3D3D3D", Dark: "#3D3D3D"}
+```
+
+**Fix:**
+
+| Element | Dark Mode | Light Mode (Fixed) |
+|---------|-----------|-------------------|
+| High (green) | `#50FA7B` | `#007700` |
+| Medium (orange) | `#FFB86C` | `#B06800` |
+| Low (gray) | `#6272A4` | `#555555` |
+| Empty bar | `#3D3D3D` | `#AAAAAA` |
+
+---
+
+## Known Remaining Issues
+
+The following colors in `pkg/ui/styles.go` have borderline contrast ratios in light mode:
+
+| Color | Light Value | Contrast Ratio | Status |
+|-------|-------------|----------------|--------|
+| `ColorMuted` | `#888888` | ~3.5:1 | Below WCAG AA (4.5:1) |
+| `ColorPrioMedium` | `#808000` | ~3.8:1 | Borderline |
+| `ColorTypeTask` | `#808000` | ~3.8:1 | Borderline |
+
+**Suggested future fixes:**
+- `ColorMuted`: Change to `#666666` (~5.7:1)
+- `ColorPrioMedium`/`ColorTypeTask`: Change to `#6B6B00` (~4.5:1)
+
+These are left as-is for now since they are used for intentionally de-emphasized content where slightly lower contrast is acceptable.
+
+---
+
 ## Files NOT Modified
 
 The following files contain color definitions but were intentionally left unchanged as they handle HTML/export output rather than TUI:

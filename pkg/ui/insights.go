@@ -1210,19 +1210,20 @@ func (m *InsightsModel) renderMiniBar(label string, value float64, width int, t 
 	}
 
 	// Color based on value intensity
+	// Light mode uses darker colors for WCAG AA contrast
 	var barColor lipgloss.AdaptiveColor
 	switch {
 	case value >= 0.7:
-		barColor = lipgloss.AdaptiveColor{Light: "#50FA7B", Dark: "#50FA7B"} // Green - high
+		barColor = lipgloss.AdaptiveColor{Light: "#007700", Dark: "#50FA7B"} // Green - high
 	case value >= 0.4:
-		barColor = lipgloss.AdaptiveColor{Light: "#FFB86C", Dark: "#FFB86C"} // Orange - medium
+		barColor = lipgloss.AdaptiveColor{Light: "#B06800", Dark: "#FFB86C"} // Orange - medium
 	default:
-		barColor = lipgloss.AdaptiveColor{Light: "#6272A4", Dark: "#6272A4"} // Gray - low
+		barColor = lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"} // Gray - low
 	}
 
 	labelStyle := t.Renderer.NewStyle().Foreground(t.Subtext)
 	filledStyle := t.Renderer.NewStyle().Foreground(barColor)
-	emptyStyle := t.Renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#3D3D3D", Dark: "#3D3D3D"})
+	emptyStyle := t.Renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#AAAAAA", Dark: "#3D3D3D"})
 
 	filledBar := strings.Repeat("█", filled)
 	emptyBar := strings.Repeat("░", barWidth-filled)

@@ -3759,13 +3759,14 @@ func (m *Model) renderHelpOverlay() string {
 	}
 
 	// Define color palette (Dracula-inspired gradient)
+	// Light mode uses darker colors for WCAG AA contrast on white backgrounds
 	colors := []lipgloss.AdaptiveColor{
-		{Light: "#7D56F4", Dark: "#BD93F9"}, // Purple
-		{Light: "#FF79C6", Dark: "#FF79C6"}, // Pink
-		{Light: "#8BE9FD", Dark: "#8BE9FD"}, // Cyan
-		{Light: "#50FA7B", Dark: "#50FA7B"}, // Green
-		{Light: "#FFB86C", Dark: "#FFB86C"}, // Orange
-		{Light: "#F1FA8C", Dark: "#F1FA8C"}, // Yellow
+		{Light: "#6B47D9", Dark: "#BD93F9"}, // Purple (darker)
+		{Light: "#C03E78", Dark: "#FF79C6"}, // Pink (darker)
+		{Light: "#006080", Dark: "#8BE9FD"}, // Cyan (much darker)
+		{Light: "#007700", Dark: "#50FA7B"}, // Green (darker)
+		{Light: "#B06800", Dark: "#FFB86C"}, // Orange (darker)
+		{Light: "#806600", Dark: "#F1FA8C"}, // Yellow/olive (much darker)
 	}
 
 	// Helper to render a section panel
@@ -3803,6 +3804,7 @@ func (m *Model) renderHelpOverlay() string {
 		panelStyle := t.Renderer.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(color).
+			// Background(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}). // Not needed - panels don't overlap content
 			Padding(0, 1).
 			Width(colWidth)
 
