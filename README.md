@@ -2961,6 +2961,28 @@ cd beads_viewer
 go install ./cmd/bv
 ```
 
+### Nix Flake
+For Nix users, `bv` provides a flake for reproducible builds and development environments.
+
+```bash
+# Run directly
+nix run github:Dicklesworthstone/beads_viewer
+
+# Install to profile
+nix profile install github:Dicklesworthstone/beads_viewer
+
+# Development shell with Go toolchain
+nix develop github:Dicklesworthstone/beads_viewer
+```
+
+Or add to your flake inputs:
+```nix
+{
+  inputs.bv.url = "github:Dicklesworthstone/beads_viewer";
+  # Use: bv.packages.${system}.default
+}
+```
+
 ---
 
 ## 🚀 Usage Guide

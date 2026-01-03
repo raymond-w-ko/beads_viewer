@@ -20,6 +20,10 @@ benchmarks/current.txt
 .bv/
 beads_report_beads_viewer_*.md
 
+# Nix build artifacts
+result
+result-*
+
 # Rust/WASM build artifacts
 bv-graph-wasm/target/
 bv-graph-wasm/pkg/
