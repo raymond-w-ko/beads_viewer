@@ -2011,6 +2011,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 
+			case "E":
+				// Toggle hierarchical tree view (bv-gllx)
+				m.clearAttentionOverlay()
+				if m.focused == focusTree {
+					m.focused = focusList
+				} else {
+					m.isGraphView = false
+					m.isBoardView = false
+					m.isActionableView = false
+					m.isHistoryView = false
+					// Build tree from all issues
+					m.tree.Build(m.issues)
+					m.tree.SetSize(m.width, m.height-2)
+					m.focused = focusTree
+				}
+				return m, nil
+
 			case "i":
 				m.clearAttentionOverlay()
 				if m.focused == focusInsights {
@@ -2262,6 +2279,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case focusGraph:
 				m = m.handleGraphKeys(msg)
 
+			case focusTree:
+				m = m.handleTreeKeys(msg)
+
 			case focusActionable:
 				m = m.handleActionableKeys(msg)
 
@@ -2305,6 +2325,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.board.MoveUp()
 			case focusGraph:
 				m.graphView.PageUp()
+			case focusTree:
+				m.tree.MoveUp()
 			case focusActionable:
 				m.actionableView.MoveUp()
 			case focusHistory:
@@ -2332,6 +2354,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.board.MoveDown()
 			case focusGraph:
 				m.graphView.PageDown()
+			case focusTree:
+				m.tree.MoveDown()
 			case focusActionable:
 				m.actionableView.MoveDown()
 			case focusHistory:
@@ -2673,6 +2697,55 @@ func (m Model) handleGraphKeys(msg tea.KeyMsg) Model {
 				m.viewport.GotoTop()
 			}
 			m.updateViewportContent()
+		}
+	}
+	return m
+}
+
+// handleTreeKeys handles keyboard input when tree view is focused (bv-gllx)
+func (m Model) handleTreeKeys(msg tea.KeyMsg) Model {
+	switch msg.String() {
+	case "j", "down":
+		m.tree.MoveDown()
+	case "k", "up":
+		m.tree.MoveUp()
+	case "enter", " ":
+		m.tree.ToggleExpand()
+	case "h", "left":
+		m.tree.CollapseOrJumpToParent()
+	case "l", "right":
+		m.tree.ExpandOrMoveToChild()
+	case "g":
+		// Double-tap g for jump to top (handled via waitingForG in main handler)
+		// Single g handled here as tree-specific
+		m.tree.JumpToTop()
+	case "G":
+		m.tree.JumpToBottom()
+	case "o":
+		m.tree.ExpandAll()
+	case "O":
+		m.tree.CollapseAll()
+	case "ctrl+d", "pgdown":
+		m.tree.PageDown()
+	case "ctrl+u", "pgup":
+		m.tree.PageUp()
+	case "E", "esc":
+		// Return to list view
+		m.focused = focusList
+	case "tab":
+		// Toggle detail panel (sync selection and jump to detail)
+		if m.isSplitView {
+			if selected := m.tree.SelectedIssue(); selected != nil {
+				// Sync detail panel with tree selection
+				for i, item := range m.list.Items() {
+					if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
+						m.list.Select(i)
+						break
+					}
+				}
+				m.updateViewportContent()
+				m.focused = focusDetail
+			}
 		}
 	}
 	return m
@@ -3496,6 +3569,10 @@ func (m Model) View() string {
 	} else if m.focused == focusFlowMatrix {
 		m.flowMatrix.SetSize(m.width, m.height-1)
 		body = m.flowMatrix.View()
+	} else if m.focused == focusTree {
+		// Hierarchical tree view (bv-gllx)
+		m.tree.SetSize(m.width, m.height-1)
+		body = m.tree.View()
 	} else if m.isGraphView {
 		body = m.graphView.View(m.width, m.height-1)
 	} else if m.isBoardView {

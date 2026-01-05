@@ -115,18 +115,16 @@ func TestTreeBuildOrphanParent(t *testing.T) {
 	tree := NewTreeModel(newTreeTestTheme())
 	tree.Build(issues)
 
-	// orphan-1 has a parent-child dep but the parent doesn't exist
-	// It should NOT be a root because hasParent is still true
-	// Only root-1 should be a root
-	// BUT orphan-1's parent doesn't exist, so it won't appear as a child anywhere
-	// This is expected behavior - dangling references are handled gracefully
+	// orphan-1 declares a parent that doesn't exist in the issue set.
+	// Rather than disappearing from the tree entirely (bad UX), orphan-1
+	// should be treated as a root - its parent reference is dangling.
 
-	if tree.RootCount() != 1 {
-		t.Errorf("expected 1 root, got %d", tree.RootCount())
+	if tree.RootCount() != 2 {
+		t.Errorf("expected 2 roots (orphan with missing parent becomes root), got %d", tree.RootCount())
 	}
-	// Only root-1 is visible since orphan-1 has a parent (that doesn't exist)
-	if tree.NodeCount() != 1 {
-		t.Errorf("expected 1 visible node, got %d", tree.NodeCount())
+	// Both issues should be visible as roots
+	if tree.NodeCount() != 2 {
+		t.Errorf("expected 2 visible nodes, got %d", tree.NodeCount())
 	}
 }
 

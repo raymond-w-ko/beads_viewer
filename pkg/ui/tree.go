@@ -98,14 +98,30 @@ func (t *TreeModel) Build(issues []model.Issue) {
 		}
 	}
 
-	// Step 2: Identify root nodes (issues with no parent)
-	// Also handle case where parent doesn't exist (dangling reference)
+	// Step 2: Identify root nodes (issues with no parent OR whose parent doesn't exist)
+	// This handles dangling references - if a parent is referenced but doesn't exist,
+	// the child becomes a root rather than disappearing from the tree entirely.
 	var rootIssues []*model.Issue
 	for i := range issues {
 		issue := &issues[i]
 		if !hasParent[issue.ID] {
 			// This issue has no parent - it's a root
 			rootIssues = append(rootIssues, issue)
+		} else {
+			// Issue declares a parent - verify the parent exists
+			hasValidParent := false
+			for _, dep := range issue.Dependencies {
+				if dep != nil && dep.Type == model.DepParentChild {
+					if _, exists := issueByID[dep.DependsOnID]; exists {
+						hasValidParent = true
+						break
+					}
+				}
+			}
+			if !hasValidParent {
+				// Parent doesn't exist in our issue set - treat as root
+				rootIssues = append(rootIssues, issue)
+			}
 		}
 	}
 
