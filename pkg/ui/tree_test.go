@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -736,5 +739,252 @@ func TestTreeStateVersion(t *testing.T) {
 	// Ensure version constant is reasonable
 	if TreeStateVersion < 1 {
 		t.Errorf("TreeStateVersion should be >= 1, got %d", TreeStateVersion)
+	}
+}
+
+// =============================================================================
+// visibleRange tests (bv-r4ng)
+// =============================================================================
+
+func TestVisibleRange(t *testing.T) {
+	tests := []struct {
+		name      string
+		nodeCount int
+		height    int
+		offset    int
+		wantStart int
+		wantEnd   int
+	}{
+		{"empty tree", 0, 10, 0, 0, 0},
+		{"fewer nodes than viewport", 5, 10, 0, 0, 5},
+		{"exact fit", 10, 10, 0, 0, 10},
+		{"offset at start", 100, 10, 0, 0, 10},
+		{"offset in middle", 100, 10, 45, 45, 55},
+		{"offset near end", 100, 10, 90, 90, 100},
+		{"offset past end clamps", 100, 10, 95, 90, 100},
+		{"zero height uses default 20", 100, 0, 0, 0, 20},
+		{"negative height uses default 20", 100, -5, 0, 0, 20},
+		{"single node", 1, 10, 0, 0, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create tree model with test nodes
+			tree := NewTreeModel(testTheme())
+			tree.height = tt.height
+			tree.viewportOffset = tt.offset
+
+			// Create fake flat list with the specified number of nodes
+			tree.flatList = make([]*IssueTreeNode, tt.nodeCount)
+			for i := 0; i < tt.nodeCount; i++ {
+				tree.flatList[i] = &IssueTreeNode{
+					Issue: &model.Issue{ID: fmt.Sprintf("test-%d", i)},
+				}
+			}
+
+			gotStart, gotEnd := tree.visibleRange()
+
+			if gotStart != tt.wantStart {
+				t.Errorf("visibleRange() start = %d, want %d", gotStart, tt.wantStart)
+			}
+			if gotEnd != tt.wantEnd {
+				t.Errorf("visibleRange() end = %d, want %d", gotEnd, tt.wantEnd)
+			}
+
+			// Verify the range is valid
+			if gotEnd < gotStart {
+				t.Errorf("visibleRange() end (%d) < start (%d)", gotEnd, gotStart)
+			}
+			if gotStart < 0 {
+				t.Errorf("visibleRange() start (%d) is negative", gotStart)
+			}
+			if gotEnd > tt.nodeCount {
+				t.Errorf("visibleRange() end (%d) exceeds node count (%d)", gotEnd, tt.nodeCount)
+			}
+		})
+	}
+}
+
+func TestVisibleRangePerformance(t *testing.T) {
+	// Verify O(1) behavior - should complete quickly regardless of tree size
+	tree := NewTreeModel(testTheme())
+	tree.height = 20
+
+	// Large tree
+	tree.flatList = make([]*IssueTreeNode, 100000)
+	tree.viewportOffset = 50000
+
+	// Should complete instantly (O(1))
+	start, end := tree.visibleRange()
+
+	if start != 50000 || end != 50020 {
+		t.Errorf("visibleRange() = (%d, %d), want (50000, 50020)", start, end)
+	}
+}
+
+// =============================================================================
+// saveState tests (bv-19vz)
+// =============================================================================
+
+// TestSaveState tests the saveState method
+func TestSaveState(t *testing.T) {
+	// Create temp directory for test
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+
+	// Create a tree with test data
+	issues := []model.Issue{
+		{ID: "root-1", Title: "Root 1", Status: model.StatusOpen, IssueType: model.TypeEpic},
+		{ID: "child-1", Title: "Child 1", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "child-1", DependsOnID: "root-1", Type: model.DepParentChild}}},
+		{ID: "grandchild-1", Title: "Grandchild 1", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "grandchild-1", DependsOnID: "child-1", Type: model.DepParentChild}}},
+	}
+
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	tree := NewTreeModel(theme)
+	tree.SetBeadsDir(beadsDir)
+	tree.Build(issues)
+
+	// Initially, root-1 (depth=0) and child-1 (depth=1) are expanded by default
+	// grandchild-1 (depth=2) is collapsed by default
+
+	// Collapse child-1 (non-default state)
+	for i, node := range tree.flatList {
+		if node.Issue != nil && node.Issue.ID == "child-1" {
+			tree.cursor = i
+			break
+		}
+	}
+	tree.ToggleExpand() // This should save state
+
+	// Verify the file was created
+	statePath := filepath.Join(beadsDir, "tree-state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("Failed to read state file: %v", err)
+	}
+
+	// Parse and verify content
+	var state TreeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Failed to parse state file: %v", err)
+	}
+
+	if state.Version != TreeStateVersion {
+		t.Errorf("State version = %d, want %d", state.Version, TreeStateVersion)
+	}
+
+	// child-1 at depth=1 was expanded by default (depth < 2), now collapsed
+	// So it should be in the Expanded map as false
+	if expanded, ok := state.Expanded["child-1"]; !ok || expanded {
+		t.Errorf("Expected child-1 to be in Expanded map as false, got %v (ok=%v)", expanded, ok)
+	}
+}
+
+// TestSaveStateOnlyNonDefault verifies that only non-default states are saved
+func TestSaveStateOnlyNonDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+
+	// Create deep tree
+	issues := []model.Issue{
+		{ID: "root", Title: "Root", Status: model.StatusOpen, IssueType: model.TypeEpic},
+		{ID: "d1", Title: "Depth 1", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "d1", DependsOnID: "root", Type: model.DepParentChild}}},
+		{ID: "d2", Title: "Depth 2", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "d2", DependsOnID: "d1", Type: model.DepParentChild}}},
+		{ID: "d3", Title: "Depth 3", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "d3", DependsOnID: "d2", Type: model.DepParentChild}}},
+	}
+
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	tree := NewTreeModel(theme)
+	tree.SetBeadsDir(beadsDir)
+	tree.Build(issues)
+
+	// Default state:
+	// - root (depth=0): expanded
+	// - d1 (depth=1): expanded
+	// - d2 (depth=2): collapsed
+	// - d3 (depth=3): collapsed
+
+	// Expand all - this makes d2 and d3 non-default (expanded when default is collapsed)
+	tree.ExpandAll()
+
+	// Read state
+	statePath := filepath.Join(beadsDir, "tree-state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("Failed to read state file: %v", err)
+	}
+
+	var state TreeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Failed to parse state file: %v", err)
+	}
+
+	// root and d1 should NOT be in the map (they're in default expanded state)
+	if _, ok := state.Expanded["root"]; ok {
+		t.Error("root should not be in Expanded map (already default expanded)")
+	}
+	if _, ok := state.Expanded["d1"]; ok {
+		t.Error("d1 should not be in Expanded map (already default expanded)")
+	}
+
+	// d2 and d3 SHOULD be in the map as true (expanded is non-default for depth >= 2)
+	if expanded, ok := state.Expanded["d2"]; !ok || !expanded {
+		t.Errorf("d2 should be in Expanded map as true, got %v (ok=%v)", expanded, ok)
+	}
+	if expanded, ok := state.Expanded["d3"]; !ok || !expanded {
+		t.Errorf("d3 should be in Expanded map as true, got %v (ok=%v)", expanded, ok)
+	}
+
+	// Now collapse all
+	tree.CollapseAll()
+
+	// Read state again
+	data, err = os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("Failed to read state file after collapse: %v", err)
+	}
+
+	// Re-initialize state to ensure clean unmarshal
+	state = TreeState{}
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Failed to parse state file after collapse: %v", err)
+	}
+
+	// root and d1 should be in the map as false (collapsed is non-default for depth < 2)
+	if expanded, ok := state.Expanded["root"]; !ok || expanded {
+		t.Errorf("root should be in Expanded map as false after CollapseAll, got %v (ok=%v)", expanded, ok)
+	}
+	if expanded, ok := state.Expanded["d1"]; !ok || expanded {
+		t.Errorf("d1 should be in Expanded map as false after CollapseAll, got %v (ok=%v)", expanded, ok)
+	}
+
+	// d2 and d3 should NOT be in the map (collapsed is default for depth >= 2)
+	if _, ok := state.Expanded["d2"]; ok {
+		t.Error("d2 should not be in Expanded map after CollapseAll (collapsed is default)")
+	}
+	if _, ok := state.Expanded["d3"]; ok {
+		t.Error("d3 should not be in Expanded map after CollapseAll (collapsed is default)")
+	}
+}
+
+// TestSetBeadsDir tests the SetBeadsDir method
+func TestSetBeadsDir(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	tree := NewTreeModel(theme)
+
+	// Default should be empty
+	if tree.beadsDir != "" {
+		t.Errorf("Expected empty beadsDir initially, got %q", tree.beadsDir)
+	}
+
+	// Set custom directory
+	tree.SetBeadsDir("/custom/path")
+	if tree.beadsDir != "/custom/path" {
+		t.Errorf("Expected beadsDir to be /custom/path, got %q", tree.beadsDir)
 	}
 }

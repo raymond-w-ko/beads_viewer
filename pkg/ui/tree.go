@@ -2,7 +2,10 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -61,6 +64,64 @@ func TreeStatePath(beadsDir string) string {
 	return filepath.Join(beadsDir, treeStateFileName)
 }
 
+// SetBeadsDir sets the beads directory for persistence (bv-19vz).
+// This should be called before any expand/collapse operations if a custom
+// beads directory is desired. If not called, defaults to ".beads" in cwd.
+func (t *TreeModel) SetBeadsDir(dir string) {
+	t.beadsDir = dir
+}
+
+// saveState persists the current expand/collapse state to disk (bv-19vz).
+// Only stores explicit user changes; nodes not in the map use default behavior.
+// Errors are logged but do not interrupt the user experience.
+func (t *TreeModel) saveState() {
+	state := &TreeState{
+		Version:  TreeStateVersion,
+		Expanded: make(map[string]bool),
+	}
+
+	// Walk all nodes and record explicit expand state
+	var walk func(node *IssueTreeNode)
+	walk = func(node *IssueTreeNode) {
+		if node == nil || node.Issue == nil {
+			return
+		}
+
+		// Default: expanded for depth < 2, collapsed otherwise
+		defaultExpanded := node.Depth < 2
+		if node.Expanded != defaultExpanded {
+			state.Expanded[node.Issue.ID] = node.Expanded
+		}
+
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+
+	for _, root := range t.roots {
+		walk(root)
+	}
+
+	// Write to file
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("warning: failed to marshal tree state: %v", err)
+		return
+	}
+
+	path := TreeStatePath(t.beadsDir)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("warning: failed to create state directory %s: %v", dir, err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("warning: failed to write tree state to %s: %v", path, err)
+		return
+	}
+}
+
 // TreeViewMode determines what relationships are displayed
 type TreeViewMode int
 
@@ -87,12 +148,16 @@ type TreeModel struct {
 	theme    Theme                      // Visual styling
 	mode     TreeViewMode               // Hierarchy vs blocking
 	issueMap map[string]*IssueTreeNode  // Quick lookup by issue ID
-	width    int                        // Available width
-	height   int                        // Available height
+	width          int                  // Available width
+	height         int                  // Available height
+	viewportOffset int                  // Index of first visible node (bv-r4ng)
 
 	// Build state
 	built    bool   // Has tree been built?
 	lastHash string // Hash of issues for cache invalidation
+
+	// Persistence state (bv-19vz)
+	beadsDir string // Directory containing .beads (for tree-state.json)
 }
 
 // NewTreeModel creates an empty tree model
@@ -583,6 +648,7 @@ func (t *TreeModel) ToggleExpand() {
 	if node != nil && len(node.Children) > 0 {
 		node.Expanded = !node.Expanded
 		t.rebuildFlatList()
+		t.saveState() // Persist expand/collapse state (bv-19vz)
 	}
 }
 
@@ -592,6 +658,7 @@ func (t *TreeModel) ExpandAll() {
 		t.setExpandedRecursive(root, true)
 	}
 	t.rebuildFlatList()
+	t.saveState() // Persist expand/collapse state (bv-19vz)
 }
 
 // CollapseAll collapses all nodes in the tree.
@@ -600,6 +667,7 @@ func (t *TreeModel) CollapseAll() {
 		t.setExpandedRecursive(root, false)
 	}
 	t.rebuildFlatList()
+	t.saveState() // Persist expand/collapse state (bv-19vz)
 }
 
 // JumpToTop moves cursor to the first node.
@@ -645,6 +713,7 @@ func (t *TreeModel) ExpandOrMoveToChild() {
 		// Expand the node
 		node.Expanded = true
 		t.rebuildFlatList()
+		t.saveState() // Persist expand/collapse state (bv-19vz)
 	} else {
 		// Move to first child
 		// Find first child in flatList (should be right after current node)
@@ -670,6 +739,7 @@ func (t *TreeModel) CollapseOrJumpToParent() {
 		// Collapse the node
 		node.Expanded = false
 		t.rebuildFlatList()
+		t.saveState() // Persist expand/collapse state (bv-19vz)
 	} else {
 		// Jump to parent
 		t.JumpToParent()
@@ -701,6 +771,44 @@ func (t *TreeModel) PageUp() {
 	if t.cursor < 0 {
 		t.cursor = 0
 	}
+}
+
+// visibleRange returns the start and end indices of nodes to render (bv-r4ng).
+// The range [start, end) covers nodes visible in the viewport.
+// This is an O(1) calculation based on viewportOffset and height.
+func (t *TreeModel) visibleRange() (start, end int) {
+	if len(t.flatList) == 0 {
+		return 0, 0
+	}
+
+	// Each node renders as 1 line
+	visibleCount := t.height
+	if visibleCount <= 0 {
+		visibleCount = 20 // Default
+	}
+
+	// Calculate range based on viewport offset
+	start = t.viewportOffset
+	end = start + visibleCount
+
+	// Clamp to bounds
+	if end > len(t.flatList) {
+		end = len(t.flatList)
+		start = end - visibleCount
+		if start < 0 {
+			start = 0
+		}
+	}
+
+	// Ensure start is valid
+	if start < 0 {
+		start = 0
+	}
+	if start > len(t.flatList) {
+		start = len(t.flatList)
+	}
+
+	return start, end
 }
 
 // SelectByID moves cursor to the node with the given issue ID.
