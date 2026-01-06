@@ -48,6 +48,7 @@ const (
 	focusDetail
 	focusBoard
 	focusGraph
+	focusTree // Hierarchical tree view (bv-gllx)
 	focusLabelDashboard
 	focusInsights
 	focusActionable
@@ -269,6 +270,7 @@ type Model struct {
 	velocityComparison VelocityComparisonModel // bv-125
 	shortcutsSidebar   ShortcutsSidebar        // bv-3qi5
 	graphView          GraphModel
+	tree               TreeModel   // Hierarchical tree view (bv-gllx)
 	insightsPanel      InsightsModel
 	flowMatrix         FlowMatrixModel // Cross-label flow matrix
 	theme              Theme
@@ -876,6 +878,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		velocityComparison:     velocityComparison,
 		shortcutsSidebar:       shortcutsSidebar,
 		graphView:              graphView,
+		tree:                   NewTreeModel(theme),
 		insightsPanel:          insightsPanel,
 		theme:                  theme,
 		currentFilter:          "all",
@@ -2008,6 +2011,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 
+			case "E":
+				// Toggle hierarchical tree view (bv-gllx)
+				m.clearAttentionOverlay()
+				if m.focused == focusTree {
+					m.focused = focusList
+				} else {
+					m.isGraphView = false
+					m.isBoardView = false
+					m.isActionableView = false
+					m.isHistoryView = false
+					// Build tree from all issues
+					m.tree.Build(m.issues)
+					m.tree.SetSize(m.width, m.height-2)
+					m.focused = focusTree
+				}
+				return m, nil
+
 			case "i":
 				m.clearAttentionOverlay()
 				if m.focused == focusInsights {
@@ -2259,6 +2279,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case focusGraph:
 				m = m.handleGraphKeys(msg)
 
+			case focusTree:
+				m = m.handleTreeKeys(msg)
+
 			case focusActionable:
 				m = m.handleActionableKeys(msg)
 
@@ -2302,6 +2325,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.board.MoveUp()
 			case focusGraph:
 				m.graphView.PageUp()
+			case focusTree:
+				m.tree.MoveUp()
 			case focusActionable:
 				m.actionableView.MoveUp()
 			case focusHistory:
@@ -2329,6 +2354,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.board.MoveDown()
 			case focusGraph:
 				m.graphView.PageDown()
+			case focusTree:
+				m.tree.MoveDown()
 			case focusActionable:
 				m.actionableView.MoveDown()
 			case focusHistory:
@@ -2670,6 +2697,54 @@ func (m Model) handleGraphKeys(msg tea.KeyMsg) Model {
 				m.viewport.GotoTop()
 			}
 			m.updateViewportContent()
+		}
+	}
+	return m
+}
+
+// handleTreeKeys handles keyboard input when tree view is focused (bv-gllx)
+func (m Model) handleTreeKeys(msg tea.KeyMsg) Model {
+	switch msg.String() {
+	case "j", "down":
+		m.tree.MoveDown()
+	case "k", "up":
+		m.tree.MoveUp()
+	case "enter", " ":
+		m.tree.ToggleExpand()
+	case "h", "left":
+		m.tree.CollapseOrJumpToParent()
+	case "l", "right":
+		m.tree.ExpandOrMoveToChild()
+	case "g":
+		// Jump to top (vim-style)
+		m.tree.JumpToTop()
+	case "G":
+		m.tree.JumpToBottom()
+	case "o":
+		m.tree.ExpandAll()
+	case "O":
+		m.tree.CollapseAll()
+	case "ctrl+d", "pgdown":
+		m.tree.PageDown()
+	case "ctrl+u", "pgup":
+		m.tree.PageUp()
+	case "E", "esc":
+		// Return to list view
+		m.focused = focusList
+	case "tab":
+		// Toggle detail panel (sync selection and jump to detail)
+		if m.isSplitView {
+			if selected := m.tree.SelectedIssue(); selected != nil {
+				// Sync detail panel with tree selection
+				for i, item := range m.list.Items() {
+					if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
+						m.list.Select(i)
+						break
+					}
+				}
+				m.updateViewportContent()
+				m.focused = focusDetail
+			}
 		}
 	}
 	return m
@@ -3493,6 +3568,10 @@ func (m Model) View() string {
 	} else if m.focused == focusFlowMatrix {
 		m.flowMatrix.SetSize(m.width, m.height-1)
 		body = m.flowMatrix.View()
+	} else if m.focused == focusTree {
+		// Hierarchical tree view (bv-gllx)
+		m.tree.SetSize(m.width, m.height-1)
+		body = m.tree.View()
 	} else if m.isGraphView {
 		body = m.graphView.View(m.width, m.height-1)
 	} else if m.isBoardView {
@@ -5674,6 +5753,79 @@ func (m Model) IsTimeTravelMode() bool {
 // TimeTravelDiff returns the current diff (nil if not in time-travel mode)
 func (m Model) TimeTravelDiff() *analysis.SnapshotDiff {
 	return m.timeTravelDiff
+}
+
+// FocusState returns the current focus state as a string for testing (bv-5e5q).
+// This enables testing focus transitions without exposing the internal focus type.
+func (m Model) FocusState() string {
+	switch m.focused {
+	case focusList:
+		return "list"
+	case focusDetail:
+		return "detail"
+	case focusBoard:
+		return "board"
+	case focusGraph:
+		return "graph"
+	case focusTree:
+		return "tree"
+	case focusLabelDashboard:
+		return "label_dashboard"
+	case focusInsights:
+		return "insights"
+	case focusActionable:
+		return "actionable"
+	case focusRecipePicker:
+		return "recipe_picker"
+	case focusRepoPicker:
+		return "repo_picker"
+	case focusHelp:
+		return "help"
+	case focusQuitConfirm:
+		return "quit_confirm"
+	case focusTimeTravelInput:
+		return "time_travel_input"
+	case focusHistory:
+		return "history"
+	case focusAttention:
+		return "attention"
+	case focusLabelPicker:
+		return "label_picker"
+	case focusSprint:
+		return "sprint"
+	case focusAgentPrompt:
+		return "agent_prompt"
+	case focusFlowMatrix:
+		return "flow_matrix"
+	case focusTutorial:
+		return "tutorial"
+	case focusCassModal:
+		return "cass_modal"
+	case focusUpdateModal:
+		return "update_modal"
+	default:
+		return "unknown"
+	}
+}
+
+// IsBoardView returns true if the board view is active (bv-5e5q).
+func (m Model) IsBoardView() bool {
+	return m.isBoardView
+}
+
+// IsGraphView returns true if the graph view is active (bv-5e5q).
+func (m Model) IsGraphView() bool {
+	return m.isGraphView
+}
+
+// IsActionableView returns true if the actionable view is active (bv-5e5q).
+func (m Model) IsActionableView() bool {
+	return m.isActionableView
+}
+
+// IsHistoryView returns true if the history view is active (bv-5e5q).
+func (m Model) IsHistoryView() bool {
+	return m.isHistoryView
 }
 
 // exportToMarkdown exports all issues to a Markdown file with auto-generated filename
