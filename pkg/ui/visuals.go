@@ -156,7 +156,7 @@ var RepoColors = []lipgloss.AdaptiveColor{
 func GetRepoColor(prefix string) lipgloss.AdaptiveColor {
 	if prefix == "" {
 		// Return a neutral muted color for empty prefix
-		return lipgloss.Color("#888888")
+		return lipgloss.AdaptiveColor{Light: "#666666", Dark: "#888888"}
 	}
 	// Simple hash based on prefix characters
 	hash := 0
