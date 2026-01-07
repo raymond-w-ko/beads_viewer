@@ -80,13 +80,43 @@ func TestIssueType_IsValid(t *testing.T) {
 		{"Task", TypeTask, true},
 		{"Epic", TypeEpic, true},
 		{"Chore", TypeChore, true},
-		{"Invalid", "random", false},
+		// Any non-empty type is valid (extensibility for Beads ecosystem)
+		{"CustomType", "custom", true},
+		// Gastown orchestration types (steveyegge/beads)
+		{"GastownRole", "role", true},
+		{"GastownAgent", "agent", true},
+		{"GastownMolecule", "molecule", true},
+		// Only empty is invalid
 		{"Empty", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.issueType.IsValid(); got != tt.want {
 				t.Errorf("IssueType.IsValid() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIssueType_IsKnownType(t *testing.T) {
+	tests := []struct {
+		name      string
+		issueType IssueType
+		want      bool
+	}{
+		{"Bug", TypeBug, true},
+		{"Feature", TypeFeature, true},
+		{"Task", TypeTask, true},
+		{"Epic", TypeEpic, true},
+		{"Chore", TypeChore, true},
+		{"Custom", "custom", false},
+		{"GastownRole", "role", false},
+		{"Empty", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.issueType.IsKnownType(); got != tt.want {
+				t.Errorf("IssueType.IsKnownType() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -255,14 +285,24 @@ func TestIssue_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "Invalid Type",
+			name: "Empty Type",
 			issue: Issue{
 				ID:        "TEST-1",
 				Title:     "Valid Issue",
 				Status:    StatusOpen,
-				IssueType: "invalid",
+				IssueType: "", // Only empty type is invalid
 			},
 			wantErr: true,
+		},
+		{
+			name: "Custom Type Allowed",
+			issue: Issue{
+				ID:        "TEST-1",
+				Title:     "Valid Issue",
+				Status:    StatusOpen,
+				IssueType: "gastown-role", // Non-standard types are now valid
+			},
+			wantErr: false,
 		},
 		{
 			name: "UpdatedAt Before CreatedAt",

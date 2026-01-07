@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/instance"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
@@ -258,8 +259,17 @@ type Model struct {
 	issueMap  map[string]*model.Issue
 	analyzer  *analysis.Analyzer
 	analysis  *analysis.GraphStats
-	beadsPath string           // Path to beads.jsonl for reloading
-	watcher   *watcher.Watcher // File watcher for live reload
+	beadsPath    string           // Path to beads.jsonl for reloading
+	watcher      *watcher.Watcher // File watcher for live reload
+	instanceLock *instance.Lock   // Multi-instance coordination lock
+
+	// Background Worker (Phase 2 architecture - bv-m7v8)
+	// snapshot is the current immutable data snapshot from BackgroundWorker.
+	// Access is safe without locks because Bubble Tea ensures Update() and View()
+	// don't run concurrently. When nil, the UI uses legacy m.issues/m.issueMap fields.
+	snapshot *DataSnapshot
+	// backgroundWorker manages async data loading (nil if background mode disabled)
+	backgroundWorker *BackgroundWorker
 
 	// UI Components
 	list               list.Model
@@ -833,6 +843,17 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
+	// Initialize instance lock for multi-instance coordination (bv-vrvn)
+	var instLock *instance.Lock
+	if beadsPath != "" {
+		beadsDir := filepath.Dir(beadsPath)
+		lock, err := instance.NewLock(beadsDir)
+		if err == nil {
+			instLock = lock
+		}
+		// Lock creation failure is non-fatal - we just won't have coordination
+	}
+
 	// Semantic search (bv-9gf.3): initialized lazily on first toggle.
 	semanticSearch := NewSemanticSearch()
 	semanticIDs := make([]string, 0, len(items))
@@ -870,6 +891,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		analysis:               graphStats,
 		beadsPath:              beadsPath,
 		watcher:                fileWatcher,
+		instanceLock:           instLock,
 		list:                   l,
 		viewport:               vp,
 		renderer:               renderer,
@@ -1180,6 +1202,94 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.agentPromptModal = NewAgentPromptModal(msg.FilePath, msg.FileType, m.theme)
 			m.focused = focusAgentPrompt
 		}
+
+	case SnapshotReadyMsg:
+		// Background worker has a new snapshot ready (bv-m7v8)
+		// This is the atomic pointer swap - O(1), sub-microsecond
+		if msg.Snapshot == nil {
+			return m, nil
+		}
+
+		// Store selected issue ID to restore position after swap
+		var selectedID string
+		if sel := m.list.SelectedItem(); sel != nil {
+			if item, ok := sel.(IssueItem); ok {
+				selectedID = item.Issue.ID
+			}
+		}
+
+		// Swap snapshot pointer
+		m.snapshot = msg.Snapshot
+
+		// Update legacy fields for backwards compatibility during migration
+		// Eventually these will be removed when all code reads from snapshot
+		m.issues = msg.Snapshot.Issues
+		m.issueMap = msg.Snapshot.IssueMap
+		m.analyzer = msg.Snapshot.Analyzer
+		m.analysis = msg.Snapshot.Analysis
+		m.countOpen = msg.Snapshot.CountOpen
+		m.countReady = msg.Snapshot.CountReady
+		m.countBlocked = msg.Snapshot.CountBlocked
+		m.countClosed = msg.Snapshot.CountClosed
+		m.triageScores = msg.Snapshot.TriageScores
+		m.triageReasons = msg.Snapshot.TriageReasons
+		m.unblocksMap = msg.Snapshot.UnblocksMap
+		m.quickWinSet = msg.Snapshot.QuickWinSet
+		m.blockerSet = msg.Snapshot.BlockerSet
+
+		// Clear caches that need recomputation
+		m.labelHealthCached = false
+		m.attentionCached = false
+		m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
+
+		// Rebuild list items from snapshot
+		items := make([]list.Item, len(msg.Snapshot.ListItems))
+		for i := range msg.Snapshot.ListItems {
+			items[i] = msg.Snapshot.ListItems[i]
+		}
+		m.list.SetItems(items)
+
+		// Restore selection if possible
+		if selectedID != "" {
+			for i, it := range items {
+				if item, ok := it.(IssueItem); ok && item.Issue.ID == selectedID {
+					m.list.Select(i)
+					break
+				}
+			}
+		}
+
+		// Update sub-views
+		m.board.SetIssues(m.issues)
+		if ins := m.analysis.GenerateInsights(len(m.issues)); len(ins.Bottlenecks) > 0 || len(ins.Keystones) > 0 {
+			m.insightsPanel.SetInsights(ins)
+		}
+		m.graphView.SetIssues(m.issues, nil)
+
+		// Refresh detail pane if visible
+		if m.isSplitView || m.showDetails {
+			m.updateViewportContent()
+		}
+
+		// Clear ephemeral overlays
+		m.clearAttentionOverlay()
+
+		// Wait for Phase 2 if not ready
+		if msg.Snapshot.Analysis != nil {
+			cmds = append(cmds, WaitForPhase2Cmd(msg.Snapshot.Analysis))
+		}
+
+		return m, tea.Batch(cmds...)
+
+	case SnapshotErrorMsg:
+		// Background worker encountered an error loading/processing data
+		// Log the error; if recoverable, we'll try again on next file change
+		if msg.Err != nil {
+			// TODO: Display error in status bar or notification area
+			// For now, just log it
+			_ = msg.Recoverable // Suppress unused variable warning
+		}
+		return m, nil
 
 	case FileChangedMsg:
 		// File changed on disk - reload issues and recompute analysis
@@ -4738,6 +4848,19 @@ func (m *Model) renderFooter() string {
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
+	// INSTANCE WARNING - Secondary instance indicator (bv-vrvn)
+	// ─────────────────────────────────────────────────────────────────────────
+	instanceSection := ""
+	if m.instanceLock != nil && !m.instanceLock.IsFirstInstance() {
+		instanceStyle := lipgloss.NewStyle().
+			Background(ColorPrioHighBg).
+			Foreground(ColorWarning).
+			Bold(true).
+			Padding(0, 1)
+		instanceSection = instanceStyle.Render(fmt.Sprintf("⚠ PID %d", m.instanceLock.HolderPID()))
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
 	// SESSION INDICATOR - Cass coding sessions for selected bead (bv-y836)
 	// ─────────────────────────────────────────────────────────────────────────
 	sessionSection := ""
@@ -4868,6 +4991,9 @@ func (m *Model) renderFooter() string {
 	if alertsSection != "" {
 		leftWidth += lipgloss.Width(alertsSection) + 1
 	}
+	if instanceSection != "" {
+		leftWidth += lipgloss.Width(instanceSection) + 1
+	}
 	if sessionSection != "" {
 		leftWidth += lipgloss.Width(sessionSection) + 1
 	}
@@ -4900,6 +5026,9 @@ func (m *Model) renderFooter() string {
 	parts = append(parts, labelHint)
 	if alertsSection != "" {
 		parts = append(parts, alertsSection)
+	}
+	if instanceSection != "" {
+		parts = append(parts, instanceSection)
 	}
 	if sessionSection != "" {
 		parts = append(parts, sessionSection)
@@ -6175,11 +6304,17 @@ func (m *Model) openInEditor() {
 	m.statusIsError = false
 }
 
-// Stop cleans up resources (file watcher, etc.)
+// Stop cleans up resources (file watcher, instance lock, background worker, etc.)
 // Should be called when the program exits
 func (m *Model) Stop() {
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.Stop()
+	}
 	if m.watcher != nil {
 		m.watcher.Stop()
+	}
+	if m.instanceLock != nil {
+		m.instanceLock.Release()
 	}
 }
 

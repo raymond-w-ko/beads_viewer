@@ -21,18 +21,19 @@ const (
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
-// COLOR PALETTE - Adaptive colors for light/dark terminal backgrounds
+// COLOR PALETTE - Adaptive colors for light and dark terminals
+// Light mode colors tuned for WCAG AA compliance (contrast ratio >= 4.5:1)
 // ══════════════════════════════════════════════════════════════════════════════
 
 var (
-	// Base colors (adaptive: Light mode default, Dark mode for dark terminals)
+	// Base colors - Light mode uses darker colors for contrast on white backgrounds
 	ColorBg          = lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}
-	ColorBgDark      = lipgloss.AdaptiveColor{Light: "#F5F5F7", Dark: "#1E1F29"}
-	ColorBgSubtle    = lipgloss.AdaptiveColor{Light: "#EAEAEF", Dark: "#363949"}
-	ColorBgHighlight = lipgloss.AdaptiveColor{Light: "#E0E0E8", Dark: "#44475A"}
-	ColorText        = lipgloss.AdaptiveColor{Light: "#1A1A2E", Dark: "#F8F8F2"}
+	ColorBgDark      = lipgloss.AdaptiveColor{Light: "#F5F5F5", Dark: "#1E1F29"}
+	ColorBgSubtle    = lipgloss.AdaptiveColor{Light: "#E8E8E8", Dark: "#363949"}
+	ColorBgHighlight = lipgloss.AdaptiveColor{Light: "#D0D0D0", Dark: "#44475A"}
+	ColorText        = lipgloss.AdaptiveColor{Light: "#1A1A1A", Dark: "#F8F8F2"}
 	ColorSubtext     = lipgloss.AdaptiveColor{Light: "#555555", Dark: "#BFBFBF"}
-	ColorMuted       = lipgloss.AdaptiveColor{Light: "#888888", Dark: "#6272A4"}
+	ColorMuted       = lipgloss.AdaptiveColor{Light: "#666666", Dark: "#6272A4"}
 
 	// Primary accent colors
 	ColorPrimary   = lipgloss.AdaptiveColor{Light: "#6B47D9", Dark: "#BD93F9"}
@@ -48,9 +49,9 @@ var (
 	ColorStatusBlocked    = lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF5555"}
 	ColorStatusClosed     = lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"}
 
-	// Status background colors (for badges)
+	// Status background colors (for badges) - subtle backgrounds
 	ColorStatusOpenBg       = lipgloss.AdaptiveColor{Light: "#D4EDDA", Dark: "#1A3D2A"}
-	ColorStatusInProgressBg = lipgloss.AdaptiveColor{Light: "#CCE5FF", Dark: "#1A3344"}
+	ColorStatusInProgressBg = lipgloss.AdaptiveColor{Light: "#D1ECF1", Dark: "#1A3344"}
 	ColorStatusBlockedBg    = lipgloss.AdaptiveColor{Light: "#F8D7DA", Dark: "#3D1A1A"}
 	ColorStatusClosedBg     = lipgloss.AdaptiveColor{Light: "#E2E3E5", Dark: "#2A2A3D"}
 
@@ -62,7 +63,7 @@ var (
 
 	// Priority background colors
 	ColorPrioCriticalBg = lipgloss.AdaptiveColor{Light: "#F8D7DA", Dark: "#3D1A1A"}
-	ColorPrioHighBg     = lipgloss.AdaptiveColor{Light: "#FFE5CC", Dark: "#3D2A1A"}
+	ColorPrioHighBg     = lipgloss.AdaptiveColor{Light: "#FFE8CC", Dark: "#3D2A1A"}
 	ColorPrioMediumBg   = lipgloss.AdaptiveColor{Light: "#FFF3CD", Dark: "#3D3D1A"}
 	ColorPrioLowBg      = lipgloss.AdaptiveColor{Light: "#D4EDDA", Dark: "#1A3D2A"}
 
@@ -97,7 +98,7 @@ var (
 // RenderPriorityBadge returns a styled priority badge
 // Priority values: 0=Critical, 1=High, 2=Medium, 3=Low, 4=Backlog
 func RenderPriorityBadge(priority int) string {
-	var fg, bg lipgloss.TerminalColor
+	var fg, bg lipgloss.AdaptiveColor
 	var label string
 
 	switch priority {
@@ -125,7 +126,7 @@ func RenderPriorityBadge(priority int) string {
 
 // RenderStatusBadge returns a styled status badge
 func RenderStatusBadge(status string) string {
-	var fg, bg lipgloss.TerminalColor
+	var fg, bg lipgloss.AdaptiveColor
 	var label string
 
 	switch status {
@@ -193,7 +194,7 @@ func RenderRankBadge(rank, total int) string {
 
 	percentile := float64(rank) / float64(total)
 
-	var color lipgloss.TerminalColor
+	var color lipgloss.AdaptiveColor
 	if percentile <= 0.1 {
 		color = ColorSuccess // Top 10%
 	} else if percentile <= 0.25 {

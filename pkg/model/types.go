@@ -157,8 +157,17 @@ const (
 	TypeChore   IssueType = "chore"
 )
 
-// IsValid returns true if the issue type is a recognized value
+// IsValid returns true if the issue type is non-empty.
+// Any non-empty type is considered valid to support extensibility in the Beads ecosystem
+// (e.g., Gastown orchestration types like "role", "agent", "molecule").
+// The UI will display a default icon for unrecognized types.
 func (t IssueType) IsValid() bool {
+	return t != ""
+}
+
+// IsKnownType returns true if the issue type is one of the standard bv types.
+// This is used for sorting and icon selection, not validation.
+func (t IssueType) IsKnownType() bool {
 	switch t {
 	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore:
 		return true
