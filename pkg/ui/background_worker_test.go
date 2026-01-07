@@ -541,3 +541,213 @@ func TestBackgroundWorker_SafeCompute(t *testing.T) {
 		t.Error("Worker should still be functional after panic recovery")
 	}
 }
+
+func TestHashPrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "short string (empty hash)",
+			input:    "empty",
+			expected: "empty",
+		},
+		{
+			name:     "exactly 16 chars",
+			input:    "1234567890123456",
+			expected: "1234567890123456",
+		},
+		{
+			name:     "longer than 16 chars",
+			input:    "8b423072ec4730921a2b3c4d5e6f7890",
+			expected: "8b423072ec473092",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := hashPrefix(tt.input)
+			if result != tt.expected {
+				t.Errorf("hashPrefix(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBackgroundWorker_StartAfterStop(t *testing.T) {
+	// Test that Start() returns error after Stop() has been called
+	cfg := WorkerConfig{
+		BeadsPath: "", // No watcher needed for this test
+	}
+
+	worker, err := NewBackgroundWorker(cfg)
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+
+	// Start and stop the worker
+	if err := worker.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	worker.Stop()
+
+	// Attempting to start again should fail
+	err = worker.Start()
+	if err == nil {
+		t.Error("Start() after Stop() should return an error")
+	}
+
+	// Verify the worker is stopped
+	if worker.State() != WorkerStopped {
+		t.Errorf("Expected WorkerStopped state, got %v", worker.State())
+	}
+}
+
+func TestBackgroundWorker_ConcurrentTrigger(t *testing.T) {
+	// Test that concurrent TriggerRefresh calls don't cause duplicate processing
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	content := `{"id":"test-1","title":"Test","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	cfg := WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 50 * time.Millisecond,
+	}
+
+	worker, err := NewBackgroundWorker(cfg)
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	if err := worker.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Fire multiple TriggerRefresh calls concurrently
+	// The fix ensures only one process() runs at a time, others mark dirty
+	for i := 0; i < 5; i++ {
+		go worker.TriggerRefresh()
+	}
+
+	// Wait for processing to complete
+	time.Sleep(400 * time.Millisecond)
+
+	// Worker should still be in idle state (not stuck in processing)
+	if worker.State() != WorkerIdle {
+		t.Errorf("Expected idle state after concurrent triggers, got %v", worker.State())
+	}
+
+	// Should have a valid snapshot
+	if worker.GetSnapshot() == nil {
+		t.Error("Expected snapshot after concurrent triggers")
+	}
+}
+
+func TestBackgroundWorker_Phase2Async(t *testing.T) {
+	// Test that Phase 2 analysis runs asynchronously (bv-e3ub)
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	// Create a file with some dependencies to make Phase 2 analysis non-trivial
+	content := `{"id":"test-1","title":"Root","status":"open","priority":1,"issue_type":"task"}
+{"id":"test-2","title":"Child","status":"open","priority":2,"issue_type":"task","dependencies":[{"depends_on":"test-1","type":"blocks"}]}
+`
+	if err := os.WriteFile(beadsPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	cfg := WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 50 * time.Millisecond,
+	}
+
+	worker, err := NewBackgroundWorker(cfg)
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	// Trigger refresh and wait for snapshot
+	worker.TriggerRefresh()
+	time.Sleep(200 * time.Millisecond)
+
+	snapshot := worker.GetSnapshot()
+	if snapshot == nil {
+		t.Fatal("Expected snapshot after refresh")
+	}
+
+	// Snapshot should exist with analysis
+	if snapshot.Analysis == nil {
+		t.Fatal("Expected Analysis in snapshot")
+	}
+
+	// Wait for Phase 2 to complete using the GraphStats API
+	snapshot.Analysis.WaitForPhase2()
+
+	// After waiting, Phase 2 should be ready
+	if !snapshot.Analysis.IsPhase2Ready() {
+		t.Error("Phase 2 should be ready after WaitForPhase2()")
+	}
+}
+
+func TestBackgroundWorker_Phase2NoSendAfterStop(t *testing.T) {
+	// Test that runPhase2Analysis doesn't send if worker is stopped (bv-e3ub)
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	content := `{"id":"test-1","title":"Test","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	cfg := WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 50 * time.Millisecond,
+	}
+
+	worker, err := NewBackgroundWorker(cfg)
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+
+	// Trigger refresh
+	worker.TriggerRefresh()
+
+	// Stop immediately (before Phase 2 can complete)
+	worker.Stop()
+
+	// Worker should be stopped
+	if worker.State() != WorkerStopped {
+		t.Errorf("Expected stopped state, got %v", worker.State())
+	}
+
+	// The test passes if we reach here without panicking
+	// (runPhase2Analysis should gracefully handle stopped worker)
+}
+
+func TestDataSnapshot_GetGraphStats(t *testing.T) {
+	// Test GetGraphStats helper method (bv-e3ub)
+
+	// Test nil snapshot
+	var nilSnapshot *DataSnapshot
+	if nilSnapshot.GetGraphStats() != nil {
+		t.Error("GetGraphStats on nil snapshot should return nil")
+	}
+
+	// Test snapshot with nil Analysis
+	emptySnapshot := &DataSnapshot{}
+	if emptySnapshot.GetGraphStats() != nil {
+		t.Error("GetGraphStats with nil Analysis should return nil")
+	}
+}

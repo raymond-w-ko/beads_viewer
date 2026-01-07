@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
+	"sync"
 	"time"
 )
+
+// staleLockMu serializes stale lock takeover attempts within the same process.
+// This prevents multiple goroutines from simultaneously claiming the same stale lock.
+var staleLockMu sync.Mutex
 
 // LockInfo contains metadata about the process holding the lock.
 type LockInfo struct {
@@ -126,42 +130,80 @@ func (l *Lock) HolderPID() int {
 }
 
 // checkStale checks if the existing lock is stale (held by a dead process)
-// and takes it over if so.
+// and takes it over if so. Uses atomic rename to avoid TOCTOU race conditions.
 func (l *Lock) checkStale() {
-	if l.isFirst || l.pid == 0 {
+	if l.isFirst {
 		return
 	}
 
-	// Check if the process holding the lock is still alive
-	if !isProcessAlive(l.pid) {
-		// Stale lock - take over
-		os.Remove(l.path)
+	// Serialize stale lock takeover attempts within the same process
+	staleLockMu.Lock()
+	defer staleLockMu.Unlock()
 
-		file, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
-		if err == nil {
-			l.lockFile = file
-			l.isFirst = true
-			l.pid = os.Getpid()
-			l.writeLockInfo()
-		}
-	}
-}
-
-// isProcessAlive checks if a process with the given PID is still running.
-func isProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-
-	process, err := os.FindProcess(pid)
+	// Re-read the lock file to get current state (another goroutine may have taken over)
+	existing, err := readLockFile(l.path)
 	if err != nil {
-		return false
+		// Can't read lock file - might have been deleted
+		return
+	}
+	currentPID := existing.PID
+
+	// Check if the process holding the lock is still alive
+	if isProcessAlive(currentPID) {
+		// Lock is held by a live process - update our record and don't take over
+		l.pid = currentPID
+		return
 	}
 
-	// On Unix, sending signal 0 checks if process exists without actually signaling
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	// Stale lock detected - attempt atomic takeover using rename
+	// This avoids the race condition of delete + create with O_EXCL
+	tmpPath := fmt.Sprintf("%s.%d", l.path, os.Getpid())
+
+	// Create temp file with our lock info
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return
+	}
+
+	hostname, _ := os.Hostname()
+	info := LockInfo{
+		PID:       os.Getpid(),
+		StartedAt: time.Now(),
+		Hostname:  hostname,
+	}
+
+	if err := json.NewEncoder(file).Encode(info); err != nil {
+		file.Close()
+		os.Remove(tmpPath)
+		return
+	}
+	file.Sync() // Ensure written to disk before rename
+	file.Close()
+
+	// Atomic rename to take over the lock
+	// On most filesystems, rename is atomic and will overwrite the existing file
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		os.Remove(tmpPath)
+		return
+	}
+
+	// Verify we won the race by re-reading and checking our PID
+	// This handles the case where two processes both rename simultaneously
+	verifyInfo, err := readLockFile(l.path)
+	if err != nil || verifyInfo.PID != os.Getpid() {
+		// Lost the race to another process - don't claim ownership
+		return
+	}
+
+	// Successfully took over the stale lock
+	l.lockFile, _ = os.OpenFile(l.path, os.O_WRONLY, 0644)
+	l.isFirst = true
+	l.pid = os.Getpid()
 }
+
+// isProcessAlive is implemented in platform-specific files:
+// - lock_unix.go for Unix/Linux/macOS (uses signal 0)
+// - lock_windows.go for Windows (uses OpenProcess API)
 
 // Release releases the lock file and cleans up.
 // This should be called when the application exits.

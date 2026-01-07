@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"context"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
@@ -43,6 +44,11 @@ type DataSnapshot struct {
 	CreatedAt time.Time // When this snapshot was built
 	DataHash  string    // Hash of source data for cache validation
 
+	// Phase 2 analysis status
+	// Phase2Ready is true when expensive metrics (PageRank, Betweenness, etc.) are computed
+	// UI can render immediately with Phase 1 data, then refresh when Phase 2 completes
+	Phase2Ready bool
+
 	// Error state (for graceful degradation)
 	LoadError    error     // Non-nil if last load had recoverable errors
 	ErrorTime    time.Time // When error occurred
@@ -73,14 +79,16 @@ func (b *SnapshotBuilder) WithAnalysis(a *analysis.GraphStats) *SnapshotBuilder 
 
 // Build constructs the final immutable DataSnapshot.
 // This performs all necessary computations that should happen in the background.
+// Uses AnalyzeAsync() so Phase 2 metrics compute in background - check Phase2Ready
+// or call GetGraphStats().WaitForPhase2() if you need Phase 2 data immediately.
 func (b *SnapshotBuilder) Build() *DataSnapshot {
 	issues := b.issues
 
 	// Compute analysis if not provided
+	// Use AnalyzeAsync to allow Phase 2 to run in background
 	graphStats := b.analysis
 	if graphStats == nil {
-		stats := b.analyzer.Analyze()
-		graphStats = &stats
+		graphStats = b.analyzer.AnalyzeAsync(context.Background())
 	}
 
 	// Build lookup map
@@ -186,7 +194,17 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		BlockerSet:    blockerSet,
 		UnblocksMap:   unblocksMap,
 		CreatedAt:     time.Now(),
+		Phase2Ready:   graphStats.IsPhase2Ready(),
 	}
+}
+
+// GetGraphStats returns the GraphStats pointer for Phase 2 waiting.
+// Callers can use stats.WaitForPhase2() to block until Phase 2 completes.
+func (s *DataSnapshot) GetGraphStats() *analysis.GraphStats {
+	if s == nil {
+		return nil
+	}
+	return s.Analysis
 }
 
 // IsEmpty returns true if the snapshot has no issues.

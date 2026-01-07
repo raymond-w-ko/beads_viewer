@@ -118,8 +118,13 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 
 // Start begins watching for file changes and processing in the background.
 // Start is idempotent - calling it multiple times has no effect.
+// Returns error if the worker has been stopped.
 func (w *BackgroundWorker) Start() error {
 	w.mu.Lock()
+	if w.state == WorkerStopped {
+		w.mu.Unlock()
+		return fmt.Errorf("worker has been stopped")
+	}
 	if w.started {
 		w.mu.Unlock()
 		return nil // Already started
@@ -129,6 +134,10 @@ func (w *BackgroundWorker) Start() error {
 
 	if w.watcher != nil {
 		if err := w.watcher.Start(); err != nil {
+			// Reset started flag so caller can retry or Stop() won't block
+			w.mu.Lock()
+			w.started = false
+			w.mu.Unlock()
 			return err
 		}
 
@@ -225,7 +234,12 @@ func (w *BackgroundWorker) processLoop() {
 // process builds a new snapshot from the current file.
 func (w *BackgroundWorker) process() {
 	w.mu.Lock()
-	if w.state == WorkerStopped {
+	if w.state != WorkerIdle {
+		// Already stopped or processing
+		if w.state == WorkerProcessing {
+			// Mark dirty so current processor will re-run when done
+			w.dirty = true
+		}
 		w.mu.Unlock()
 		return
 	}
@@ -350,7 +364,7 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 	w.mu.RUnlock()
 
 	if hash == lastHash && lastHash != "" {
-		log.Printf("buildSnapshot: content unchanged (hash=%s), skipping rebuild", hash[:16])
+		log.Printf("buildSnapshot: content unchanged (hash=%s), skipping rebuild", hashPrefix(hash))
 		// Clear any previous error on successful dedup
 		w.recordError(nil)
 		return nil
@@ -396,9 +410,43 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 
 	totalDuration := time.Since(start)
 	log.Printf("buildSnapshot: loaded %d issues (load=%v, analyze=%v, total=%v, hash=%s)",
-		len(issues), loadDuration, analyzeDuration, totalDuration, hash[:16])
+		len(issues), loadDuration, analyzeDuration, totalDuration, hashPrefix(hash))
+
+	// Spawn Phase 2 completion watcher if Phase 2 isn't ready yet
+	if snapshot != nil && !snapshot.Phase2Ready {
+		go w.runPhase2Analysis(snapshot.Analysis, hash)
+	}
 
 	return snapshot
+}
+
+// runPhase2Analysis waits for Phase 2 analysis to complete and notifies the UI.
+// This runs in a goroutine so it doesn't block snapshot delivery.
+// The dataHash is used by the UI to verify the update matches the current snapshot.
+func (w *BackgroundWorker) runPhase2Analysis(stats *analysis.GraphStats, dataHash string) {
+	if stats == nil {
+		return
+	}
+
+	// Wait for Phase 2 to complete (blocking)
+	stats.WaitForPhase2()
+
+	// Check if worker was stopped while we were waiting
+	w.mu.RLock()
+	stopped := w.state == WorkerStopped
+	w.mu.RUnlock()
+
+	if stopped {
+		log.Printf("runPhase2Analysis: worker stopped, not sending update")
+		return
+	}
+
+	log.Printf("runPhase2Analysis: Phase 2 complete for hash=%s", hashPrefix(dataHash))
+
+	// Notify UI that Phase 2 metrics are ready
+	if w.program != nil {
+		w.program.Send(Phase2UpdateMsg{DataHash: dataHash})
+	}
 }
 
 // SnapshotReadyMsg is sent to the UI when a new snapshot is ready.
@@ -414,8 +462,9 @@ type SnapshotErrorMsg struct {
 
 // Phase2UpdateMsg is sent when Phase 2 analysis completes.
 // This allows the UI to update without waiting for full rebuild.
+// The UI should check DataHash matches current snapshot before using.
 type Phase2UpdateMsg struct {
-	// Phase 2 metrics are embedded in the GraphStats
+	DataHash string // Content hash to verify this matches current snapshot
 }
 
 // WatcherChanged returns the watcher's change notification channel.
@@ -433,6 +482,15 @@ func (w *BackgroundWorker) LastHash() string {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.lastHash
+}
+
+// hashPrefix returns a safe prefix of the hash for logging.
+// Returns up to 16 characters, or the full hash if shorter.
+func hashPrefix(hash string) string {
+	if len(hash) > 16 {
+		return hash[:16]
+	}
+	return hash
 }
 
 // ResetHash clears the stored content hash, forcing the next buildSnapshot

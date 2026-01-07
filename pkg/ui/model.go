@@ -1109,6 +1109,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Stats != m.analysis {
 			return m, nil
 		}
+
+		// Mark snapshot as Phase 2 ready for consistency with Phase2UpdateMsg (bv-e3ub)
+		if m.snapshot != nil {
+			m.snapshot.Phase2Ready = true
+		}
+
 		// Phase 2 analysis complete - regenerate insights with full data
 		ins := m.analysis.GenerateInsights(len(m.issues))
 		m.insightsPanel = NewInsightsModel(ins, m.issueMap, m.theme)
@@ -1178,6 +1184,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.applyFilter()
 		}
+
+	case Phase2UpdateMsg:
+		// BackgroundWorker notifies that Phase 2 analysis is complete (bv-e3ub)
+		// Verify this update matches the current snapshot using DataHash
+		if m.snapshot == nil || m.snapshot.DataHash != msg.DataHash {
+			// Stale update - ignore
+			return m, nil
+		}
+
+		// Mark snapshot as Phase 2 ready
+		m.snapshot.Phase2Ready = true
+
+		// Note: Phase2ReadyMsg handler (via WaitForPhase2Cmd) already handles
+		// all the UI updates (insights, graph view, alerts, etc.). This message
+		// is a complementary notification from the BackgroundWorker that Phase 2
+		// completed. If Phase2ReadyMsg hasn't fired yet, it will handle the full
+		// UI refresh. If it already fired (race condition), this is a no-op.
+		return m, nil
 
 	case HistoryLoadedMsg:
 		// Background history loading completed
@@ -6286,9 +6310,14 @@ func (m *Model) openInEditor() {
 		// This matches git's behavior with $EDITOR
 		switch runtime.GOOS {
 		case "windows":
-			cmd = exec.Command("cmd", "/c", editor+" \""+beadsFile+"\"")
+			// Escape double quotes and wrap in double quotes for Windows cmd.exe
+			escapedFile := strings.ReplaceAll(beadsFile, `"`, `""`)
+			cmd = exec.Command("cmd", "/c", editor+` "`+escapedFile+`"`)
 		default:
-			cmd = exec.Command("sh", "-c", editor+" \""+beadsFile+"\"")
+			// Use single quotes for Unix shells to prevent all shell expansion.
+			// Single quotes within the path are escaped as: end quote, escaped quote, start quote.
+			escapedFile := strings.ReplaceAll(beadsFile, "'", `'\''`)
+			cmd = exec.Command("sh", "-c", editor+" '"+escapedFile+"'")
 		}
 	} else {
 		// Simple editor command without arguments

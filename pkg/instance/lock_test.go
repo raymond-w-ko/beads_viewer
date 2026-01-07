@@ -263,3 +263,68 @@ func TestNewLock_EmptyLockFile(t *testing.T) {
 	}
 	defer lock.Release()
 }
+
+func TestNewLock_ConcurrentStaleTakeover(t *testing.T) {
+	// Test that concurrent attempts to take over a stale lock don't both succeed
+	// (verifies the atomic rename + verify fix for the TOCTOU race condition)
+	tmpDir := t.TempDir()
+
+	// Create a stale lock file with a fake PID
+	staleLockPath := filepath.Join(tmpDir, LockFileName)
+	info := LockInfo{
+		PID:       99999999,
+		StartedAt: time.Now().Add(-time.Hour),
+		Hostname:  "stale-host",
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("marshaling stale lock: %v", err)
+	}
+	if err := os.WriteFile(staleLockPath, data, 0644); err != nil {
+		t.Fatalf("writing stale lock: %v", err)
+	}
+
+	// Simulate concurrent takeover attempts using goroutines
+	// Each goroutine creates a Lock and tries to take over
+	const numGoroutines = 10
+	type result struct {
+		lock    *Lock
+		isFirst bool
+	}
+	results := make(chan result, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			lock, err := NewLock(tmpDir)
+			if err != nil {
+				results <- result{nil, false}
+				return
+			}
+			// Don't release here - we need to keep locks held until all goroutines finish
+			results <- result{lock, lock.IsFirstInstance()}
+		}()
+	}
+
+	// Collect all results and count first instances
+	locks := make([]*Lock, 0, numGoroutines)
+	firstCount := 0
+	for i := 0; i < numGoroutines; i++ {
+		r := <-results
+		if r.lock != nil {
+			locks = append(locks, r.lock)
+		}
+		if r.isFirst {
+			firstCount++
+		}
+	}
+
+	// Release all locks after counting
+	for _, lock := range locks {
+		lock.Release()
+	}
+
+	// Exactly one goroutine should claim to be first instance
+	if firstCount != 1 {
+		t.Errorf("Expected exactly 1 goroutine to be first instance, got %d", firstCount)
+	}
+}
