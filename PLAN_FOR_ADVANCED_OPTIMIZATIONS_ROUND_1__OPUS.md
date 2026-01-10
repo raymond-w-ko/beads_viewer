@@ -183,7 +183,7 @@ delta := make(map[int64]float64)  // N entries
 pred := make(map[int64][]int64)   // N entries + dynamic slices
 ```
 
-For 500 nodes × 100 samples = 400 maps with 200K+ entries allocated per operation.
+For a 500-node graph with 100 samples: 400 maps created (4 per sample), totaling ~200K entries.
 
 ### 3C) I/O Profile Sanity Check
 
@@ -277,7 +277,7 @@ Scoring: **(Impact × Confidence) / Effort**
 
 ### Change 1 (Primary): Buffer Pooling for Brandes' Algorithm
 
-**Location**: `pkg/analysis/betweenness_approx.go:162-241`
+**Location**: `pkg/analysis/betweenness_approx.go:167-241`
 
 **Current Implementation**:
 ```go
@@ -487,7 +487,7 @@ Explicit mapping of optimization techniques to this codebase:
 
 | Metric | Value |
 |--------|-------|
-| Allocations/op (Sample100) | 199,550 |
+| Allocations/op (Sample100) | 199,548 |
 | Bytes/op (Sample100) | 29.5 MB |
 | GC CPU overhead | ~45% |
 
