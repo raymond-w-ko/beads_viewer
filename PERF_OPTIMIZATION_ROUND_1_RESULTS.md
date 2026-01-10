@@ -66,10 +66,10 @@ which is addressed in Round 2 via cached adjacency lists.
 
 ### Changes Made
 
-1. **`brandesBuffers` struct** (lines 15-34): Holds reusable maps and slices for BFS
-2. **`brandesPool` sync.Pool** (lines 36-58): Thread-safe buffer reuse with 256-entry pre-allocation
-3. **`reset()` method** (lines 60-105): Clears buffers while retaining capacity
-4. **`singleSourceBetweenness`** (lines 254-329): Modified to use pooled buffers
+1. **`brandesBuffers` struct** (lines 26-34): Holds reusable maps and slices for BFS
+2. **`brandesPool` sync.Pool** (lines 46-58): Thread-safe buffer reuse with 256-entry pre-allocation
+3. **`reset()` method** (lines 74-105): Clears buffers while retaining capacity
+4. **`singleSourceBetweenness`** (lines 264-333): Modified to use pooled buffers
 
 ### Memory Strategy
 
