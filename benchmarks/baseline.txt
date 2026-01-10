@@ -105,4 +105,5 @@ BenchmarkLongChain_Betweenness500-64                	      16	 230805297 ns/op	4
 BenchmarkLongChain_Betweenness500-64                	       9	 287370761 ns/op	633993044 B/op	 1389924 allocs/op
 BenchmarkLongChain_Betweenness500-64                	       6	 183227194 ns/op	626050416 B/op	 1441625 allocs/op
 BenchmarkLongChain_TopoSort2000-64                  	     100	  20165865 ns/op	15544113 B/op	   50761 allocs/op
+BenchmarkLongChain_TopoSort2000-64                  	     110	  12739761 ns/op	43316303 B/op	   37268 allocs/op
 BenchmarkLongChain_TopoSort2000-64                  	
