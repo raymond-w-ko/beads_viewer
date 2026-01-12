@@ -3,6 +3,8 @@ package correlation
 import (
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func createTestHistoryReport() *HistoryReport {
@@ -197,6 +199,62 @@ func TestBuildNetworkSharedFiles(t *testing.T) {
 	}
 }
 
+func TestBuildNetworkDependencyEdges(t *testing.T) {
+	report := createTestHistoryReport()
+	issues := []model.Issue{
+		{
+			ID: "bv-001",
+			Dependencies: []*model.Dependency{
+				{
+					IssueID:     "bv-001",
+					DependsOnID: "bv-002",
+					Type:        model.DepBlocks,
+				},
+			},
+		},
+		{
+			ID: "bv-003",
+			Dependencies: []*model.Dependency{
+				{
+					IssueID:     "bv-003",
+					DependsOnID: "bv-001",
+					Type:        model.DepBlocks,
+				},
+				{
+					IssueID:     "bv-003",
+					DependsOnID: "bv-004",
+					Type:        model.DepRelated,
+				},
+			},
+		},
+	}
+	builder := NewNetworkBuilderWithIssues(report, issues)
+	network := builder.Build()
+
+	foundBlocking := false
+	foundRelated := false
+	for _, edge := range network.Edges {
+		if edge.EdgeType != EdgeDependency {
+			continue
+		}
+		if (edge.FromBead == "bv-001" && edge.ToBead == "bv-002") ||
+			(edge.FromBead == "bv-002" && edge.ToBead == "bv-001") {
+			foundBlocking = true
+		}
+		if (edge.FromBead == "bv-003" && edge.ToBead == "bv-004") ||
+			(edge.FromBead == "bv-004" && edge.ToBead == "bv-003") {
+			foundRelated = true
+		}
+	}
+
+	if !foundBlocking {
+		t.Error("Expected blocking dependency edge between bv-001 and bv-002")
+	}
+	if foundRelated {
+		t.Error("Did not expect non-blocking dependency edge for DepRelated")
+	}
+}
+
 func TestClusterDetection(t *testing.T) {
 	report := createTestHistoryReport()
 	builder := NewNetworkBuilder(report)
@@ -253,11 +311,11 @@ func TestGetSubNetworkDepthLimits(t *testing.T) {
 		depth    int
 		expected int // expected capped depth
 	}{
-		{0, 1},  // depth < 1 should become 1
+		{0, 1}, // depth < 1 should become 1
 		{1, 1},
 		{2, 2},
 		{3, 3},
-		{4, 3},  // depth > 3 should become 3
+		{4, 3}, // depth > 3 should become 3
 		{100, 3},
 	}
 

@@ -258,6 +258,12 @@ type WorkerConfig struct {
 // NewBackgroundWorker creates a new background worker.
 func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	initialized := false
+	defer func() {
+		if !initialized {
+			cancel()
+		}
+	}()
 
 	if cfg.DebounceDelay == 0 {
 		cfg.DebounceDelay = envDurationMilliseconds("BV_DEBOUNCE_MS", 200*time.Millisecond)
@@ -342,12 +348,12 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 			watcher.WithDebounceDuration(cfg.DebounceDelay),
 		)
 		if err != nil {
-			cancel()
 			return nil, err
 		}
 		w.watcher = fw
 	}
 
+	initialized = true
 	return w, nil
 }
 
@@ -415,6 +421,12 @@ func (w *BackgroundWorker) openTraceFile() {
 		})
 		return
 	}
+	// Close the file unless we successfully take ownership.
+	defer func() {
+		if w.traceFile != f {
+			_ = f.Close()
+		}
+	}()
 	w.traceFile = f
 }
 
@@ -626,16 +638,29 @@ func (w *BackgroundWorker) startLoop() {
 		return
 	}
 
-	loopCtx, loopCancel := context.WithCancel(w.ctx)
 	done := make(chan struct{})
 
-	w.loopCtx = loopCtx
-	w.loopCancel = loopCancel
 	w.done = done
 	w.lastHeartbeat = time.Now()
 	w.mu.Unlock()
 
-	go w.processLoop(loopCtx, done)
+	go w.runProcessLoop(done)
+}
+
+func (w *BackgroundWorker) runProcessLoop(done chan struct{}) {
+	loopCtx, loopCancel := context.WithCancel(w.ctx)
+	defer loopCancel()
+
+	w.mu.Lock()
+	if w.state == WorkerStopped {
+		w.mu.Unlock()
+		return
+	}
+	w.loopCtx = loopCtx
+	w.loopCancel = loopCancel
+	w.mu.Unlock()
+
+	w.processLoop(loopCtx, done)
 }
 
 func (w *BackgroundWorker) startWatchdog() {

@@ -4,6 +4,8 @@ package correlation
 import (
 	"sort"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // NetworkEdgeType categorizes the types of connections between beads.
@@ -29,72 +31,89 @@ type NetworkEdge struct {
 
 // NetworkNode represents a bead in the impact network.
 type NetworkNode struct {
-	BeadID        string    `json:"bead_id"`
-	Title         string    `json:"title"`
-	Status        string    `json:"status"`
-	Priority      int       `json:"priority"`
-	LastActivity  time.Time `json:"last_activity"`
-	Degree        int       `json:"degree"`         // Number of connections
-	ClusterID     int       `json:"cluster_id"`     // Cluster membership (-1 if none)
-	CommitCount   int       `json:"commit_count"`   // Number of associated commits
-	FileCount     int       `json:"file_count"`     // Number of touched files
-	Connectivity  float64   `json:"connectivity"`   // Ratio of edges to potential edges in cluster
+	BeadID       string    `json:"bead_id"`
+	Title        string    `json:"title"`
+	Status       string    `json:"status"`
+	Priority     int       `json:"priority"`
+	LastActivity time.Time `json:"last_activity"`
+	Degree       int       `json:"degree"`       // Number of connections
+	ClusterID    int       `json:"cluster_id"`   // Cluster membership (-1 if none)
+	CommitCount  int       `json:"commit_count"` // Number of associated commits
+	FileCount    int       `json:"file_count"`   // Number of touched files
+	Connectivity float64   `json:"connectivity"` // Ratio of edges to potential edges in cluster
 }
 
 // BeadCluster represents a group of tightly connected beads.
 type BeadCluster struct {
-	ClusterID          int       `json:"cluster_id"`
-	BeadIDs            []string  `json:"bead_ids"`
-	Label              string    `json:"label"`               // Auto-generated or user-provided label
-	InternalEdges      int       `json:"internal_edges"`      // Edges within cluster
-	ExternalEdges      int       `json:"external_edges"`      // Edges to other clusters
-	InternalConnectivity float64 `json:"internal_connectivity"` // internal_edges / max_possible
-	CentralBead        string    `json:"central_bead"`        // Bead with highest degree in cluster
-	SharedFiles        []string  `json:"shared_files"`        // Common files across cluster beads
-	TotalCommits       int       `json:"total_commits"`       // Sum of commits across cluster
+	ClusterID            int      `json:"cluster_id"`
+	BeadIDs              []string `json:"bead_ids"`
+	Label                string   `json:"label"`                 // Auto-generated or user-provided label
+	InternalEdges        int      `json:"internal_edges"`        // Edges within cluster
+	ExternalEdges        int      `json:"external_edges"`        // Edges to other clusters
+	InternalConnectivity float64  `json:"internal_connectivity"` // internal_edges / max_possible
+	CentralBead          string   `json:"central_bead"`          // Bead with highest degree in cluster
+	SharedFiles          []string `json:"shared_files"`          // Common files across cluster beads
+	TotalCommits         int      `json:"total_commits"`         // Sum of commits across cluster
 }
 
 // ImpactNetwork represents the full network graph of bead relationships.
 type ImpactNetwork struct {
-	GeneratedAt  time.Time              `json:"generated_at"`
-	DataHash     string                 `json:"data_hash"`
-	Nodes        map[string]*NetworkNode `json:"nodes"`
-	Edges        []NetworkEdge          `json:"edges"`
-	Clusters     []BeadCluster          `json:"clusters"`
-	Stats        NetworkStats           `json:"stats"`
+	GeneratedAt time.Time               `json:"generated_at"`
+	DataHash    string                  `json:"data_hash"`
+	Nodes       map[string]*NetworkNode `json:"nodes"`
+	Edges       []NetworkEdge           `json:"edges"`
+	Clusters    []BeadCluster           `json:"clusters"`
+	Stats       NetworkStats            `json:"stats"`
 }
 
 // NetworkStats provides aggregate statistics about the network.
 type NetworkStats struct {
-	TotalNodes       int     `json:"total_nodes"`
-	TotalEdges       int     `json:"total_edges"`
-	ClusterCount     int     `json:"cluster_count"`
-	AvgDegree        float64 `json:"avg_degree"`
-	MaxDegree        int     `json:"max_degree"`
-	Density          float64 `json:"density"`          // edges / max_possible_edges
-	IsolatedNodes    int     `json:"isolated_nodes"`   // Nodes with no connections
-	LargestCluster   int     `json:"largest_cluster"`  // Size of largest cluster
+	TotalNodes     int     `json:"total_nodes"`
+	TotalEdges     int     `json:"total_edges"`
+	ClusterCount   int     `json:"cluster_count"`
+	AvgDegree      float64 `json:"avg_degree"`
+	MaxDegree      int     `json:"max_degree"`
+	Density        float64 `json:"density"`         // edges / max_possible_edges
+	IsolatedNodes  int     `json:"isolated_nodes"`  // Nodes with no connections
+	LargestCluster int     `json:"largest_cluster"` // Size of largest cluster
 }
 
 // NetworkBuilder constructs an impact network from correlation data.
 type NetworkBuilder struct {
-	report    *HistoryReport
-	fileIndex *FileBeadIndex
-	beadFiles map[string]map[string]bool // beadID -> set of file paths
+	report      *HistoryReport
+	fileIndex   *FileBeadIndex
+	beadFiles   map[string]map[string]bool // beadID -> set of file paths
 	beadCommits map[string]map[string]bool // beadID -> set of commit SHAs
+	issues      []model.Issue
+	issueIndex  map[string]model.Issue
 }
 
 // NewNetworkBuilder creates a new network builder from a history report.
 func NewNetworkBuilder(report *HistoryReport) *NetworkBuilder {
+	return NewNetworkBuilderWithIssues(report, nil)
+}
+
+// NewNetworkBuilderWithIssues creates a new network builder from a history report and issues.
+func NewNetworkBuilderWithIssues(report *HistoryReport, issues []model.Issue) *NetworkBuilder {
 	nb := &NetworkBuilder{
 		report:      report,
 		beadFiles:   make(map[string]map[string]bool),
 		beadCommits: make(map[string]map[string]bool),
+		issues:      issues,
 	}
 
 	if report != nil {
 		nb.fileIndex = BuildFileIndex(report)
 		nb.buildBeadMaps()
+	}
+	if len(issues) > 0 {
+		nb.issueIndex = make(map[string]model.Issue, len(issues))
+		for _, issue := range issues {
+			if issue.ID == "" {
+				continue
+			}
+			nb.issueIndex[issue.ID] = issue
+		}
 	}
 
 	return nb
@@ -138,16 +157,19 @@ func (nb *NetworkBuilder) Build() *ImpactNetwork {
 	for beadID, history := range nb.report.Histories {
 		// Get priority from somewhere (default to 2 if not available)
 		priority := 2 // Default medium priority
+		if issue, ok := nb.issueIndex[beadID]; ok {
+			priority = issue.Priority
+		}
 
 		node := &NetworkNode{
-			BeadID:       beadID,
-			Title:        history.Title,
-			Status:       history.Status,
-			Priority:     priority,
-			Degree:       0,
-			ClusterID:    -1,
-			CommitCount:  len(history.Commits),
-			FileCount:    len(nb.beadFiles[beadID]),
+			BeadID:      beadID,
+			Title:       history.Title,
+			Status:      history.Status,
+			Priority:    priority,
+			Degree:      0,
+			ClusterID:   -1,
+			CommitCount: len(history.Commits),
+			FileCount:   len(nb.beadFiles[beadID]),
 		}
 
 		// Set last activity from milestones or commits
@@ -169,6 +191,9 @@ func (nb *NetworkBuilder) Build() *ImpactNetwork {
 
 	// Build edges from shared files
 	nb.addSharedFileEdges(network)
+
+	// Build edges from explicit blocking dependencies
+	nb.addDependencyEdges(network)
 
 	// Update node degrees
 	for _, edge := range network.Edges {
@@ -293,6 +318,64 @@ func (nb *NetworkBuilder) addSharedFileEdges(network *ImpactNetwork) {
 	}
 }
 
+// addDependencyEdges adds edges for explicit blocking dependencies.
+func (nb *NetworkBuilder) addDependencyEdges(network *ImpactNetwork) {
+	if nb == nil || len(nb.issues) == 0 || network == nil {
+		return
+	}
+
+	edgeSet := make(map[string]bool)
+	edgeWeights := make(map[string]int)
+	edgeDetails := make(map[string][]string)
+
+	for _, issue := range nb.issues {
+		fromID := issue.ID
+		if fromID == "" {
+			continue
+		}
+		if _, ok := network.Nodes[fromID]; !ok {
+			continue
+		}
+		for _, dep := range issue.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			toID := dep.DependsOnID
+			if toID == "" || toID == fromID {
+				continue
+			}
+			if _, ok := network.Nodes[toID]; !ok {
+				continue
+			}
+
+			beadA, beadB := fromID, toID
+			if beadA > beadB {
+				beadA, beadB = beadB, beadA
+			}
+			key := beadA + ":" + beadB + ":dep"
+
+			edgeWeights[key]++
+			edgeSet[key] = true
+			if len(edgeDetails[key]) < 5 {
+				edgeDetails[key] = append(edgeDetails[key], fromID+" -> "+toID)
+			}
+		}
+	}
+
+	for key := range edgeSet {
+		parts := splitEdgeKey(key)
+		if len(parts) >= 2 {
+			network.Edges = append(network.Edges, NetworkEdge{
+				FromBead: parts[0],
+				ToBead:   parts[1],
+				EdgeType: EdgeDependency,
+				Weight:   edgeWeights[key],
+				Details:  edgeDetails[key],
+			})
+		}
+	}
+}
+
 // splitEdgeKey parses "beadA:beadB:type" back to parts.
 func splitEdgeKey(key string) []string {
 	result := []string{}
@@ -393,9 +476,9 @@ func (nb *NetworkBuilder) detectClusters(network *ImpactNetwork) {
 // buildCluster creates a cluster from a set of bead IDs.
 func (nb *NetworkBuilder) buildCluster(id int, beadIDs []string, network *ImpactNetwork) BeadCluster {
 	cluster := BeadCluster{
-		ClusterID:     id,
-		BeadIDs:       beadIDs,
-		SharedFiles:   []string{},
+		ClusterID:   id,
+		BeadIDs:     beadIDs,
+		SharedFiles: []string{},
 	}
 
 	// Create set of cluster beads for quick lookup
@@ -674,14 +757,14 @@ func (network *ImpactNetwork) GetSubNetwork(beadID string, depth int) *ImpactNet
 
 // ImpactNetworkResult is the robot command output structure.
 type ImpactNetworkResult struct {
-	GeneratedAt  time.Time       `json:"generated_at"`
-	DataHash     string          `json:"data_hash"`
-	BeadID       string          `json:"bead_id,omitempty"`      // Set if queried for specific bead
-	Depth        int             `json:"depth,omitempty"`        // Set if using subnetwork
-	Network      *ImpactNetwork  `json:"network,omitempty"`      // Full or sub network
-	Stats        NetworkStats    `json:"stats"`
-	TopClusters  []BeadCluster   `json:"top_clusters,omitempty"` // Top 5 clusters
-	TopConnected []NetworkNode   `json:"top_connected,omitempty"` // Top 10 most connected beads
+	GeneratedAt  time.Time      `json:"generated_at"`
+	DataHash     string         `json:"data_hash"`
+	BeadID       string         `json:"bead_id,omitempty"` // Set if queried for specific bead
+	Depth        int            `json:"depth,omitempty"`   // Set if using subnetwork
+	Network      *ImpactNetwork `json:"network,omitempty"` // Full or sub network
+	Stats        NetworkStats   `json:"stats"`
+	TopClusters  []BeadCluster  `json:"top_clusters,omitempty"`  // Top 5 clusters
+	TopConnected []NetworkNode  `json:"top_connected,omitempty"` // Top 10 most connected beads
 }
 
 // ToResult converts the network to a robot command result.
