@@ -109,6 +109,11 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		return fmt.Errorf("insert dependencies: %w", err)
 	}
 
+	// Insert comments (bv-52)
+	if err := e.insertComments(db); err != nil {
+		return fmt.Errorf("insert comments: %w", err)
+	}
+
 	// Insert metrics
 	if err := e.insertMetrics(db); err != nil {
 		return fmt.Errorf("insert metrics: %w", err)
@@ -246,6 +251,53 @@ func (e *SQLiteExporter) insertDependencies(db *sql.DB) error {
 		_, err := stmt.Exec(dep.IssueID, dep.DependsOnID, string(dep.Type))
 		if err != nil {
 			return fmt.Errorf("insert dependency %s->%s: %w", dep.IssueID, dep.DependsOnID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// insertComments inserts all comments for all issues (bv-52).
+func (e *SQLiteExporter) insertComments(db *sql.DB) error {
+	// Count total comments first
+	totalComments := 0
+	for _, issue := range e.Issues {
+		totalComments += len(issue.Comments)
+	}
+	if totalComments == 0 {
+		return nil // No comments to insert
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO comments (id, issue_id, author, text, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, issue := range e.Issues {
+		for _, comment := range issue.Comments {
+			if comment == nil {
+				continue
+			}
+			_, err := stmt.Exec(
+				comment.ID,
+				issue.ID,
+				comment.Author,
+				comment.Text,
+				comment.CreatedAt.Format(time.RFC3339),
+			)
+			if err != nil {
+				return fmt.Errorf("insert comment %d for issue %s: %w", comment.ID, issue.ID, err)
+			}
 		}
 	}
 

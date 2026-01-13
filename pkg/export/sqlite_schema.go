@@ -34,7 +34,7 @@ func CreateSchema(db *sql.DB) error {
 	return nil
 }
 
-// createCoreTables creates the issues and dependencies tables.
+// createCoreTables creates the issues, dependencies, and comments tables.
 func createCoreTables(db *sql.DB) error {
 	// Issues table - core issue data
 	issuesSQL := `
@@ -69,6 +69,21 @@ func createCoreTables(db *sql.DB) error {
 	`
 	if _, err := db.Exec(depsSQL); err != nil {
 		return fmt.Errorf("create dependencies table: %w", err)
+	}
+
+	// Comments table - issue discussion threads (bv-52)
+	commentsSQL := `
+		CREATE TABLE IF NOT EXISTS comments (
+			id INTEGER PRIMARY KEY,
+			issue_id TEXT NOT NULL,
+			author TEXT,
+			text TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY (issue_id) REFERENCES issues(id)
+		)
+	`
+	if _, err := db.Exec(commentsSQL); err != nil {
+		return fmt.Errorf("create comments table: %w", err)
 	}
 
 	return nil
@@ -125,6 +140,10 @@ func createIndexes(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_deps_issue ON dependencies(issue_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_deps_depends ON dependencies(depends_on_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_deps_type ON dependencies(type)`,
+
+		// Comments indexes (bv-52)
+		`CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at DESC)`,
 
 		// Metrics indexes
 		`CREATE INDEX IF NOT EXISTS idx_metrics_score ON issue_metrics(triage_score DESC)`,
@@ -214,6 +233,8 @@ func CreateMaterializedViews(db *sql.DB) error {
 			COALESCE(m.blocks_count, 0) as dependent_count,
 			COALESCE(m.critical_path_depth, 0) as critical_depth,
 			0 as in_cycle,
+			-- Comment count for display badges (bv-52)
+			(SELECT COUNT(*) FROM comments c WHERE c.issue_id = i.id) as comment_count,
 				-- dep.IssueID depends on dep.DependsOnID, so:
 				-- - blocks_ids are the issues that depend on i (downstream)
 				-- - blocked_by_ids are the issues i depends on (upstream)

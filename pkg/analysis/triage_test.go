@@ -1343,3 +1343,112 @@ func TestComputeTriageFromAnalyzer_Empty(t *testing.T) {
 		t.Errorf("expected 0 recommendations, got %d", len(triage.Recommendations))
 	}
 }
+
+// TestBuildTopPicks_FiltersBlockedItems verifies that blocked items are excluded from TopPicks.
+// This is critical for --robot-next which should only return actionable items.
+// Fixes: https://github.com/Dicklesworthstone/beads_viewer/issues/53
+func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
+	recommendations := []Recommendation{
+		{
+			ID:         "blocked-high-score",
+			Title:      "Blocked but high score",
+			Score:      100.0,
+			BlockedBy:  []string{"blocker-1"},
+			UnblocksIDs: []string{},
+		},
+		{
+			ID:         "actionable-1",
+			Title:      "Actionable item 1",
+			Score:      80.0,
+			BlockedBy:  nil, // Not blocked
+			UnblocksIDs: []string{"downstream-1"},
+		},
+		{
+			ID:         "blocked-medium-score",
+			Title:      "Another blocked item",
+			Score:      70.0,
+			BlockedBy:  []string{"blocker-2", "blocker-3"},
+			UnblocksIDs: []string{},
+		},
+		{
+			ID:         "actionable-2",
+			Title:      "Actionable item 2",
+			Score:      60.0,
+			BlockedBy:  []string{}, // Empty slice = not blocked
+			UnblocksIDs: []string{},
+		},
+		{
+			ID:         "actionable-3",
+			Title:      "Actionable item 3",
+			Score:      50.0,
+			BlockedBy:  nil,
+			UnblocksIDs: []string{"downstream-2", "downstream-3"},
+		},
+	}
+
+	// Test with limit of 3
+	picks := buildTopPicks(recommendations, 3)
+
+	// Should have exactly 3 picks (all actionable items)
+	if len(picks) != 3 {
+		t.Errorf("expected 3 picks, got %d", len(picks))
+	}
+
+	// Verify blocked items are excluded
+	for _, pick := range picks {
+		if pick.ID == "blocked-high-score" || pick.ID == "blocked-medium-score" {
+			t.Errorf("blocked item %q should not be in TopPicks", pick.ID)
+		}
+	}
+
+	// Verify actionable items are included in order
+	expectedIDs := []string{"actionable-1", "actionable-2", "actionable-3"}
+	for i, expected := range expectedIDs {
+		if picks[i].ID != expected {
+			t.Errorf("picks[%d].ID = %q, want %q", i, picks[i].ID, expected)
+		}
+	}
+
+	// Verify unblocks count is correct
+	if picks[0].Unblocks != 1 {
+		t.Errorf("picks[0].Unblocks = %d, want 1", picks[0].Unblocks)
+	}
+	if picks[2].Unblocks != 2 {
+		t.Errorf("picks[2].Unblocks = %d, want 2", picks[2].Unblocks)
+	}
+}
+
+// TestBuildTopPicks_LimitRespected verifies the limit is respected when filtering.
+func TestBuildTopPicks_LimitRespected(t *testing.T) {
+	recommendations := []Recommendation{
+		{ID: "a1", Title: "Actionable 1", Score: 100.0},
+		{ID: "a2", Title: "Actionable 2", Score: 90.0},
+		{ID: "a3", Title: "Actionable 3", Score: 80.0},
+		{ID: "a4", Title: "Actionable 4", Score: 70.0},
+		{ID: "a5", Title: "Actionable 5", Score: 60.0},
+	}
+
+	// Limit of 2
+	picks := buildTopPicks(recommendations, 2)
+	if len(picks) != 2 {
+		t.Errorf("expected 2 picks with limit=2, got %d", len(picks))
+	}
+
+	// Should be the top 2 by score order
+	if picks[0].ID != "a1" || picks[1].ID != "a2" {
+		t.Errorf("expected picks [a1, a2], got [%s, %s]", picks[0].ID, picks[1].ID)
+	}
+}
+
+// TestBuildTopPicks_AllBlocked verifies empty result when all items are blocked.
+func TestBuildTopPicks_AllBlocked(t *testing.T) {
+	recommendations := []Recommendation{
+		{ID: "b1", Title: "Blocked 1", Score: 100.0, BlockedBy: []string{"x"}},
+		{ID: "b2", Title: "Blocked 2", Score: 90.0, BlockedBy: []string{"y"}},
+	}
+
+	picks := buildTopPicks(recommendations, 10)
+	if len(picks) != 0 {
+		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
+	}
+}

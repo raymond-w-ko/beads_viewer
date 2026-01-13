@@ -37,6 +37,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/watcher"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -182,6 +183,7 @@ func main() {
 	pagesIncludeClosed := flag.Bool("pages-include-closed", true, "Include closed issues in export (default: true)")
 	pagesIncludeHistory := flag.Bool("pages-include-history", true, "Include git history for time-travel (default: true)")
 	previewPages := flag.String("preview-pages", "", "Preview existing static site bundle")
+	watchExport := flag.Bool("watch-export", false, "Watch for beads changes and auto-regenerate export (use with --export-pages)")
 	pagesWizard := flag.Bool("pages", false, "Launch interactive Pages deployment wizard")
 	// Debug rendering flag (for diagnosing TUI issues)
 	debugRender := flag.String("debug-render", "", "Render a view and output to file (views: insights, board)")
@@ -199,6 +201,7 @@ func main() {
 	_ = pagesIncludeHistory
 	_ = previewPages
 	_ = pagesWizard
+	_ = watchExport
 	_ = debugRender
 	_ = debugWidth
 	_ = debugHeight
@@ -1285,136 +1288,205 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Handle --export-pages (bv-73f)
+	// Handle --export-pages (bv-73f) with optional --watch-export (bv-55)
 	if *exportPages != "" {
-		fmt.Println("Exporting static site...")
-		fmt.Printf("  → Loading %d issues\n", len(issues))
-
-		// Filter closed issues if not requested
-		exportIssues := issues
-		if !*pagesIncludeClosed {
-			var openIssues []model.Issue
-			for _, issue := range issues {
-				if issue.Status != model.StatusClosed {
-					openIssues = append(openIssues, issue)
-				}
+		// Define export function for reuse in watch mode
+		exportCount := 0
+		doExport := func(allIssues []model.Issue) error {
+			exportCount++
+			if exportCount > 1 {
+				fmt.Printf("\n[%s] Re-exporting (change #%d)...\n", time.Now().Format("15:04:05"), exportCount-1)
+			} else {
+				fmt.Println("Exporting static site...")
 			}
-			exportIssues = openIssues
-			fmt.Printf("  → Filtering to %d open issues\n", len(exportIssues))
-		}
+			fmt.Printf("  → Loading %d issues\n", len(allIssues))
 
-		// Load and run pre-export hooks (bv-qjc.3)
-		cwd, _ := os.Getwd()
-		var pagesExecutor *hooks.Executor
-		if !*noHooks {
-			hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
-			if err := hookLoader.Load(); err != nil {
-				fmt.Printf("  → Warning: failed to load hooks: %v\n", err)
-			} else if hookLoader.HasHooks() {
-				fmt.Println("  → Running pre-export hooks...")
-				ctx := hooks.ExportContext{
-					ExportPath:   *exportPages,
-					ExportFormat: "html",
-					IssueCount:   len(exportIssues),
-					Timestamp:    time.Now(),
-				}
-				pagesExecutor = hooks.NewExecutor(hookLoader.Config(), ctx)
-				pagesExecutor.SetLogger(func(msg string) {
-					fmt.Printf("  → %s\n", msg)
-				})
-
-				if err := pagesExecutor.RunPreExport(); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: pre-export hook failed: %v\n", err)
-					os.Exit(1)
-				}
-			}
-		}
-
-		// Build graph and compute stats
-		fmt.Println("  → Running graph analysis...")
-		analyzer := analysis.NewAnalyzer(exportIssues)
-		stats := analyzer.AnalyzeAsync(context.Background())
-		stats.WaitForPhase2()
-
-		// Compute triage
-		fmt.Println("  → Generating triage data...")
-		triage := analysis.ComputeTriage(exportIssues)
-
-		// Extract dependencies
-		var deps []*model.Dependency
-		for i := range exportIssues {
-			issue := &exportIssues[i]
-			for _, dep := range issue.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				deps = append(deps, &model.Dependency{
-					IssueID:     issue.ID,
-					DependsOnID: dep.DependsOnID,
-					Type:        dep.Type,
-				})
-			}
-		}
-
-		// Create exporter
-		issuePointers := make([]*model.Issue, len(exportIssues))
-		for i := range exportIssues {
-			issuePointers[i] = &exportIssues[i]
-		}
-		exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
-		if *pagesTitle != "" {
-			exporter.Config.Title = *pagesTitle
-		}
-
-		// Export SQLite database
-		fmt.Println("  → Writing database and JSON files...")
-		if err := exporter.Export(*exportPages); err != nil {
-			fmt.Fprintf(os.Stderr, "Error exporting: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Copy viewer assets
-		fmt.Println("  → Copying viewer assets...")
-		if err := copyViewerAssets(*exportPages, *pagesTitle); err != nil {
-			fmt.Fprintf(os.Stderr, "Error copying assets: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Generate README.md with project stats (useful for GitHub Pages deployment)
-		fmt.Println("  → Generating README.md...")
-		if err := generateREADME(*exportPages, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
-			fmt.Printf("  → Warning: failed to generate README: %v\n", err)
-		}
-
-		// Export history data for time-travel feature (bv-z38b)
-		if *pagesIncludeHistory {
-			fmt.Println("  → Generating time-travel history data...")
-			if historyReport, err := generateHistoryForExport(issues); err == nil && historyReport != nil {
-				historyPath := filepath.Join(*exportPages, "data", "history.json")
-				if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-					if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
-					} else {
-						fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
+			// Filter closed issues if not requested
+			exportIssues := allIssues
+			if !*pagesIncludeClosed {
+				var openIssues []model.Issue
+				for _, issue := range allIssues {
+					if issue.Status != model.StatusClosed {
+						openIssues = append(openIssues, issue)
 					}
 				}
-			} else if err != nil {
-				fmt.Printf("  → Warning: failed to generate history: %v\n", err)
+				exportIssues = openIssues
+				fmt.Printf("  → Filtering to %d open issues\n", len(exportIssues))
 			}
+
+			// Load and run pre-export hooks (bv-qjc.3)
+			cwd, _ := os.Getwd()
+			var pagesExecutor *hooks.Executor
+			if !*noHooks {
+				hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
+				if err := hookLoader.Load(); err != nil {
+					fmt.Printf("  → Warning: failed to load hooks: %v\n", err)
+				} else if hookLoader.HasHooks() {
+					fmt.Println("  → Running pre-export hooks...")
+					ctx := hooks.ExportContext{
+						ExportPath:   *exportPages,
+						ExportFormat: "html",
+						IssueCount:   len(exportIssues),
+						Timestamp:    time.Now(),
+					}
+					pagesExecutor = hooks.NewExecutor(hookLoader.Config(), ctx)
+					pagesExecutor.SetLogger(func(msg string) {
+						fmt.Printf("  → %s\n", msg)
+					})
+
+					if err := pagesExecutor.RunPreExport(); err != nil {
+						return fmt.Errorf("pre-export hook failed: %w", err)
+					}
+				}
+			}
+
+			// Build graph and compute stats
+			fmt.Println("  → Running graph analysis...")
+			analyzer := analysis.NewAnalyzer(exportIssues)
+			stats := analyzer.AnalyzeAsync(context.Background())
+			stats.WaitForPhase2()
+
+			// Compute triage
+			fmt.Println("  → Generating triage data...")
+			triage := analysis.ComputeTriage(exportIssues)
+
+			// Extract dependencies
+			var deps []*model.Dependency
+			for i := range exportIssues {
+				issue := &exportIssues[i]
+				for _, dep := range issue.Dependencies {
+					if dep == nil || !dep.Type.IsBlocking() {
+						continue
+					}
+					deps = append(deps, &model.Dependency{
+						IssueID:     issue.ID,
+						DependsOnID: dep.DependsOnID,
+						Type:        dep.Type,
+					})
+				}
+			}
+
+			// Create exporter
+			issuePointers := make([]*model.Issue, len(exportIssues))
+			for i := range exportIssues {
+				issuePointers[i] = &exportIssues[i]
+			}
+			exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
+			if *pagesTitle != "" {
+				exporter.Config.Title = *pagesTitle
+			}
+
+			// Export SQLite database
+			fmt.Println("  → Writing database and JSON files...")
+			if err := exporter.Export(*exportPages); err != nil {
+				return fmt.Errorf("exporting: %w", err)
+			}
+
+			// Copy viewer assets
+			fmt.Println("  → Copying viewer assets...")
+			if err := copyViewerAssets(*exportPages, *pagesTitle); err != nil {
+				return fmt.Errorf("copying assets: %w", err)
+			}
+
+			// Generate README.md with project stats (useful for GitHub Pages deployment)
+			fmt.Println("  → Generating README.md...")
+			if err := generateREADME(*exportPages, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
+				fmt.Printf("  → Warning: failed to generate README: %v\n", err)
+			}
+
+			// Export history data for time-travel feature (bv-z38b)
+			if *pagesIncludeHistory {
+				fmt.Println("  → Generating time-travel history data...")
+				if historyReport, err := generateHistoryForExport(allIssues); err == nil && historyReport != nil {
+					historyPath := filepath.Join(*exportPages, "data", "history.json")
+					if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
+						if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
+							fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
+						} else {
+							fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
+						}
+					}
+				} else if err != nil {
+					fmt.Printf("  → Warning: failed to generate history: %v\n", err)
+				}
+			}
+
+			// Run post-export hooks (bv-qjc.3)
+			if pagesExecutor != nil {
+				fmt.Println("  → Running post-export hooks...")
+				if err := pagesExecutor.RunPostExport(); err != nil {
+					fmt.Printf("  → Warning: post-export hook failed: %v\n", err)
+				}
+
+				if len(pagesExecutor.Results()) > 0 {
+					fmt.Println("")
+					fmt.Println(pagesExecutor.Summary())
+				}
+			}
+
+			fmt.Printf("✓ Export complete [%s]\n", time.Now().Format("15:04:05"))
+			return nil
 		}
 
-		// Run post-export hooks (bv-qjc.3)
-		if pagesExecutor != nil {
-			fmt.Println("  → Running post-export hooks...")
-			if err := pagesExecutor.RunPostExport(); err != nil {
-				fmt.Printf("  → Warning: post-export hook failed: %v\n", err)
-				// Don't exit, just warn
+		// Initial export
+		if err := doExport(issues); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Watch mode (bv-55): monitor .beads/ for changes and auto-regenerate
+		if *watchExport {
+			cwd, _ := os.Getwd()
+			issuesFile := filepath.Join(cwd, ".beads", "issues.jsonl")
+
+			fmt.Println("")
+			fmt.Println("Watch mode enabled. Monitoring for changes...")
+			fmt.Printf("  → Watching: %s\n", issuesFile)
+			fmt.Println("  → Press Ctrl+C to stop")
+			fmt.Println("")
+			fmt.Println("To preview with auto-refresh, run in another terminal:")
+			fmt.Printf("  bv --preview-pages %s\n", *exportPages)
+
+			// Create file watcher with 500ms debounce
+			w, err := watcher.NewWatcher(issuesFile,
+				watcher.WithDebounceDuration(500*time.Millisecond),
+				watcher.WithOnError(func(err error) {
+					fmt.Printf("  → Watch error: %v\n", err)
+				}),
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating watcher: %v\n", err)
+				os.Exit(1)
 			}
 
-			// Print hook summary if any hooks ran
-			if len(pagesExecutor.Results()) > 0 {
-				fmt.Println("")
-				fmt.Println(pagesExecutor.Summary())
+			if err := w.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error starting watcher: %v\n", err)
+				os.Exit(1)
+			}
+			defer w.Stop()
+
+			// Set up signal handling for graceful shutdown
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
+
+			// Watch loop
+			for {
+				select {
+				case <-w.Changed():
+					// Reload issues from disk
+					freshIssues, err := loader.LoadIssues("")
+					if err != nil {
+						fmt.Printf("  → Error reloading issues: %v\n", err)
+						continue
+					}
+					if err := doExport(freshIssues); err != nil {
+						fmt.Printf("  → Export error: %v\n", err)
+					}
+				case <-sigCh:
+					fmt.Println("\nStopping watch mode...")
+					os.Exit(0)
+				}
 			}
 		}
 

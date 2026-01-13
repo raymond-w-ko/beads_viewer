@@ -47,13 +47,21 @@ var (
 	ColorStatusOpen       = lipgloss.AdaptiveColor{Light: "#007700", Dark: "#50FA7B"}
 	ColorStatusInProgress = lipgloss.AdaptiveColor{Light: "#006080", Dark: "#8BE9FD"}
 	ColorStatusBlocked    = lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF5555"}
+	ColorStatusDeferred   = lipgloss.AdaptiveColor{Light: "#B06800", Dark: "#FFB86C"} // Orange - on ice
+	ColorStatusPinned     = lipgloss.AdaptiveColor{Light: "#0066CC", Dark: "#6699FF"} // Blue - persistent
+	ColorStatusHooked     = lipgloss.AdaptiveColor{Light: "#008080", Dark: "#00CED1"} // Teal - agent-attached
 	ColorStatusClosed     = lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"}
+	ColorStatusTombstone  = lipgloss.AdaptiveColor{Light: "#888888", Dark: "#44475A"} // Muted gray - deleted
 
 	// Status background colors (for badges) - subtle backgrounds
 	ColorStatusOpenBg       = lipgloss.AdaptiveColor{Light: "#D4EDDA", Dark: "#1A3D2A"}
 	ColorStatusInProgressBg = lipgloss.AdaptiveColor{Light: "#D1ECF1", Dark: "#1A3344"}
 	ColorStatusBlockedBg    = lipgloss.AdaptiveColor{Light: "#F8D7DA", Dark: "#3D1A1A"}
+	ColorStatusDeferredBg   = lipgloss.AdaptiveColor{Light: "#FFE8CC", Dark: "#3D2A1A"} // Orange bg
+	ColorStatusPinnedBg     = lipgloss.AdaptiveColor{Light: "#CCE5FF", Dark: "#1A2A44"} // Blue bg
+	ColorStatusHookedBg     = lipgloss.AdaptiveColor{Light: "#CCFFFF", Dark: "#1A3D3D"} // Teal bg
 	ColorStatusClosedBg     = lipgloss.AdaptiveColor{Light: "#E2E3E5", Dark: "#2A2A3D"}
+	ColorStatusTombstoneBg  = lipgloss.AdaptiveColor{Light: "#D0D0D0", Dark: "#1E1F29"} // Dark bg
 
 	// Priority colors
 	ColorPrioCritical = lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF5555"}
@@ -136,8 +144,16 @@ func RenderStatusBadge(status string) string {
 		fg, bg, label = ColorStatusInProgress, ColorStatusInProgressBg, "PROG"
 	case "blocked":
 		fg, bg, label = ColorStatusBlocked, ColorStatusBlockedBg, "BLKD"
+	case "deferred":
+		fg, bg, label = ColorStatusDeferred, ColorStatusDeferredBg, "DEFR"
+	case "pinned":
+		fg, bg, label = ColorStatusPinned, ColorStatusPinnedBg, "PIN"
+	case "hooked":
+		fg, bg, label = ColorStatusHooked, ColorStatusHookedBg, "HOOK"
 	case "closed":
 		fg, bg, label = ColorStatusClosed, ColorStatusClosedBg, "DONE"
+	case "tombstone":
+		fg, bg, label = ColorStatusTombstone, ColorStatusTombstoneBg, "TOMB"
 	default:
 		fg, bg, label = ColorMuted, ColorBgSubtle, "????"
 	}

@@ -1155,6 +1155,9 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 
 	// Handle empty graph - mark phase 2 ready immediately
 	if nodeCount == 0 {
+		kcoreComputed := config.ComputeKCore || config.ComputeArticulation
+		articulationComputed := config.ComputeArticulation || config.ComputeKCore
+		slackComputed := config.ComputeSlack
 		stats.status = MetricStatus{
 			PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false)},
 			Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false)},
@@ -1162,9 +1165,9 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 			HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false)},
 			Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false)},
 			Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false)},
-			KCore:        statusEntry{State: "computed"},
-			Articulation: statusEntry{State: "computed"},
-			Slack:        statusEntry{State: "computed"},
+			KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false)},
+			Articulation: statusEntry{State: stateFromTiming(articulationComputed, false)},
+			Slack:        statusEntry{State: stateFromTiming(slackComputed, false)},
 		}
 		stats.phase2Ready = true
 		close(stats.phase2Done)
@@ -1508,6 +1511,13 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 				hasCycles = true
 				break
 			}
+			if len(scc) == 1 {
+				n := scc[0]
+				if a.g.HasEdgeFromTo(n.ID(), n.ID()) {
+					hasCycles = true
+					break
+				}
+			}
 		}
 
 		if hasCycles {
@@ -1609,6 +1619,10 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	}
 
 	// record status snapshot
+	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
+	articulationComputed := config.ComputeArticulation || config.ComputeKCore
+	slackComputed := config.ComputeSlack
+
 	stats.status = MetricStatus{
 		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Elapsed: profile.PageRank},
 		Betweenness: statusEntry{
@@ -1621,9 +1635,9 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, profile.HITSTO), Reason: config.HITSSkipReason, Elapsed: profile.HITS},
 		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath},
 		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, profile.CyclesTO), Reason: cycleReason, Elapsed: profile.Cycles},
-		KCore:        statusEntry{State: "computed", Elapsed: profile.KCore},        // bv-85: always computed (fast)
-		Articulation: statusEntry{State: "computed", Elapsed: profile.Articulation}, // bv-85: computed with k-core
-		Slack:        statusEntry{State: "computed", Elapsed: profile.Slack},        // bv-85: always computed (fast)
+		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false), Elapsed: profile.KCore},
+		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false), Elapsed: profile.Articulation},
+		Slack:        statusEntry{State: stateFromTiming(slackComputed, false), Elapsed: profile.Slack},
 	}
 	stats.mu.Unlock()
 }

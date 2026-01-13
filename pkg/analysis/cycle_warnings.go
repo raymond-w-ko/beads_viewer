@@ -138,7 +138,7 @@ func WouldCreateCycle(issues []model.Issue, fromID, toID string) (bool, []string
 	adj := make(map[string][]string)
 	for _, issue := range issues {
 		for _, dep := range issue.Dependencies {
-			if dep == nil {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			adj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)

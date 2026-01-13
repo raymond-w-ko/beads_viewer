@@ -395,6 +395,57 @@ func TestExport_WithClosedAt(t *testing.T) {
 	}
 }
 
+// TestExport_WithComments tests the comments export functionality (bv-52)
+func TestExport_WithComments(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	issue := makeTestIssue("comments-1", "Issue with comments", model.StatusOpen, 2, model.TypeTask)
+	now := time.Now()
+	issue.Comments = []*model.Comment{
+		{ID: 1, IssueID: "comments-1", Author: "alice", Text: "First comment", CreatedAt: now.Add(-time.Hour)},
+		{ID: 2, IssueID: "comments-1", Author: "bob", Text: "Second comment", CreatedAt: now},
+	}
+
+	exp := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+
+	if err := exp.Export(tmpDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(tmpDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify comments were inserted
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM comments WHERE issue_id = ?`, "comments-1").Scan(&count); err != nil {
+		t.Fatalf("Query comments count failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("Expected 2 comments, got %d", count)
+	}
+
+	// Verify comment content
+	var author, text string
+	if err := db.QueryRow(`SELECT author, text FROM comments WHERE id = 1`).Scan(&author, &text); err != nil {
+		t.Fatalf("Query comment 1 failed: %v", err)
+	}
+	if author != "alice" || text != "First comment" {
+		t.Errorf("Comment 1: expected author='alice', text='First comment', got author='%s', text='%s'", author, text)
+	}
+
+	// Verify comment_count in materialized view
+	var commentCount int
+	if err := db.QueryRow(`SELECT comment_count FROM issue_overview_mv WHERE id = ?`, "comments-1").Scan(&commentCount); err != nil {
+		t.Fatalf("Query comment_count from MV failed: %v", err)
+	}
+	if commentCount != 2 {
+		t.Errorf("Expected comment_count=2 in MV, got %d", commentCount)
+	}
+}
+
 func TestExport_EmptyData(t *testing.T) {
 	tmpDir := t.TempDir()
 

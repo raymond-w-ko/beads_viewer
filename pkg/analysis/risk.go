@@ -104,7 +104,7 @@ func computeFanVariance(issue *model.Issue, stats *GraphStats) float64 {
 	var degrees []float64
 
 	for _, dep := range issue.Dependencies {
-		if dep == nil || dep.Type != model.DepBlocks {
+		if dep == nil || !dep.Type.IsBlocking() {
 			continue
 		}
 		neighborID := dep.DependsOnID
@@ -191,7 +191,7 @@ func computeCrossRepoRisk(issue *model.Issue, issues map[string]model.Issue) flo
 	totalBlockingDeps := 0
 
 	for _, dep := range issue.Dependencies {
-		if dep == nil || dep.Type != model.DepBlocks {
+		if dep == nil || !dep.Type.IsBlocking() {
 			continue
 		}
 		totalBlockingDeps++

@@ -372,7 +372,18 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 	for _, match := range matches {
 		if len(match) >= 2 {
 			beadID := "bv-" + strings.ToLower(match[1]) // Normalize to lowercase
-			if history, ok := od.lookup.beads[beadID]; ok {
+			history, ok := od.lookup.beads[beadID]
+			if !ok {
+				for id, h := range od.lookup.beads {
+					if strings.EqualFold(id, beadID) {
+						beadID = id
+						history = h
+						ok = true
+						break
+					}
+				}
+			}
+			if ok {
 				if _, exists := beadScores[beadID]; !exists {
 					beadScores[beadID] = &probableBeadBuilder{
 						title:  history.Title,

@@ -31,8 +31,8 @@ func TestCreateSchema(t *testing.T) {
 		t.Fatalf("CreateSchema failed: %v", err)
 	}
 
-	// Verify tables exist
-	tables := []string{"issues", "dependencies", "issue_metrics", "triage_recommendations", "export_meta"}
+	// Verify tables exist (comments added in bv-52)
+	tables := []string{"issues", "dependencies", "comments", "issue_metrics", "triage_recommendations", "export_meta"}
 	for _, table := range tables {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
@@ -41,8 +41,8 @@ func TestCreateSchema(t *testing.T) {
 		}
 	}
 
-	// Verify indexes exist
-	indexes := []string{"idx_issues_status", "idx_issues_priority", "idx_deps_issue"}
+	// Verify indexes exist (comments indexes added in bv-52)
+	indexes := []string{"idx_issues_status", "idx_issues_priority", "idx_deps_issue", "idx_comments_issue", "idx_comments_created"}
 	for _, idx := range indexes {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&name)
@@ -105,6 +105,93 @@ func TestInsertAndQueryIssues(t *testing.T) {
 
 	if pagerank != 0.15 || triageScore != 0.75 {
 		t.Errorf("Unexpected metrics: pagerank=%f triageScore=%f", pagerank, triageScore)
+	}
+}
+
+// TestInsertAndQueryComments tests the comments table functionality (bv-52)
+func TestInsertAndQueryComments(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.sqlite3")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	if err := CreateSchema(db); err != nil {
+		t.Fatalf("CreateSchema failed: %v", err)
+	}
+
+	// Insert test issue first (foreign key reference)
+	_, err = db.Exec(`
+		INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "comment-test-1", "Issue with comments", "Test description", "open", 2, "task", `["test"]`, "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatalf("Insert issue failed: %v", err)
+	}
+
+	// Insert test comments
+	_, err = db.Exec(`
+		INSERT INTO comments (id, issue_id, author, text, created_at)
+		VALUES
+			(?, ?, ?, ?, ?),
+			(?, ?, ?, ?, ?)
+	`,
+		1, "comment-test-1", "alice", "First comment from Alice", "2025-01-01T12:00:00Z",
+		2, "comment-test-1", "bob", "Reply from Bob", "2025-01-01T13:00:00Z",
+	)
+	if err != nil {
+		t.Fatalf("Insert comments failed: %v", err)
+	}
+
+	// Query comments back
+	rows, err := db.Query(`SELECT id, issue_id, author, text FROM comments WHERE issue_id = ? ORDER BY created_at`, "comment-test-1")
+	if err != nil {
+		t.Fatalf("Query comments failed: %v", err)
+	}
+	defer rows.Close()
+
+	var comments []struct {
+		ID      int64
+		IssueID string
+		Author  string
+		Text    string
+	}
+	for rows.Next() {
+		var c struct {
+			ID      int64
+			IssueID string
+			Author  string
+			Text    string
+		}
+		if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text); err != nil {
+			t.Fatalf("Scan comment failed: %v", err)
+		}
+		comments = append(comments, c)
+	}
+
+	if len(comments) != 2 {
+		t.Fatalf("Expected 2 comments, got %d", len(comments))
+	}
+	if comments[0].Author != "alice" || comments[1].Author != "bob" {
+		t.Errorf("Unexpected comment authors: %s, %s", comments[0].Author, comments[1].Author)
+	}
+
+	// Verify comment count via materialized view
+	if err := CreateMaterializedViews(db); err != nil {
+		t.Fatalf("CreateMaterializedViews failed: %v", err)
+	}
+
+	var commentCount int
+	err = db.QueryRow(`SELECT comment_count FROM issue_overview_mv WHERE id = ?`, "comment-test-1").Scan(&commentCount)
+	if err != nil {
+		t.Fatalf("Query comment_count from MV failed: %v", err)
+	}
+
+	if commentCount != 2 {
+		t.Errorf("Expected comment_count=2 in MV, got %d", commentCount)
 	}
 }
 

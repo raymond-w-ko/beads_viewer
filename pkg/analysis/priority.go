@@ -119,9 +119,13 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 	}
 	for _, issue := range a.issueMap {
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type.IsBlocking() {
-				blockerCounts[dep.DependsOnID]++
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
 			}
+			if _, exists := a.issueMap[dep.DependsOnID]; !exists {
+				continue
+			}
+			blockerCounts[dep.DependsOnID]++
 		}
 	}
 

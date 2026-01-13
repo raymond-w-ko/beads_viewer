@@ -884,21 +884,35 @@ func getStatusIcon(status model.Status) string {
 		return "🟡"
 	case status == model.StatusBlocked:
 		return "🔴"
+	case status == model.StatusDeferred:
+		return "⏸️"
+	case status == model.StatusPinned:
+		return "📌"
+	case status == model.StatusHooked:
+		return "🪝"
 	default:
 		return "⚪"
 	}
 }
 
 func getStatusColor(status model.Status, t Theme) lipgloss.AdaptiveColor {
-	switch {
-	case isClosedLikeStatus(status):
-		return t.Closed
-	case status == model.StatusOpen:
+	switch status {
+	case model.StatusOpen:
 		return t.Open
-	case status == model.StatusInProgress:
+	case model.StatusInProgress:
 		return t.InProgress
-	case status == model.StatusBlocked:
+	case model.StatusBlocked:
 		return t.Blocked
+	case model.StatusDeferred:
+		return t.Deferred
+	case model.StatusPinned:
+		return t.Pinned
+	case model.StatusHooked:
+		return t.Hooked
+	case model.StatusClosed:
+		return t.Closed
+	case model.StatusTombstone:
+		return t.Tombstone
 	default:
 		return t.Secondary
 	}

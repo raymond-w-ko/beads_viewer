@@ -16,7 +16,11 @@ type Theme struct {
 	Open       lipgloss.AdaptiveColor
 	InProgress lipgloss.AdaptiveColor
 	Blocked    lipgloss.AdaptiveColor
+	Deferred   lipgloss.AdaptiveColor
+	Pinned     lipgloss.AdaptiveColor
+	Hooked     lipgloss.AdaptiveColor
 	Closed     lipgloss.AdaptiveColor
+	Tombstone  lipgloss.AdaptiveColor
 
 	// Types
 	Bug     lipgloss.AdaptiveColor
@@ -64,7 +68,11 @@ func DefaultTheme(r *lipgloss.Renderer) Theme {
 		Open:       lipgloss.AdaptiveColor{Light: "#007700", Dark: "#50FA7B"}, // Green (was #00A800, now ~4.6:1)
 		InProgress: lipgloss.AdaptiveColor{Light: "#006080", Dark: "#8BE9FD"}, // Cyan (darker for contrast)
 		Blocked:    lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF5555"}, // Red (slightly adjusted)
+		Deferred:   lipgloss.AdaptiveColor{Light: "#B06800", Dark: "#FFB86C"}, // Orange - on ice
+		Pinned:     lipgloss.AdaptiveColor{Light: "#0066CC", Dark: "#6699FF"}, // Blue - persistent
+		Hooked:     lipgloss.AdaptiveColor{Light: "#008080", Dark: "#00CED1"}, // Teal - agent-attached
 		Closed:     lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"}, // Gray
+		Tombstone:  lipgloss.AdaptiveColor{Light: "#888888", Dark: "#44475A"}, // Muted gray - deleted
 
 		Bug:     lipgloss.AdaptiveColor{Light: "#CC0000", Dark: "#FF5555"}, // Red
 		Feature: lipgloss.AdaptiveColor{Light: "#B06800", Dark: "#FFB86C"}, // Orange (darker for contrast)

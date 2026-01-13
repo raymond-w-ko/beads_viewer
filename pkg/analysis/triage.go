@@ -827,14 +827,16 @@ func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string]
 	return result
 }
 
-// buildTopPicks creates condensed top picks from recommendations
+// buildTopPicks creates condensed top picks from recommendations.
+// Only includes actionable (non-blocked) items since TopPicks are used
+// for "what should I work on next" queries (e.g., --robot-next).
 func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
-	if len(recommendations) > limit {
-		recommendations = recommendations[:limit]
-	}
-
-	picks := make([]TopPick, 0, len(recommendations))
+	picks := make([]TopPick, 0, limit)
 	for _, rec := range recommendations {
+		// Skip blocked items - they can't be worked on yet
+		if len(rec.BlockedBy) > 0 {
+			continue
+		}
 		picks = append(picks, TopPick{
 			ID:       rec.ID,
 			Title:    rec.Title,
@@ -842,6 +844,9 @@ func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
 			Reasons:  rec.Reasons,
 			Unblocks: len(rec.UnblocksIDs),
 		})
+		if len(picks) >= limit {
+			break
+		}
 	}
 
 	return picks

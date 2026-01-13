@@ -95,7 +95,7 @@ type ColumnStats struct {
 }
 
 // computeColumnStats calculates statistics for issues in a column (bv-nl8a)
-func computeColumnStats(issues []model.Issue) ColumnStats {
+func computeColumnStats(issues []model.Issue, issueMap map[string]*model.Issue) ColumnStats {
 	stats := ColumnStats{Total: len(issues)}
 
 	var oldest time.Time
@@ -106,12 +106,23 @@ func computeColumnStats(issues []model.Issue) ColumnStats {
 			stats.P1Count++
 		}
 
-		// Count blocked items (has blocking deps)
+		// Count blocked items (has unresolved blocking deps)
+		hasOpenBlocker := false
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type.IsBlocking() {
-				stats.BlockedCount++
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			if issueMap == nil {
+				hasOpenBlocker = true
 				break
 			}
+			if blocker, ok := issueMap[dep.DependsOnID]; ok && blocker != nil && !isClosedLikeStatus(blocker.Status) {
+				hasOpenBlocker = true
+				break
+			}
+		}
+		if hasOpenBlocker {
+			stats.BlockedCount++
 		}
 
 		// Track oldest by created date
@@ -977,7 +988,7 @@ func (b BoardModel) View(width, height int) string {
 		issueCount := len(issues)
 
 		// Compute column statistics (bv-nl8a)
-		stats := computeColumnStats(issues)
+		stats := computeColumnStats(issues, b.issueMap)
 
 		// Build header text with adaptive stats based on terminal width (bv-nl8a)
 		// - Narrow (<100): Just count

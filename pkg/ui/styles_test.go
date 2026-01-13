@@ -34,17 +34,45 @@ func TestRenderStatusBadge(t *testing.T) {
 		status string
 		want   string
 	}{
+		// All 8 official beads statuses
 		{"open", "OPEN"},
 		{"in_progress", "PROG"},
 		{"blocked", "BLKD"},
+		{"deferred", "DEFR"},
+		{"pinned", "PIN"},
+		{"hooked", "HOOK"},
 		{"closed", "DONE"},
+		{"tombstone", "TOMB"},
+		// Unknown status should show "????"
 		{"unknown", "????"},
+		{"", "????"},
+		{"invalid_status", "????"},
 	}
 
 	for _, tt := range tests {
 		got := RenderStatusBadge(tt.status)
 		if !strings.Contains(got, tt.want) {
 			t.Errorf("RenderStatusBadge(%q) = %q, want to contain %q", tt.status, got, tt.want)
+		}
+	}
+}
+
+// TestRenderStatusBadge_AllStatusesHaveColors verifies each status has distinct colors
+func TestRenderStatusBadge_AllStatusesHaveColors(t *testing.T) {
+	statuses := []string{
+		"open", "in_progress", "blocked", "deferred",
+		"pinned", "hooked", "closed", "tombstone",
+	}
+
+	// Each status should produce a non-empty output
+	for _, status := range statuses {
+		got := RenderStatusBadge(status)
+		if got == "" {
+			t.Errorf("RenderStatusBadge(%q) returned empty string", status)
+		}
+		// Should NOT contain "????" for known statuses
+		if strings.Contains(got, "????") {
+			t.Errorf("RenderStatusBadge(%q) returned unknown badge '????'", status)
 		}
 	}
 }
