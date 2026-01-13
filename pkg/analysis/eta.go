@@ -222,8 +222,12 @@ func velocityMinutesPerDayForLabel(issues []model.Issue, label string, since tim
 }
 
 func hasLabel(labels []string, target string) bool {
+	if target == "" {
+		return false
+	}
+	targetLower := strings.ToLower(target)
 	for _, l := range labels {
-		if l == target {
+		if strings.ToLower(l) == targetLower {
 			return true
 		}
 	}

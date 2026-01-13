@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/mattn/go-runewidth"
 )
 
 func TestComputeAttentionView_Empty(t *testing.T) {
@@ -21,6 +22,19 @@ func TestComputeAttentionView_Empty(t *testing.T) {
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line (header only), got %d:\n%s", len(lines), out)
+	}
+}
+
+func TestComputeAttentionView_RespectsWidthWhenWideEnough(t *testing.T) {
+	const width = 80
+	out, err := ComputeAttentionView(nil, width)
+	if err != nil {
+		t.Fatalf("ComputeAttentionView error: %v", err)
+	}
+
+	line := strings.TrimSuffix(out, "\n")
+	if got := runewidth.StringWidth(line); got != width {
+		t.Fatalf("expected header width %d, got %d:\n%q", width, got, line)
 	}
 }
 

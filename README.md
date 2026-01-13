@@ -2637,7 +2637,7 @@ bv --pages
 
 Launches an interactive wizard that guides you through:
 1. **Export**: Generate the static bundle
-2. **Preview**: Local server at `http://localhost:9000`
+2. **Preview**: Local server at `http://localhost:9000` (or next available port)
 3. **Deploy**: Push to GitHub Pages with automatic repository creation
 
 ### Direct Export
@@ -2649,7 +2649,7 @@ bv --export-pages ./bv-pages --pages-exclude-closed   # Omit closed issues
 bv --export-pages ./bv-pages --pages-exclude-history  # Omit git history
 
 # Preview an existing bundle without regenerating
-bv --preview-pages ./bv-pages                   # Serve at localhost:9000
+bv --preview-pages ./bv-pages                   # Serve at localhost:9000 (or next available port)
 ```
 
 ### Optional: Hybrid Search WASM Scorer

@@ -107,3 +107,20 @@ func TestUpdateFileChangedReloadsSelection(t *testing.T) {
 		t.Fatalf("expected successful reload, got error %q", m2.statusMsg)
 	}
 }
+
+func TestNewModel_SetsTreeBeadsDirFromBeadsPath(t *testing.T) {
+	tmp := t.TempDir()
+	beads := filepath.Join(tmp, "beads.jsonl")
+	if err := os.WriteFile(beads, []byte(`{"id":"ONE","title":"One","status":"open"}`+"\n"), 0644); err != nil {
+		t.Fatalf("write beads: %v", err)
+	}
+
+	m := NewModel(nil, nil, beads)
+	if m.watcher != nil {
+		m.watcher.Stop()
+	}
+
+	if got, want := m.tree.beadsDir, filepath.Dir(beads); got != want {
+		t.Fatalf("expected tree beadsDir %q, got %q", want, got)
+	}
+}

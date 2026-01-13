@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -54,4 +55,78 @@ func TestAnalyzerAnalyzeWithConfigCachesPhase2(t *testing.T) {
 	}
 	// Tiny sleep to avoid zero durations in formatDuration paths
 	time.Sleep(1 * time.Millisecond)
+}
+
+func TestAnalyzerAnalyzeAsync_ReusesStatsWhenGraphUnchanged(t *testing.T) {
+	issues1 := []model.Issue{
+		{
+			ID:           "A",
+			Title:        "Alpha",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}},
+		},
+		{ID: "B", Title: "Beta", Status: model.StatusOpen},
+	}
+	stats1 := NewAnalyzer(issues1).AnalyzeAsync(context.Background())
+	if stats1 == nil {
+		t.Fatalf("expected non-nil stats")
+	}
+
+	// Content-only changes (titles) shouldn't invalidate graph stats reuse.
+	issues2 := []model.Issue{
+		{
+			ID:           "A",
+			Title:        "Alpha updated",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}},
+		},
+		{ID: "B", Title: "Beta updated", Status: model.StatusOpen},
+	}
+	stats2 := NewAnalyzer(issues2).AnalyzeAsync(context.Background())
+	if stats2 == nil {
+		t.Fatalf("expected non-nil stats")
+	}
+
+	if stats1 != stats2 {
+		t.Fatalf("expected graph stats to be reused for unchanged graph structure (got %p, want %p)", stats2, stats1)
+	}
+
+	stats2.WaitForPhase2()
+	if !stats2.IsPhase2Ready() {
+		t.Fatalf("expected phase2 ready after WaitForPhase2")
+	}
+}
+
+func TestAnalyzerAnalyzeAsync_DoesNotReuseStatsWhenGraphChanges(t *testing.T) {
+	issues1 := []model.Issue{
+		{
+			ID:           "A",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}},
+		},
+		{ID: "B", Status: model.StatusOpen},
+	}
+	stats1 := NewAnalyzer(issues1).AnalyzeAsync(context.Background())
+	if stats1 == nil {
+		t.Fatalf("expected non-nil stats")
+	}
+
+	// Structural change: dependency edge A->B becomes A->C.
+	issues2 := []model.Issue{
+		{
+			ID:           "A",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}},
+		},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+	}
+	stats2 := NewAnalyzer(issues2).AnalyzeAsync(context.Background())
+	if stats2 == nil {
+		t.Fatalf("expected non-nil stats")
+	}
+
+	if stats1 == stats2 {
+		t.Fatalf("expected graph stats to NOT be reused when graph structure changes")
+	}
 }

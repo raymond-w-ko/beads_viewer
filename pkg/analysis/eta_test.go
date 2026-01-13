@@ -288,6 +288,9 @@ func TestHasLabelETA(t *testing.T) {
 	if !hasLabel([]string{"a", "b", "c"}, "b") {
 		t.Error("hasLabel should find 'b' in slice")
 	}
+	if !hasLabel([]string{"API"}, "api") {
+		t.Error("hasLabel should be case-insensitive")
+	}
 	if hasLabel([]string{"a", "b", "c"}, "d") {
 		t.Error("hasLabel should not find 'd' in slice")
 	}

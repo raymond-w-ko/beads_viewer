@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -291,6 +292,101 @@ func TestCachedAnalyzer_DataHash(t *testing.T) {
 
 	if hash != expected {
 		t.Errorf("DataHash() = %s, want %s", hash, expected)
+	}
+}
+
+func TestComputeIssueFingerprint_Deterministic(t *testing.T) {
+	ts := time.Date(2024, 2, 10, 12, 0, 0, 0, time.UTC)
+	issueA := model.Issue{
+		ID:        "A",
+		Title:     "Title",
+		Status:    model.StatusOpen,
+		Priority:  1,
+		IssueType: model.TypeTask,
+		Labels:    []string{"b", "a"},
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "B", Type: model.DepBlocks, CreatedAt: ts, CreatedBy: "alice"},
+			{DependsOnID: "A", Type: model.DepRelated, CreatedAt: ts.Add(time.Minute), CreatedBy: "bob"},
+		},
+		Comments: []*model.Comment{
+			{ID: 2, IssueID: "A", Author: "bob", Text: "second", CreatedAt: ts.Add(2 * time.Minute)},
+			{ID: 1, IssueID: "A", Author: "alice", Text: "first", CreatedAt: ts},
+		},
+	}
+	issueB := issueA
+	issueB.Labels = []string{"a", "b"}
+	issueB.Dependencies = []*model.Dependency{
+		issueA.Dependencies[1],
+		issueA.Dependencies[0],
+	}
+	issueB.Comments = []*model.Comment{
+		issueA.Comments[1],
+		issueA.Comments[0],
+	}
+
+	fpA := analysis.ComputeIssueFingerprint(issueA)
+	fpB := analysis.ComputeIssueFingerprint(issueB)
+
+	if fpA.ContentHash != fpB.ContentHash {
+		t.Fatalf("ContentHash mismatch: %s vs %s", fpA.ContentHash, fpB.ContentHash)
+	}
+	if fpA.DependencyHash != fpB.DependencyHash {
+		t.Fatalf("DependencyHash mismatch: %s vs %s", fpA.DependencyHash, fpB.DependencyHash)
+	}
+}
+
+func TestComputeIssueDiff(t *testing.T) {
+	ts := time.Date(2024, 3, 10, 12, 0, 0, 0, time.UTC)
+	oldIssues := []model.Issue{
+		{ID: "A", Title: "Title", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID:        "B",
+			Title:     "Depends on A",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "A", Type: model.DepBlocks, CreatedAt: ts, CreatedBy: "alice"},
+			},
+		},
+		{ID: "C", Title: "Removed", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "E", Title: "Unchanged", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+	}
+	newIssues := []model.Issue{
+		{ID: "A", Title: "Title updated", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID:        "B",
+			Title:     "Depends on A",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "A", Type: model.DepRelated, CreatedAt: ts, CreatedBy: "alice"},
+			},
+		},
+		{ID: "D", Title: "Added", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "E", Title: "Unchanged", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+	}
+
+	diff := analysis.ComputeIssueDiff(oldIssues, newIssues)
+
+	if got := strings.Join(diff.Added, ","); got != "D" {
+		t.Fatalf("Added=%q, want %q", got, "D")
+	}
+	if got := strings.Join(diff.Removed, ","); got != "C" {
+		t.Fatalf("Removed=%q, want %q", got, "C")
+	}
+	if got := strings.Join(diff.ContentChanged, ","); got != "A" {
+		t.Fatalf("ContentChanged=%q, want %q", got, "A")
+	}
+	if got := strings.Join(diff.DependencyChanged, ","); got != "B" {
+		t.Fatalf("DependencyChanged=%q, want %q", got, "B")
+	}
+	if got := strings.Join(diff.Modified, ","); got != "A,B" {
+		t.Fatalf("Modified=%q, want %q", got, "A,B")
+	}
+	if got := strings.Join(diff.Unchanged, ","); got != "E" {
+		t.Fatalf("Unchanged=%q, want %q", got, "E")
 	}
 }
 

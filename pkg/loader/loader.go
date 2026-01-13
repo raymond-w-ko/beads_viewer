@@ -3,12 +3,13 @@ package loader
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	json "github.com/goccy/go-json"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -157,6 +158,10 @@ type ParseOptions struct {
 	// Lines longer than this are skipped with a warning.
 	// If 0, uses DefaultMaxBufferSize (10MB).
 	BufferSize int
+
+	// IssueFilter optionally filters parsed issues. Return true to include.
+	// When nil, all valid issues are included.
+	IssueFilter func(*model.Issue) bool
 }
 
 // LoadIssuesFromFileWithOptions reads issues from a file with custom options.
@@ -324,11 +329,18 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 				continue
 			}
 
+			issue.Status = normalizeIssueStatus(issue.Status)
+
 			// Validate issue
 			if err := issue.Validate(); err != nil {
 				PutIssue(issue)
 				// Skip invalid issues
 				warn(fmt.Sprintf("skipping invalid issue on line %d: %v", lineNum, err))
+				continue
+			}
+
+			if opts.IssueFilter != nil && !opts.IssueFilter(issue) {
+				PutIssue(issue)
 				continue
 			}
 
@@ -342,10 +354,16 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 				continue
 			}
 
+			issue.Status = normalizeIssueStatus(issue.Status)
+
 			// Validate issue
 			if err := issue.Validate(); err != nil {
 				// Skip invalid issues
 				warn(fmt.Sprintf("skipping invalid issue on line %d: %v", lineNum, err))
+				continue
+			}
+
+			if opts.IssueFilter != nil && !opts.IssueFilter(&issue) {
 				continue
 			}
 
@@ -362,4 +380,12 @@ func stripBOM(b []byte) []byte {
 		return b[3:]
 	}
 	return b
+}
+
+func normalizeIssueStatus(status model.Status) model.Status {
+	trimmed := strings.TrimSpace(string(status))
+	if trimmed == "" {
+		return status
+	}
+	return model.Status(strings.ToLower(trimmed))
 }

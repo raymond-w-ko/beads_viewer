@@ -52,7 +52,7 @@ func TestGenerateInsights_WithData(t *testing.T) {
 		map[string]float64{"A": 1.0, "B": 2.0, "C": 0.5}, // hubs
 		map[string]float64{"A": 0.7, "B": 0.9, "C": 0.3}, // authorities
 		map[string]float64{"A": 3.0, "B": 1.0, "C": 5.0}, // criticalPathScore
-		nil,                         // outDegree
+		map[string]int{"A": 0, "B": 1, "C": 0}, // outDegree
 		nil,                         // inDegree
 		[][]string{{"X", "Y", "Z"}}, // cycles
 		0.42,                        // density
@@ -119,6 +119,14 @@ func TestGenerateInsights_WithData(t *testing.T) {
 		t.Errorf("Expected density 0.42, got %f", insights.ClusterDensity)
 	}
 
+	// Check Orphans derived from OutDegree
+	if len(insights.Orphans) != 2 {
+		t.Fatalf("Expected 2 orphans, got %d", len(insights.Orphans))
+	}
+	if insights.Orphans[0] != "A" || insights.Orphans[1] != "C" {
+		t.Errorf("Expected orphans [A C], got %v", insights.Orphans)
+	}
+
 	// Check Stats reference
 	if insights.Stats == nil {
 		t.Error("Expected Stats to be set")
@@ -133,7 +141,7 @@ func TestGenerateInsights_ZeroLimit(t *testing.T) {
 		map[string]float64{"A": 1.0, "B": 2.0}, // hubs
 		map[string]float64{"A": 0.7, "B": 0.9}, // authorities
 		map[string]float64{"A": 3.0, "B": 1.0}, // criticalPathScore
-		nil, nil, nil, 0, nil,
+		map[string]int{"A": 0, "B": 2}, nil, nil, 0, nil,
 	)
 
 	// Zero limit should return all items
@@ -141,6 +149,9 @@ func TestGenerateInsights_ZeroLimit(t *testing.T) {
 
 	if len(insights.Bottlenecks) != 2 {
 		t.Errorf("Expected 2 bottlenecks with limit 0, got %d", len(insights.Bottlenecks))
+	}
+	if len(insights.Orphans) != 1 || insights.Orphans[0] != "A" {
+		t.Errorf("Expected orphans [A] with limit 0, got %v", insights.Orphans)
 	}
 }
 

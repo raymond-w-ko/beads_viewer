@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -78,6 +79,86 @@ func TestRenderSubtleDivider(t *testing.T) {
 	}
 }
 
+func TestParseCommandLine(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "empty",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "simple",
+			input: "code",
+			want:  []string{"code"},
+		},
+		{
+			name:  "args",
+			input: "code --wait",
+			want:  []string{"code", "--wait"},
+		},
+		{
+			name:  "double_quoted_path",
+			input: "\"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code\" --wait",
+			want:  []string{"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code", "--wait"},
+		},
+		{
+			name:  "single_quoted_arg",
+			input: "open -a 'Visual Studio Code'",
+			want:  []string{"open", "-a", "Visual Studio Code"},
+		},
+		{
+			name:  "escaped_space",
+			input: "open Visual\\ Studio",
+			want:  []string{"open", "Visual Studio"},
+		},
+		{
+			name:  "windows_path_in_quotes_preserves_backslashes",
+			input: "\"C:\\Program Files\\VS Code\\Code.exe\" --wait",
+			want:  []string{"C:\\Program Files\\VS Code\\Code.exe", "--wait"},
+		},
+		{
+			name:    "unterminated_single_quote",
+			input:   "open 'oops",
+			wantErr: true,
+		},
+		{
+			name:    "unterminated_double_quote",
+			input:   "open \"oops",
+			wantErr: true,
+		},
+		{
+			name:    "trailing_escape",
+			input:   "open \\",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseCommandLine(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (got=%v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("parseCommandLine(%q) = %#v, want %#v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandleListKeysFiltersAndTimeTravelPrompt(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "1", Title: "One", Status: model.StatusOpen},
@@ -134,6 +215,84 @@ func TestHandleListKeysFiltersAndTimeTravelPrompt(t *testing.T) {
 	}
 	if m.focused != focusList {
 		t.Fatalf("focus should return to list after esc")
+	}
+}
+
+func TestClassifyEditorCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantBase string
+		wantKind editorCommandKind
+	}{
+		{
+			name:     "empty",
+			args:     nil,
+			wantBase: "",
+			wantKind: editorCommandEmpty,
+		},
+		{
+			name:     "terminal_editor",
+			args:     []string{"VIM"},
+			wantBase: "vim",
+			wantKind: editorCommandTerminal,
+		},
+		{
+			name:     "forbidden_shell_bash",
+			args:     []string{"bash", "-lc", "echo hi"},
+			wantBase: "bash",
+			wantKind: editorCommandForbidden,
+		},
+		{
+			name:     "forbidden_shell_pwsh_exe",
+			args:     []string{"pwsh.exe", "-NoProfile"},
+			wantBase: "pwsh",
+			wantKind: editorCommandForbidden,
+		},
+		{
+			name:     "gui_editor",
+			args:     []string{"code", "--reuse-window"},
+			wantBase: "code",
+			wantKind: editorCommandOK,
+		},
+		{
+			name:     "windows_path_gui_editor",
+			args:     []string{`C:\Program Files\VS Code\Code.exe`, "--wait"},
+			wantBase: "code",
+			wantKind: editorCommandOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBase, gotKind := classifyEditorCommand(tt.args)
+			if gotBase != tt.wantBase || gotKind != tt.wantKind {
+				t.Fatalf("classifyEditorCommand(%v) = (%q, %v), want (%q, %v)", tt.args, gotBase, gotKind, tt.wantBase, tt.wantKind)
+			}
+		})
+	}
+}
+
+func TestAllowlistedGUIEditorKindForBase(t *testing.T) {
+	tests := []struct {
+		base string
+		want allowlistedGUIEditorKind
+	}{
+		{base: "code", want: allowlistedGUIEditorCode},
+		{base: "code-insiders", want: allowlistedGUIEditorCodeInsiders},
+		{base: "cursor", want: allowlistedGUIEditorCursor},
+		{base: "xdg-open", want: allowlistedGUIEditorXdgOpen},
+		{base: "notepad", want: allowlistedGUIEditorNotepad},
+		{base: "open", want: allowlistedGUIEditorOpenText},
+		{base: "unknown", want: allowlistedGUIEditorUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.base, func(t *testing.T) {
+			if got := allowlistedGUIEditorKindForBase(tt.base); got != tt.want {
+				t.Fatalf("allowlistedGUIEditorKindForBase(%q)=%v, want %v", tt.base, got, tt.want)
+			}
+		})
 	}
 }
 

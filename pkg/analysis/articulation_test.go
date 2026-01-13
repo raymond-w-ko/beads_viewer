@@ -9,10 +9,10 @@ func TestFindArticulationPointsHandlesZeroID(t *testing.T) {
 	// Explicit IDs: 0-1-2 chain; 1 should be articulation.
 	adj := undirectedAdjacency{
 		nodes: []int64{0, 1, 2},
-		neighbors: map[int64][]int64{
-			0: {1},
-			1: {0, 2},
-			2: {1},
+		neighbors: [][]int64{
+			{1},
+			{0, 2},
+			{1},
 		},
 	}
 

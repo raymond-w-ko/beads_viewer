@@ -88,12 +88,14 @@ func findOneCycleInSCC(g graph.Directed, scc []graph.Node) []graph.Node {
 	// Iterative DFS state
 	visited := make(map[int64]bool)
 	onStack := make(map[int64]bool)
+	stackPos := make(map[int64]int) // O(1) lookup for position in stack
 	stack := []graph.Node{}
-	
+
 	// Track neighbor index for each node on stack to resume iteration
 	neighborIndex := make(map[int64]int)
 
 	if len(scc) > 0 {
+		stackPos[scc[0].ID()] = 0 // Track initial node position
 		stack = append(stack, scc[0])
 	}
 
@@ -116,28 +118,22 @@ func findOneCycleInSCC(g graph.Directed, scc []graph.Node) []graph.Node {
 
 			if onStack[v.ID()] {
 				// Cycle found! Reconstruct path from v to u then close with v
-				var cycle []graph.Node
-				// Find index of v in stack
-				stackIdx := -1
-				for i, n := range stack {
-					if n.ID() == v.ID() {
-						stackIdx = i
-						break
-					}
-				}
-				if stackIdx != -1 {
-					cycle = append(cycle, stack[stackIdx:]...)
+				// Use O(1) lookup instead of linear search
+				if stackIdx, ok := stackPos[v.ID()]; ok {
+					cycle := append([]graph.Node{}, stack[stackIdx:]...)
 					cycle = append(cycle, v) // Close the loop
 					return cycle
 				}
 			}
 
 			if !visited[v.ID()] {
+				stackPos[v.ID()] = len(stack) // Track position before append
 				stack = append(stack, v)
 			}
 		} else {
 			// All neighbors visited, backtrack
 			onStack[uID] = false
+			delete(stackPos, uID) // Remove position tracking
 			stack = stack[:len(stack)-1]
 			delete(neighborIndex, uID)
 		}

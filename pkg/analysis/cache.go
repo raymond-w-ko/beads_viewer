@@ -207,16 +207,89 @@ func ComputeDataHash(issues []model.Issue) string {
 
 		// Dependencies (sorted)
 		if len(issue.Dependencies) > 0 {
-			deps := make([]string, 0, len(issue.Dependencies))
+			type depKey struct {
+				dependsOn string
+				depType   string
+				createdAt string
+				createdBy string
+			}
+			deps := make([]depKey, 0, len(issue.Dependencies))
 			for _, dep := range issue.Dependencies {
 				if dep == nil {
 					continue
 				}
-				deps = append(deps, dep.DependsOnID+":"+string(dep.Type))
+				deps = append(deps, depKey{
+					dependsOn: dep.DependsOnID,
+					depType:   string(dep.Type),
+					createdAt: dep.CreatedAt.UTC().Format(time.RFC3339Nano),
+					createdBy: dep.CreatedBy,
+				})
 			}
-			sort.Strings(deps)
+			sort.Slice(deps, func(i, j int) bool {
+				if deps[i].dependsOn != deps[j].dependsOn {
+					return deps[i].dependsOn < deps[j].dependsOn
+				}
+				if deps[i].depType != deps[j].depType {
+					return deps[i].depType < deps[j].depType
+				}
+				if deps[i].createdAt != deps[j].createdAt {
+					return deps[i].createdAt < deps[j].createdAt
+				}
+				return deps[i].createdBy < deps[j].createdBy
+			})
 			for _, dep := range deps {
-				h.Write([]byte(dep))
+				h.Write([]byte(dep.dependsOn))
+				h.Write([]byte{0})
+				h.Write([]byte(dep.depType))
+				h.Write([]byte{0})
+				h.Write([]byte(dep.createdAt))
+				h.Write([]byte{0})
+				h.Write([]byte(dep.createdBy))
+				h.Write([]byte{0})
+			}
+		}
+		h.Write([]byte{0})
+
+		// Comments (sorted)
+		if len(issue.Comments) > 0 {
+			type commentKey struct {
+				id        string
+				author    string
+				text      string
+				createdAt string
+			}
+			comments := make([]commentKey, 0, len(issue.Comments))
+			for _, comment := range issue.Comments {
+				if comment == nil {
+					continue
+				}
+				comments = append(comments, commentKey{
+					id:        strconv.FormatInt(comment.ID, 10),
+					author:    comment.Author,
+					text:      comment.Text,
+					createdAt: comment.CreatedAt.UTC().Format(time.RFC3339Nano),
+				})
+			}
+			sort.Slice(comments, func(i, j int) bool {
+				if comments[i].id != comments[j].id {
+					return comments[i].id < comments[j].id
+				}
+				if comments[i].createdAt != comments[j].createdAt {
+					return comments[i].createdAt < comments[j].createdAt
+				}
+				if comments[i].author != comments[j].author {
+					return comments[i].author < comments[j].author
+				}
+				return comments[i].text < comments[j].text
+			})
+			for _, comment := range comments {
+				h.Write([]byte(comment.id))
+				h.Write([]byte{0})
+				h.Write([]byte(comment.author))
+				h.Write([]byte{0})
+				h.Write([]byte(comment.text))
+				h.Write([]byte{0})
+				h.Write([]byte(comment.createdAt))
 				h.Write([]byte{0})
 			}
 		}
@@ -225,6 +298,234 @@ func ComputeDataHash(issues []model.Issue) string {
 	}
 
 	return hex.EncodeToString(h.Sum(nil))[:16] // Use first 16 chars for brevity
+}
+
+// IssueFingerprint represents a per-issue hash split across content and dependencies.
+// It supports fast diffing between snapshots without a full rebuild.
+type IssueFingerprint struct {
+	ID             string
+	ContentHash    string
+	DependencyHash string
+}
+
+// IssueDiff captures a per-issue diff between two snapshots.
+type IssueDiff struct {
+	Added             []string
+	Removed           []string
+	Modified          []string
+	ContentChanged    []string
+	DependencyChanged []string
+	Unchanged         []string
+}
+
+// ComputeIssueFingerprint returns the fingerprint for a single issue.
+func ComputeIssueFingerprint(issue model.Issue) IssueFingerprint {
+	return IssueFingerprint{
+		ID:             issue.ID,
+		ContentHash:    computeIssueContentHash(issue),
+		DependencyHash: computeIssueDependencyHash(issue),
+	}
+}
+
+// ComputeIssueDiff compares old and new issue slices and returns an IssueDiff.
+func ComputeIssueDiff(oldIssues, newIssues []model.Issue) IssueDiff {
+	oldFP := make(map[string]IssueFingerprint, len(oldIssues))
+	for i := range oldIssues {
+		fp := ComputeIssueFingerprint(oldIssues[i])
+		oldFP[fp.ID] = fp
+	}
+	newFP := make(map[string]IssueFingerprint, len(newIssues))
+	for i := range newIssues {
+		fp := ComputeIssueFingerprint(newIssues[i])
+		newFP[fp.ID] = fp
+	}
+
+	var diff IssueDiff
+	for id, newIssue := range newFP {
+		oldIssue, exists := oldFP[id]
+		if !exists {
+			diff.Added = append(diff.Added, id)
+			continue
+		}
+		contentChanged := oldIssue.ContentHash != newIssue.ContentHash
+		dependencyChanged := oldIssue.DependencyHash != newIssue.DependencyHash
+		if contentChanged || dependencyChanged {
+			diff.Modified = append(diff.Modified, id)
+			if contentChanged {
+				diff.ContentChanged = append(diff.ContentChanged, id)
+			}
+			if dependencyChanged {
+				diff.DependencyChanged = append(diff.DependencyChanged, id)
+			}
+			continue
+		}
+		diff.Unchanged = append(diff.Unchanged, id)
+	}
+
+	for id := range oldFP {
+		if _, exists := newFP[id]; !exists {
+			diff.Removed = append(diff.Removed, id)
+		}
+	}
+
+	sort.Strings(diff.Added)
+	sort.Strings(diff.Removed)
+	sort.Strings(diff.Modified)
+	sort.Strings(diff.ContentChanged)
+	sort.Strings(diff.DependencyChanged)
+	sort.Strings(diff.Unchanged)
+	return diff
+}
+
+func computeIssueContentHash(issue model.Issue) string {
+	h := sha256.New()
+
+	writeStringHash(h, issue.Title)
+	writeStringHash(h, issue.Description)
+	writeStringHash(h, issue.Design)
+	writeStringHash(h, issue.AcceptanceCriteria)
+	writeStringHash(h, issue.Notes)
+	writeStringHash(h, issue.Assignee)
+	writeStringHash(h, issue.SourceRepo)
+	writeStringPtrHash(h, issue.ExternalRef)
+
+	writeStringHash(h, string(issue.Status))
+	writeStringHash(h, string(issue.IssueType))
+	writeIntHash(h, issue.Priority)
+	writeIntPtrHash(h, issue.EstimatedMinutes)
+	writeTimeHash(h, issue.CreatedAt)
+	writeTimeHash(h, issue.UpdatedAt)
+	writeTimePtrHash(h, issue.DueDate)
+	writeTimePtrHash(h, issue.ClosedAt)
+
+	writeIntHash(h, issue.CompactionLevel)
+	writeTimePtrHash(h, issue.CompactedAt)
+	writeStringPtrHash(h, issue.CompactedAtCommit)
+	writeIntHash(h, issue.OriginalSize)
+
+	if len(issue.Labels) > 0 {
+		labels := append([]string(nil), issue.Labels...)
+		sort.Strings(labels)
+		for _, label := range labels {
+			writeStringHash(h, label)
+		}
+	}
+	writeStringHash(h, "")
+
+	if len(issue.Comments) > 0 {
+		comments := make([]*model.Comment, 0, len(issue.Comments))
+		for _, comment := range issue.Comments {
+			if comment != nil {
+				comments = append(comments, comment)
+			}
+		}
+		sort.Slice(comments, func(i, j int) bool {
+			if comments[i].ID != comments[j].ID {
+				return comments[i].ID < comments[j].ID
+			}
+			return comments[i].CreatedAt.Before(comments[j].CreatedAt)
+		})
+		for _, comment := range comments {
+			writeInt64Hash(h, comment.ID)
+			writeStringHash(h, comment.IssueID)
+			writeStringHash(h, comment.Author)
+			writeStringHash(h, comment.Text)
+			writeTimeHash(h, comment.CreatedAt)
+		}
+	}
+	writeStringHash(h, "")
+
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func computeIssueDependencyHash(issue model.Issue) string {
+	if len(issue.Dependencies) == 0 {
+		return "none"
+	}
+	type depKey struct {
+		dependsOn string
+		depType   string
+		createdAt string
+		createdBy string
+	}
+	deps := make([]depKey, 0, len(issue.Dependencies))
+	for _, dep := range issue.Dependencies {
+		if dep == nil {
+			continue
+		}
+		deps = append(deps, depKey{
+			dependsOn: dep.DependsOnID,
+			depType:   string(dep.Type),
+			createdAt: dep.CreatedAt.UTC().Format(time.RFC3339Nano),
+			createdBy: dep.CreatedBy,
+		})
+	}
+	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].dependsOn != deps[j].dependsOn {
+			return deps[i].dependsOn < deps[j].dependsOn
+		}
+		if deps[i].depType != deps[j].depType {
+			return deps[i].depType < deps[j].depType
+		}
+		if deps[i].createdAt != deps[j].createdAt {
+			return deps[i].createdAt < deps[j].createdAt
+		}
+		return deps[i].createdBy < deps[j].createdBy
+	})
+
+	h := sha256.New()
+	for _, dep := range deps {
+		writeStringHash(h, dep.dependsOn)
+		writeStringHash(h, dep.depType)
+		writeStringHash(h, dep.createdAt)
+		writeStringHash(h, dep.createdBy)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func writeStringHash(w io.Writer, v string) {
+	if v != "" {
+		_, _ = io.WriteString(w, v)
+	}
+	_, _ = w.Write([]byte{0})
+}
+
+func writeStringPtrHash(w io.Writer, v *string) {
+	if v != nil {
+		_, _ = io.WriteString(w, *v)
+	}
+	_, _ = w.Write([]byte{0})
+}
+
+func writeIntHash(w io.Writer, v int) {
+	_, _ = io.WriteString(w, strconv.Itoa(v))
+	_, _ = w.Write([]byte{0})
+}
+
+func writeIntPtrHash(w io.Writer, v *int) {
+	if v != nil {
+		_, _ = io.WriteString(w, strconv.Itoa(*v))
+	}
+	_, _ = w.Write([]byte{0})
+}
+
+func writeInt64Hash(w io.Writer, v int64) {
+	_, _ = io.WriteString(w, strconv.FormatInt(v, 10))
+	_, _ = w.Write([]byte{0})
+}
+
+func writeTimeHash(w io.Writer, t time.Time) {
+	if !t.IsZero() {
+		_, _ = io.WriteString(w, t.UTC().Format(time.RFC3339Nano))
+	}
+	_, _ = w.Write([]byte{0})
+}
+
+func writeTimePtrHash(w io.Writer, t *time.Time) {
+	if t != nil {
+		_, _ = io.WriteString(w, t.UTC().Format(time.RFC3339Nano))
+	}
+	_, _ = w.Write([]byte{0})
 }
 
 // ComputeConfigHash generates a deterministic hash of the analysis configuration.

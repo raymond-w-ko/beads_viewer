@@ -2,9 +2,11 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -60,5 +62,30 @@ func TestMetricStatusAndFullStatsLimits(t *testing.T) {
 	prTrim := trim(stats.PageRank(), cap)
 	if len(prTrim) != cap {
 		t.Fatalf("expected trimmed pagerank size %d, got %d", cap, len(prTrim))
+	}
+}
+
+func TestStatusEntryMarshalJSONMilliseconds(t *testing.T) {
+	entry := statusEntry{
+		State:   "computed",
+		Elapsed: 1500 * time.Millisecond,
+	}
+
+	raw, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal statusEntry: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal statusEntry: %v", err)
+	}
+
+	ms, ok := decoded["ms"].(float64)
+	if !ok {
+		t.Fatalf("expected ms field in JSON, got %v", decoded)
+	}
+	if ms < 1499 || ms > 1501 {
+		t.Fatalf("expected ~1500ms, got %v", ms)
 	}
 }

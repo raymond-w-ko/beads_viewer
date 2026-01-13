@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -341,6 +342,262 @@ func TestBackgroundWorker_ContentHashChanges(t *testing.T) {
 	// New snapshot should have updated title
 	if snapshot2.Issues[0].Title != "Updated Title" {
 		t.Errorf("Expected updated title, got %q", snapshot2.Issues[0].Title)
+	}
+}
+
+func TestBackgroundWorker_MetricsSnapshot(t *testing.T) {
+	t.Setenv("BV_WORKER_METRICS", "1")
+
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+	content := strings.Join([]string{
+		`{"id":"test-1","title":"Test","status":"open","priority":1,"issue_type":"task"}`,
+		`{"id":"test-2","title":"Test 2","status":"open","priority":2,"issue_type":"feature"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.TriggerRefresh()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if worker.GetSnapshot() != nil && worker.Metrics().SnapshotVersion > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if worker.GetSnapshot() == nil {
+		t.Fatal("Expected snapshot after refresh")
+	}
+
+	metrics := worker.Metrics()
+	if metrics.ProcessingCount == 0 {
+		t.Fatalf("expected ProcessingCount > 0, got %d", metrics.ProcessingCount)
+	}
+	if metrics.SnapshotVersion == 0 {
+		t.Fatalf("expected SnapshotVersion > 0")
+	}
+	if metrics.LastSnapshotReadyAt.IsZero() {
+		t.Fatal("expected LastSnapshotReadyAt to be set")
+	}
+	if metrics.SnapshotSizeBytes <= 0 {
+		t.Fatalf("expected SnapshotSizeBytes > 0, got %d", metrics.SnapshotSizeBytes)
+	}
+}
+
+func TestBackgroundWorker_IncrementalListMetrics(t *testing.T) {
+	t.Setenv("BV_WORKER_METRICS", "1")
+
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	var builder strings.Builder
+	for i := 0; i < 10; i++ {
+		builder.WriteString(fmt.Sprintf(
+			`{"id":"issue-%d","title":"Issue %d","status":"open","priority":%d,"issue_type":"task"}`+"\n",
+			i, i, i,
+		))
+	}
+	if err := os.WriteFile(beadsPath, []byte(builder.String()), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.TriggerRefresh()
+	waitForSnapshotVersion(t, worker, 1)
+
+	if snap := worker.GetSnapshot(); snap == nil {
+		t.Fatal("Expected snapshot after first refresh")
+	} else if snap.IncrementalListUsed {
+		t.Fatalf("expected first snapshot to be full rebuild")
+	}
+
+	updated := builder.String()
+	updated = strings.Replace(updated, `"title":"Issue 0"`, `"title":"Issue 0 updated"`, 1)
+	if err := os.WriteFile(beadsPath, []byte(updated), 0644); err != nil {
+		t.Fatalf("Failed to write modified file: %v", err)
+	}
+
+	worker.TriggerRefresh()
+	waitForSnapshotVersion(t, worker, 2)
+
+	snap2 := worker.GetSnapshot()
+	if snap2 == nil {
+		t.Fatal("Expected snapshot after second refresh")
+	}
+	if !snap2.IncrementalListUsed {
+		t.Fatalf("expected incremental list path on second snapshot")
+	}
+
+	metrics := worker.Metrics()
+	if metrics.IncrementalListCount == 0 {
+		t.Fatalf("expected IncrementalListCount > 0, got %d", metrics.IncrementalListCount)
+	}
+	if metrics.FullListCount == 0 {
+		t.Fatalf("expected FullListCount > 0, got %d", metrics.FullListCount)
+	}
+	if metrics.IncrementalListRatio <= 0 {
+		t.Fatalf("expected IncrementalListRatio > 0, got %f", metrics.IncrementalListRatio)
+	}
+}
+
+func TestBackgroundWorker_LargeDatasetWarning(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	const issueCount = 5000
+	f, err := os.Create(beadsPath)
+	if err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+	writer := bufio.NewWriter(f)
+	for i := 0; i < issueCount; i++ {
+		line := fmt.Sprintf(`{"id":"issue-%d","title":"Issue %d","status":"open","priority":1,"issue_type":"task"}`+"\n", i, i)
+		if _, err := writer.WriteString(line); err != nil {
+			_ = f.Close()
+			t.Fatalf("Failed to write test file: %v", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = f.Close()
+		t.Fatalf("Failed to flush test file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Failed to close test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.TriggerRefresh()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if worker.GetSnapshot() != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	snapshot := worker.GetSnapshot()
+	if snapshot == nil {
+		t.Fatal("Expected snapshot after refresh")
+	}
+	if snapshot.DatasetTier != datasetTierLarge {
+		t.Fatalf("expected datasetTierLarge, got %v", snapshot.DatasetTier)
+	}
+	if snapshot.SourceIssueCountHint != issueCount {
+		t.Fatalf("expected SourceIssueCountHint=%d, got %d", issueCount, snapshot.SourceIssueCountHint)
+	}
+	if snapshot.LoadedOpenOnly {
+		t.Fatalf("expected LoadedOpenOnly=false for large tier")
+	}
+	if snapshot.TruncatedCount != 0 {
+		t.Fatalf("expected TruncatedCount=0, got %d", snapshot.TruncatedCount)
+	}
+	if snapshot.LargeDatasetWarning == "" {
+		t.Fatal("expected LargeDatasetWarning to be populated")
+	}
+}
+
+func TestBackgroundWorker_HugeDatasetOpenOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	const issueCount = 20000
+	f, err := os.Create(beadsPath)
+	if err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+	writer := bufio.NewWriter(f)
+	openCount := 0
+	for i := 0; i < issueCount; i++ {
+		status := "open"
+		if i%2 == 0 {
+			status = "closed"
+		} else {
+			openCount++
+		}
+		line := fmt.Sprintf(`{"id":"issue-%d","title":"Issue %d","status":"%s","priority":1,"issue_type":"task"}`+"\n", i, i, status)
+		if _, err := writer.WriteString(line); err != nil {
+			_ = f.Close()
+			t.Fatalf("Failed to write test file: %v", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = f.Close()
+		t.Fatalf("Failed to flush test file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Failed to close test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.TriggerRefresh()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if worker.GetSnapshot() != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	snapshot := worker.GetSnapshot()
+	if snapshot == nil {
+		t.Fatal("Expected snapshot after refresh")
+	}
+	if snapshot.DatasetTier != datasetTierHuge {
+		t.Fatalf("expected datasetTierHuge, got %v", snapshot.DatasetTier)
+	}
+	if snapshot.SourceIssueCountHint != issueCount {
+		t.Fatalf("expected SourceIssueCountHint=%d, got %d", issueCount, snapshot.SourceIssueCountHint)
+	}
+	if !snapshot.LoadedOpenOnly {
+		t.Fatalf("expected LoadedOpenOnly=true for huge tier")
+	}
+	if len(snapshot.Issues) != openCount {
+		t.Fatalf("expected %d open issues, got %d", openCount, len(snapshot.Issues))
+	}
+	expectedTruncated := issueCount - openCount
+	if snapshot.TruncatedCount != expectedTruncated {
+		t.Fatalf("expected TruncatedCount=%d, got %d", expectedTruncated, snapshot.TruncatedCount)
+	}
+	if !strings.Contains(snapshot.LargeDatasetWarning, "open-only") {
+		t.Fatalf("expected LargeDatasetWarning to mention open-only, got %q", snapshot.LargeDatasetWarning)
 	}
 }
 
@@ -1003,6 +1260,19 @@ func waitForBackgroundWorkerMsg(t *testing.T, worker *BackgroundWorker, timeout 
 			t.Fatalf("timeout waiting for BackgroundWorker message (%v)", timeout)
 		}
 	}
+}
+
+func waitForSnapshotVersion(t *testing.T, worker *BackgroundWorker, minVersion uint64) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if worker.Metrics().SnapshotVersion >= minVersion {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for snapshot version %d (got %d)", minVersion, worker.Metrics().SnapshotVersion)
 }
 
 func TestBackgroundWorker_MalformedJSON_WarnsAndContinues(t *testing.T) {

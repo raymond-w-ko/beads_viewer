@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/util/topk"
 )
 
 const (
@@ -338,7 +340,10 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	results := make([]SearchResult, 0, min(k, len(ids)))
+	// Use heap-based top-K collector: O(n log k) vs O(nk) for linear insert
+	collector := topk.New[SearchResult](k, func(a, b SearchResult) bool {
+		return a.IssueID < b.IssueID // Deterministic tie-breaking: smaller ID wins
+	})
 
 	for _, issueID := range ids {
 		entry, ok := idx.entries[issueID]
@@ -347,38 +352,10 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 			continue
 		}
 		score := dotFloat32(query, entry.Vector)
-		insertTopK(&results, SearchResult{IssueID: issueID, Score: score}, k)
-	}
-	return results, nil
-}
-
-func insertTopK(results *[]SearchResult, candidate SearchResult, k int) {
-	r := *results
-	pos := len(r)
-	for i := range r {
-		if candidate.Score > r[i].Score || (candidate.Score == r[i].Score && candidate.IssueID < r[i].IssueID) {
-			pos = i
-			break
-		}
+		collector.Add(SearchResult{IssueID: issueID, Score: score}, score)
 	}
 
-	if pos == len(r) {
-		if len(r) < k {
-			*results = append(r, candidate)
-		}
-		return
-	}
-
-	if len(r) < k {
-		r = append(r, SearchResult{})
-	} else {
-		// Drop last element (lowest score).
-		r = r[:k]
-	}
-
-	copy(r[pos+1:], r[pos:])
-	r[pos] = candidate
-	*results = r
+	return collector.Results(), nil
 }
 
 func dotFloat32(a, b []float32) float64 {

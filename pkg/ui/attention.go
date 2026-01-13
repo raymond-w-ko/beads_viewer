@@ -16,7 +16,8 @@ func ComputeAttentionView(issues []model.Issue, width int) (string, error) {
 	result := analysis.ComputeLabelAttentionScores(issues, cfg, time.Now().UTC())
 
 	headers := []string{"Rank", "Label", "Attention", "Reason"}
-	colWidths := []int{4, 18, 10, width - 4 - 18 - 10 - 3}
+	sepWidth := len(" | ") * (len(headers) - 1)
+	colWidths := []int{4, 18, 10, width - 4 - 18 - 10 - sepWidth}
 	if colWidths[3] < 20 {
 		colWidths[3] = 20
 	}
