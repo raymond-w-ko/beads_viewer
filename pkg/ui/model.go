@@ -798,7 +798,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 
 	// Theme
-	theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+	r := lipgloss.NewRenderer(os.Stdout)
+	r.SetHasDarkBackground(false) // Force light mode for adaptive colors
+	theme := DefaultTheme(r)
 
 	// Default dimensions for immediate ready state (updated when WindowSizeMsg arrives)
 	// This eliminates the "Initializing..." phase entirely, fixing slow startup issues
