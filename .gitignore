@@ -1,6 +1,7 @@
 beads_reference/
 /bv
 /main
+/termcheck
 *.test
 cmd/bv/bv
 .DS_Store
