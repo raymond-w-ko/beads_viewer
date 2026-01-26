@@ -33,6 +33,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // View width thresholds for adaptive layout
@@ -802,8 +803,22 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
-	// Theme
-	theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+	// Theme - with light mode detection diagnostic
+	r := lipgloss.NewRenderer(os.Stdout)
+	if r.HasDarkBackground() {
+		// Detection failed - we're in light mode but it detected dark
+		termenvOut := termenv.NewOutput(os.Stdout)
+		bg := termenvOut.BackgroundColor()
+		rgb := termenv.ConvertToRGB(bg)
+		_, _, l := rgb.Hsl()
+		panic(fmt.Sprintf("Light mode detection failed!\n"+
+			"  lipgloss.NewRenderer.HasDarkBackground: true (wrong)\n"+
+			"  lipgloss.DefaultRenderer.HasDarkBackground: %v\n"+
+			"  termenv.HasDarkBackground: %v\n"+
+			"  Detected background: %s (HSL L=%.2f)",
+			lipgloss.HasDarkBackground(), termenvOut.HasDarkBackground(), rgb.Hex(), l))
+	}
+	theme := DefaultTheme(r)
 
 	// Default dimensions for immediate ready state (updated when WindowSizeMsg arrives)
 	// This eliminates the "Initializing..." phase entirely, fixing slow startup issues
