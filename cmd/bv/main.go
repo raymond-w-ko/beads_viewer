@@ -188,6 +188,7 @@ func main() {
 	pagesIncludeClosed := flag.Bool("pages-include-closed", true, "Include closed issues in export (default: true)")
 	pagesIncludeHistory := flag.Bool("pages-include-history", true, "Include git history for time-travel (default: true)")
 	previewPages := flag.String("preview-pages", "", "Preview existing static site bundle")
+	previewNoLiveReload := flag.Bool("no-live-reload", false, "Disable live-reload in preview mode")
 	watchExport := flag.Bool("watch-export", false, "Watch for beads changes and auto-regenerate export (use with --export-pages)")
 	pagesWizard := flag.Bool("pages", false, "Launch interactive Pages deployment wizard")
 	// Debug rendering flag (for diagnosing TUI issues)
@@ -220,6 +221,7 @@ func main() {
 	_ = pagesIncludeClosed
 	_ = pagesIncludeHistory
 	_ = previewPages
+	_ = previewNoLiveReload
 	_ = pagesWizard
 	_ = watchExport
 	_ = debugRender
@@ -740,7 +742,11 @@ func main() {
 		fmt.Println("      --preview-pages <dir>")
 		fmt.Println("          Start local server to preview existing export.")
 		fmt.Println("          Opens http://localhost:9000 (or next available port) in your browser.")
+		fmt.Println("          Live-reload is enabled by default: browser auto-refreshes on file changes.")
 		fmt.Println("          Example: bv --preview-pages ./bv-pages")
+		fmt.Println("")
+		fmt.Println("      --no-live-reload")
+		fmt.Println("          Disable live-reload for --preview-pages (default: live-reload is enabled).")
 		fmt.Println("")
 		fmt.Println("      --pages-title <title>")
 		fmt.Println("          Custom title for the static site (default: 'Project Issues')")
@@ -1317,7 +1323,7 @@ func main() {
 
 	// Handle --preview-pages (before export since it doesn't need analysis)
 	if *previewPages != "" {
-		if err := runPreviewServer(*previewPages); err != nil {
+		if err := runPreviewServer(*previewPages, !*previewNoLiveReload); err != nil {
 			fmt.Fprintf(os.Stderr, "Error starting preview server: %v\n", err)
 			os.Exit(1)
 		}
@@ -5882,9 +5888,10 @@ func escapeMarkdownTableCell(s string) string {
 }
 
 // runPreviewServer starts a local HTTP server to preview the static site.
-func runPreviewServer(dir string) error {
+func runPreviewServer(dir string, liveReload bool) error {
 	cfg := export.DefaultPreviewConfig()
 	cfg.BundlePath = dir
+	cfg.LiveReload = liveReload
 	return export.StartPreviewWithConfig(cfg)
 }
 
