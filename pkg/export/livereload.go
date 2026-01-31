@@ -258,6 +258,14 @@ type injectingResponseWriter struct {
 	committed bool
 }
 
+// WriteHeader deletes Content-Length before writing headers.
+// Since we inject script bytes, the original Content-Length from http.FileServer
+// would be incorrect. Removing it allows Go to use chunked transfer encoding.
+func (w *injectingResponseWriter) WriteHeader(code int) {
+	w.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 	if w.committed {
 		return w.ResponseWriter.Write(b)
