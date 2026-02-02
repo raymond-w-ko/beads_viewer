@@ -55,3 +55,4 @@ sweep_*.png
 test_screenshot.png
 a.out
 target-*/
+.playwright-mcp/
