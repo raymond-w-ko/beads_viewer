@@ -370,6 +370,7 @@ type Model struct {
 	focused                  focus
 	focusBeforeHelp          focus // Stores focus before opening help overlay
 	isSplitView              bool
+	splitPaneRatio           float64 // Ratio of list pane width (0.2-0.8), default 0.4
 	isBoardView              bool
 	isGraphView              bool
 	isActionableView         bool
@@ -1051,6 +1052,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		semanticHybridReady:    false,
 		lastSearchTerm:         "",
 		focused:                focusList,
+		splitPaneRatio:         0.4, // Default: list pane gets 40% of width
 		// Initialize as ready with default dimensions to eliminate "Initializing..." phase
 		ready:               true,
 		width:               defaultWidth,
@@ -2817,6 +2819,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
+			case "<":
+				// Shrink list pane (move divider left)
+				if m.isSplitView {
+					m.splitPaneRatio -= 0.05
+					if m.splitPaneRatio < 0.2 {
+						m.splitPaneRatio = 0.2
+					}
+					m.recalculateSplitPaneSizes()
+				}
+
+			case ">":
+				// Expand list pane (move divider right)
+				if m.isSplitView {
+					m.splitPaneRatio += 0.05
+					if m.splitPaneRatio > 0.8 {
+						m.splitPaneRatio = 0.8
+					}
+					m.recalculateSplitPaneSizes()
+				}
+
 			case "b":
 				m.clearAttentionOverlay()
 				m.isBoardView = !m.isBoardView
@@ -3250,7 +3272,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				availWidth = 10
 			}
 
-			listInnerWidth := int(float64(availWidth) * 0.4)
+			// Use configurable split ratio (default 0.4, adjustable via [ and ])
+			listInnerWidth := int(float64(availWidth) * m.splitPaneRatio)
 			detailInnerWidth := availWidth - listInnerWidth
 
 			// listHeight fits header (1) + page line (1) inside a panel with Border (2)
@@ -6622,6 +6645,37 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 	if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
 		m.list.Select(0)
 	}
+	m.updateViewportContent()
+}
+
+// recalculateSplitPaneSizes updates list and viewport dimensions after pane ratio changes
+func (m *Model) recalculateSplitPaneSizes() {
+	if !m.isSplitView {
+		return
+	}
+
+	bodyHeight := m.height - 1
+	if bodyHeight < 5 {
+		bodyHeight = 5
+	}
+
+	// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
+	availWidth := m.width - 8
+	if availWidth < 10 {
+		availWidth = 10
+	}
+
+	listInnerWidth := int(float64(availWidth) * m.splitPaneRatio)
+	detailInnerWidth := availWidth - listInnerWidth
+
+	listHeight := bodyHeight - 4
+	if listHeight < 3 {
+		listHeight = 3
+	}
+
+	m.list.SetSize(listInnerWidth, listHeight)
+	m.viewport = viewport.New(detailInnerWidth, bodyHeight-2)
+	m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
 	m.updateViewportContent()
 }
 

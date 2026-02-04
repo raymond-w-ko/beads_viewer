@@ -231,6 +231,17 @@ func TestExport_ChunkConfigCreated(t *testing.T) {
 	if config.TotalSize <= 0 {
 		t.Error("Total size should be positive")
 	}
+
+	// Hash must be present for OPFS cache invalidation (bv-pages-cache-fix)
+	// Without this, all deployments use cache key "default" and old data persists
+	if config.Hash == "" {
+		t.Error("Config hash is required for OPFS cache invalidation but was empty")
+	}
+
+	// Hash should be 64 hex chars (SHA-256)
+	if len(config.Hash) != 64 {
+		t.Errorf("Expected SHA-256 hash (64 chars), got %d chars: %s", len(config.Hash), config.Hash)
+	}
 }
 
 func TestGetExportedIssues(t *testing.T) {
