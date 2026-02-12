@@ -5464,7 +5464,7 @@ func (m *Model) renderFooter() string {
 		if remaining < 0 {
 			remaining = 0
 		}
-		filler := lipgloss.NewStyle().Background(ColorBgDark).Width(remaining).Render("")
+		filler := lipgloss.NewStyle().Width(remaining).Render("")
 		return lipgloss.JoinHorizontal(lipgloss.Bottom, msgSection, filler)
 	}
 
@@ -5549,7 +5549,6 @@ func (m *Model) renderFooter() string {
 
 	labelHint := lipgloss.NewStyle().
 		Foreground(ColorMuted).
-		Background(ColorBgDark).
 		Padding(0, 1).
 		Render("L:labels • h:detail")
 
@@ -5563,7 +5562,6 @@ func (m *Model) renderFooter() string {
 			}
 			labelHint = lipgloss.NewStyle().
 				Foreground(ColorMuted).
-				Background(ColorBgDark).
 				Padding(0, 1).
 				Render(fmt.Sprintf("/%s%s • n/N:match • enter:done • esc:cancel", m.board.SearchQuery(), matchInfo))
 		} else {
@@ -5576,14 +5574,12 @@ func (m *Model) renderFooter() string {
 			}
 			labelHint = lipgloss.NewStyle().
 				Foreground(ColorMuted).
-				Background(ColorBgDark).
 				Padding(0, 1).
 				Render(fmt.Sprintf("%s1-4:col • o/c/r:filter • L:labels • /:search • ?:help", filterInfo))
 		}
 	} else if m.showAttentionView {
 		labelHint = lipgloss.NewStyle().
 			Foreground(ColorMuted).
-			Background(ColorBgDark).
 			Padding(0, 1).
 			Render("A:attention • 1-9 filter • esc close")
 	}
@@ -5886,7 +5882,7 @@ func (m *Model) renderFooter() string {
 	workspaceSection := ""
 	if m.workspaceMode && m.workspaceSummary != "" {
 		workspaceStyle := lipgloss.NewStyle().
-			Background(lipgloss.Color("#45B7D1")).
+			Background(ThemeBg("#45B7D1")).
 			Foreground(ColorBg).
 			Bold(true).
 			Padding(0, 1)
@@ -6028,7 +6024,7 @@ func (m *Model) renderFooter() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	filler := lipgloss.NewStyle().Background(ColorBgDark).Width(remaining).Render("")
+	filler := lipgloss.NewStyle().Width(remaining).Render("")
 
 	// Build the footer
 	var parts []string

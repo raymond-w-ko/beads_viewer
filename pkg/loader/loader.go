@@ -19,7 +19,9 @@ import (
 const BeadsDirEnvVar = "BEADS_DIR"
 
 // PreferredJSONLNames defines the priority order for looking up beads data files.
-var PreferredJSONLNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
+// Priority order matches bd's canonical naming (beads.jsonl) to ensure bv watches
+// the same file that bd writes to in stealth/direct mode. Fixes bv-96.
+var PreferredJSONLNames = []string{"beads.jsonl", "issues.jsonl", "beads.base.jsonl"}
 
 // GetBeadsDir returns the beads directory path, respecting BEADS_DIR env var.
 // If BEADS_DIR is set, it is used directly.
@@ -106,7 +108,8 @@ func getMainRepoRoot(repoPath string) (string, error) {
 }
 
 // FindJSONLPath locates the beads JSONL file in the given directory.
-// Prefers issues.jsonl (canonical per beads upstream) over beads.jsonl (backward compat).
+// Prefers beads.jsonl (canonical per bd) over issues.jsonl (legacy) to match
+// the file that bd writes to in stealth/direct mode. Fixes bv-96.
 // Skips backup files and merge artifacts.
 func FindJSONLPath(beadsDir string) (string, error) {
 	return FindJSONLPathWithWarnings(beadsDir, nil)
@@ -153,7 +156,7 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 
 	// Warn about detected merge artifacts
 	if len(mergeArtifacts) > 0 && warnFunc != nil {
-		warnFunc(fmt.Sprintf("Merge artifact files detected: %s. Consider running 'bd clean' to remove them.",
+		warnFunc(fmt.Sprintf("Merge artifact files detected: %s. Consider running 'br clean' to remove them.",
 			strings.Join(mergeArtifacts, ", ")))
 	}
 
@@ -161,9 +164,9 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 		return "", fmt.Errorf("no beads JSONL file found in %s", beadsDir)
 	}
 
-	// Priority order for beads files per beads upstream:
-	// 1. issues.jsonl (canonical - per steveyegge/beads pre-commit hook)
-	// 2. beads.jsonl (backward compatibility)
+	// Priority order for beads files - matches bd's canonical naming (bv-96):
+	// 1. beads.jsonl (canonical - what bd writes to in stealth/direct mode)
+	// 2. issues.jsonl (legacy from steveyegge/beads pre-commit hook)
 	// 3. beads.base.jsonl (fallback, may be present during merge resolution)
 	// 4. First candidate
 	preferredNames := PreferredJSONLNames

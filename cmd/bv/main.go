@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
+	flag "github.com/spf13/pflag"
 	"fmt"
 	"html"
 	"io"
@@ -104,8 +104,7 @@ func main() {
 	alertSeverity := flag.String("severity", "", "Filter robot alerts by severity (info|warning|critical)")
 	alertType := flag.String("alert-type", "", "Filter robot alerts by alert type (e.g., stale_issue)")
 	alertLabel := flag.String("alert-label", "", "Filter robot alerts by label match")
-	recipeName := flag.String("recipe", "", "Apply named recipe (e.g., triage, actionable, high-impact)")
-	recipeShort := flag.String("r", "", "Shorthand for --recipe")
+	recipeName := flag.StringP("recipe", "r", "", "Apply named recipe (e.g., triage, actionable, high-impact)")
 	semanticQuery := flag.String("search", "", "Semantic search query (vector-based; builds/updates index on first run)")
 	robotSearch := flag.Bool("robot-search", false, "Output semantic search results as JSON for AI agents (use with --search)")
 	searchLimit := flag.Int("search-limit", 10, "Max results for --search/--robot-search")
@@ -205,6 +204,12 @@ func main() {
 	// Experimental background snapshot worker (bv-o11l)
 	backgroundMode := flag.Bool("background-mode", false, "Enable experimental background snapshot loading (TUI only)")
 	noBackgroundMode := flag.Bool("no-background-mode", false, "Disable experimental background snapshot loading (TUI only)")
+	// Override pflag's default usage so -h/--help prints our custom header.
+	flag.Usage = func() {
+		fmt.Println("Usage: bv [options]")
+		fmt.Println("\nA TUI viewer for beads issue tracker.")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	// CPU profiling support
@@ -304,11 +309,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Handle -r shorthand
-	if *recipeShort != "" && *recipeName == "" {
-		*recipeName = *recipeShort
-	}
-
 	if *help {
 		fmt.Println("Usage: bv [options]")
 		fmt.Println("\nA TUI viewer for beads issue tracker.")
@@ -386,7 +386,7 @@ func main() {
 		fmt.Println("  --emit-script [--script-limit=N]")
 		fmt.Println("      Emits a shell script for top-N recommendations (default: 5).")
 		fmt.Println("      Includes hash/config header for deterministic ordering.")
-		fmt.Println("      Output: bd show commands for each item, commented claim commands")
+		fmt.Println("      Output: br show commands for each item, commented claim commands")
 		fmt.Println("      Options: --script-format=bash|fish|zsh, --script-limit=N")
 		fmt.Println("      Example: bv --emit-script > work.sh && bash work.sh")
 		fmt.Println("      Example: bv --emit-script --script-limit=3")
@@ -532,8 +532,8 @@ func main() {
 		fmt.Println("      Useful for agent workflows and automation.")
 		fmt.Println("      Output includes:")
 		fmt.Println("        - Header comment with data hash and generation time")
-		fmt.Println("        - bd show commands for each recommended item")
-		fmt.Println("        - Commented bd update commands to claim items")
+		fmt.Println("        - br show commands for each recommended item")
+		fmt.Println("        - Commented br update commands to claim items")
 		fmt.Println("      Options:")
 		fmt.Println("        --script-limit=N      Number of items (default: 5)")
 		fmt.Println("        --script-format=X     Script format: bash, fish, zsh")
@@ -1188,6 +1188,14 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// Apply recipe filtering early for robot modes (bv-93)
+	// This ensures --recipe filters are applied before robot modes exit.
+	// dataHash uses pre-filtered issues for stability.
+	if activeRecipe != nil && (*robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel || *robotPriority || *robotInsights || *robotPlan) {
+		issues = applyRecipeFilters(issues, activeRecipe)
+		issues = applyRecipeSort(issues, activeRecipe)
 	}
 
 	// Handle semantic search CLI (bv-9gf.3)
@@ -2768,8 +2776,8 @@ func main() {
 				Score:         top.Score,
 				Reasons:       top.Reasons,
 				Unblocks:      top.Unblocks,
-				ClaimCmd:      fmt.Sprintf("bd update %s --status=in_progress", top.ID),
-				ShowCmd:       fmt.Sprintf("bd show %s", top.ID),
+				ClaimCmd:      fmt.Sprintf("br update %s --status=in_progress", top.ID),
+				ShowCmd:       fmt.Sprintf("br show %s", top.ID),
 			}
 
 			encoder := newRobotEncoder(os.Stdout)
@@ -2986,9 +2994,9 @@ func main() {
 				}
 
 				// Claim command
-				sb.WriteString(fmt.Sprintf("# To claim: bd update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("# To claim: br update %s --status=in_progress\n", rec.ID))
 				// Show command
-				sb.WriteString(fmt.Sprintf("bd show %s\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("br show %s\n", rec.ID))
 				sb.WriteString("\n")
 			}
 
@@ -2996,12 +3004,12 @@ func main() {
 			sb.WriteString("# === Quick Actions ===\n")
 			sb.WriteString("# To claim the top pick:\n")
 			if len(recs) > 0 {
-				sb.WriteString(fmt.Sprintf("# bd update %s --status=in_progress\n", recs[0].ID))
+				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", recs[0].ID))
 			}
 			sb.WriteString("#\n")
 			sb.WriteString("# To claim all listed items (uncomment to enable):\n")
 			for _, rec := range recs {
-				sb.WriteString(fmt.Sprintf("# bd update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", rec.ID))
 			}
 		}
 
@@ -3429,8 +3437,20 @@ func main() {
 			orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filteredCandidates))
 		}
 
+		// Wrap orphan report with standard envelope fields
+		type OrphanOutputEnvelope struct {
+			*correlation.OrphanReport
+			OutputFormat string `json:"output_format,omitempty"`
+			Version      string `json:"version,omitempty"`
+		}
+		output := OrphanOutputEnvelope{
+			OrphanReport: orphanReport,
+			OutputFormat: robotOutputFormat,
+			Version:      version.Version,
+		}
+
 		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(orphanReport); err != nil {
+		if err := encoder.Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding orphan report: %v\n", err)
 			os.Exit(1)
 		}
@@ -3491,18 +3511,16 @@ func main() {
 		if *fileHotspots {
 			// Output hotspots
 			type HotspotsOutput struct {
-				GeneratedAt time.Time                  `json:"generated_at"`
-				DataHash    string                     `json:"data_hash"`
-				Hotspots    []correlation.FileHotspot  `json:"hotspots"`
-				Stats       correlation.FileIndexStats `json:"stats"`
+				RobotEnvelope
+				Hotspots []correlation.FileHotspot  `json:"hotspots"`
+				Stats    correlation.FileIndexStats `json:"stats"`
 			}
 
 			hotspots := fileLookup.GetHotspots(*hotspotsLimit)
 			output := HotspotsOutput{
-				GeneratedAt: time.Now(),
-				DataHash:    report.DataHash,
-				Hotspots:    hotspots,
-				Stats:       fileLookup.GetStats(),
+				RobotEnvelope: NewRobotEnvelope(report.DataHash),
+				Hotspots:      hotspots,
+				Stats:         fileLookup.GetStats(),
 			}
 
 			if err := encoder.Encode(output); err != nil {
@@ -3519,8 +3537,7 @@ func main() {
 			}
 
 			type FileBeadsOutput struct {
-				GeneratedAt time.Time                   `json:"generated_at"`
-				DataHash    string                      `json:"data_hash"`
+				RobotEnvelope
 				FilePath    string                      `json:"file_path"`
 				TotalBeads  int                         `json:"total_beads"`
 				OpenBeads   []correlation.BeadReference `json:"open_beads"`
@@ -3528,12 +3545,11 @@ func main() {
 			}
 
 			output := FileBeadsOutput{
-				GeneratedAt: time.Now(),
-				DataHash:    report.DataHash,
-				FilePath:    *robotFileBeads,
-				TotalBeads:  result.TotalBeads,
-				OpenBeads:   result.OpenBeads,
-				ClosedBeads: result.ClosedBeads,
+				RobotEnvelope: NewRobotEnvelope(report.DataHash),
+				FilePath:      *robotFileBeads,
+				TotalBeads:    result.TotalBeads,
+				OpenBeads:     result.OpenBeads,
+				ClosedBeads:   result.ClosedBeads,
 			}
 
 			if err := encoder.Encode(output); err != nil {
@@ -3595,8 +3611,7 @@ func main() {
 		impactResult := fileLookup.ImpactAnalysis(files)
 
 		type ImpactOutput struct {
-			GeneratedAt   time.Time                  `json:"generated_at"`
-			DataHash      string                     `json:"data_hash"`
+			RobotEnvelope
 			Files         []string                   `json:"files"`
 			RiskLevel     string                     `json:"risk_level"`
 			RiskScore     float64                    `json:"risk_score"`
@@ -3606,8 +3621,7 @@ func main() {
 		}
 
 		output := ImpactOutput{
-			GeneratedAt:   time.Now(),
-			DataHash:      report.DataHash,
+			RobotEnvelope: NewRobotEnvelope(report.DataHash),
 			Files:         impactResult.Files,
 			RiskLevel:     impactResult.RiskLevel,
 			RiskScore:     impactResult.RiskScore,
@@ -3676,8 +3690,7 @@ func main() {
 		result := fileLookup.GetRelatedFiles(*robotFileRelations, *relationsThreshold, *relationsLimit)
 
 		type RelationsOutput struct {
-			GeneratedAt  time.Time                   `json:"generated_at"`
-			DataHash     string                      `json:"data_hash"`
+			RobotEnvelope
 			FilePath     string                      `json:"file_path"`
 			TotalCommits int                         `json:"total_commits"`
 			Threshold    float64                     `json:"threshold"`
@@ -3685,12 +3698,11 @@ func main() {
 		}
 
 		output := RelationsOutput{
-			GeneratedAt:  time.Now(),
-			DataHash:     report.DataHash,
-			FilePath:     result.FilePath,
-			TotalCommits: result.TotalCommits,
-			Threshold:    result.Threshold,
-			RelatedFiles: result.RelatedFiles,
+			RobotEnvelope: NewRobotEnvelope(report.DataHash),
+			FilePath:      result.FilePath,
+			TotalCommits:  result.TotalCommits,
+			Threshold:     result.Threshold,
+			RelatedFiles:  result.RelatedFiles,
 		}
 
 		encoder := newRobotEncoder(os.Stdout)
@@ -3772,15 +3784,19 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Add data hash to output
+		// Add envelope fields to output
 		type RelatedWorkOutput struct {
 			*correlation.RelatedWorkResult
-			DataHash string `json:"data_hash"`
+			DataHash     string `json:"data_hash"`
+			OutputFormat string `json:"output_format,omitempty"`
+			Version      string `json:"version,omitempty"`
 		}
 
 		output := RelatedWorkOutput{
 			RelatedWorkResult: result,
 			DataHash:          report.DataHash,
+			OutputFormat:      robotOutputFormat,
+			Version:           version.Version,
 		}
 
 		encoder := newRobotEncoder(os.Stdout)
@@ -3814,18 +3830,16 @@ func main() {
 		}
 
 		type BlockerChainOutput struct {
-			GeneratedAt time.Time                    `json:"generated_at"`
-			DataHash    string                       `json:"data_hash"`
-			Result      *analysis.BlockerChainResult `json:"result"`
+			RobotEnvelope
+			Result *analysis.BlockerChainResult `json:"result"`
 		}
 
 		// Compute data hash for consistency
 		dataHash := analysis.ComputeDataHash(issues)
 
 		output := BlockerChainOutput{
-			GeneratedAt: time.Now(),
-			DataHash:    dataHash,
-			Result:      result,
+			RobotEnvelope: NewRobotEnvelope(dataHash),
+			Result:        result,
 		}
 
 		encoder := newRobotEncoder(os.Stdout)
@@ -3903,11 +3917,22 @@ func main() {
 			depth = 3
 		}
 
-		// Generate result
+		// Generate result and wrap with envelope fields
 		result := network.ToResult(beadID, depth)
 
+		type ImpactNetworkEnvelope struct {
+			*correlation.ImpactNetworkResult
+			OutputFormat string `json:"output_format,omitempty"`
+			Version      string `json:"version,omitempty"`
+		}
+		output := ImpactNetworkEnvelope{
+			ImpactNetworkResult: result,
+			OutputFormat:        robotOutputFormat,
+			Version:             version.Version,
+		}
+
 		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(result); err != nil {
+		if err := encoder.Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding impact network: %v\n", err)
 			os.Exit(1)
 		}
@@ -3979,8 +4004,20 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Wrap with envelope fields
+		type CausalityEnvelope struct {
+			*correlation.CausalityResult
+			OutputFormat string `json:"output_format,omitempty"`
+			Version      string `json:"version,omitempty"`
+		}
+		output := CausalityEnvelope{
+			CausalityResult: result,
+			OutputFormat:     robotOutputFormat,
+			Version:          version.Version,
+		}
+
 		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(result); err != nil {
+		if err := encoder.Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding causality result: %v\n", err)
 			os.Exit(1)
 		}
@@ -4001,6 +4038,8 @@ func main() {
 			os.Exit(1)
 		}
 
+		dataHash := analysis.ComputeDataHash(issues)
+
 		if *robotSprintShow != "" {
 			// Find specific sprint
 			var found *model.Sprint
@@ -4014,22 +4053,30 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotSprintShow)
 				os.Exit(1)
 			}
-			// Output single sprint as JSON
+			// Wrap sprint with standard envelope
+			type SprintShowOutput struct {
+				RobotEnvelope
+				Sprint *model.Sprint `json:"sprint"`
+			}
+			output := SprintShowOutput{
+				RobotEnvelope: NewRobotEnvelope(dataHash),
+				Sprint:        found,
+			}
 			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(found); err != nil {
+			if err := encoder.Encode(output); err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding sprint: %v\n", err)
 				os.Exit(1)
 			}
 		} else {
 			// Output all sprints as JSON
 			output := struct {
-				GeneratedAt time.Time      `json:"generated_at"`
+				RobotEnvelope
 				SprintCount int            `json:"sprint_count"`
 				Sprints     []model.Sprint `json:"sprints"`
 			}{
-				GeneratedAt: time.Now().UTC(),
-				SprintCount: len(sprints),
-				Sprints:     sprints,
+				RobotEnvelope: NewRobotEnvelope(dataHash),
+				SprintCount:   len(sprints),
+				Sprints:       sprints,
 			}
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
@@ -4085,6 +4132,7 @@ func main() {
 		// Build burndown data
 		now := time.Now()
 		burndown := calculateBurndownAt(targetSprint, issues, now)
+		burndown.RobotEnvelope = NewRobotEnvelope(analysis.ComputeDataHash(issues))
 		issueMap := make(map[string]model.Issue, len(issues))
 		for _, iss := range issues {
 			issueMap[iss.ID] = iss
@@ -4170,7 +4218,7 @@ func main() {
 			LatestETA     time.Time `json:"latest_eta"`
 		}
 		type ForecastOutput struct {
-			GeneratedAt   time.Time              `json:"generated_at"`
+			RobotEnvelope
 			Agents        int                    `json:"agents"`
 			Filters       map[string]string      `json:"filters,omitempty"`
 			ForecastCount int                    `json:"forecast_count"`
@@ -4239,7 +4287,7 @@ func main() {
 		}
 
 		output := ForecastOutput{
-			GeneratedAt:   now.UTC(),
+			RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(issues)),
 			Agents:        agents,
 			ForecastCount: len(forecasts),
 			Forecasts:     forecasts,
@@ -4414,7 +4462,7 @@ func main() {
 
 		// Build output
 		type CapacityOutput struct {
-			GeneratedAt       time.Time    `json:"generated_at"`
+			RobotEnvelope
 			Agents            int          `json:"agents"`
 			Label             string       `json:"label,omitempty"`
 			OpenIssueCount    int          `json:"open_issue_count"`
@@ -4432,7 +4480,7 @@ func main() {
 		}
 
 		output := CapacityOutput{
-			GeneratedAt:       now.UTC(),
+			RobotEnvelope:     NewRobotEnvelope(analysis.ComputeDataHash(issues)),
 			Agents:            agents,
 			OpenIssueCount:    len(openIssues),
 			TotalMinutes:      totalMinutes,
@@ -4608,7 +4656,7 @@ func main() {
 	}
 
 	if len(issues) == 0 {
-		fmt.Println("No issues found. Create some with 'bd create'!")
+		fmt.Println("No issues found. Create some with 'br create'!")
 		os.Exit(0)
 	}
 
@@ -5565,6 +5613,13 @@ func copyViewerAssets(outputDir, title string) error {
 		}
 	}
 
+	// Always add GitHub Actions workflow for reliable Pages deployment
+	// This ensures the workflow is in the bundle regardless of deployment target
+	if err := export.WriteGitHubActionsWorkflow(outputDir); err != nil {
+		// Non-fatal - just log a warning
+		fmt.Printf("  Warning: Could not add GitHub Actions workflow: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -6141,8 +6196,8 @@ func runPagesWizard(beadsPath string) error {
 			}
 			wizard.PrintSuccess(result)
 		} else {
-			// Perform deployment
-			result, err := wizard.PerformDeploy()
+			// Perform deployment with issue count for verification
+			result, err := wizard.PerformDeployWithIssueCount(len(exportIssues))
 			if err != nil {
 				return err
 			}
@@ -6537,8 +6592,8 @@ func absInt(v int) int {
 
 // BurndownOutput represents the JSON output for --robot-burndown (bv-159)
 type BurndownOutput struct {
-	GeneratedAt       time.Time             `json:"generated_at"`
-	SprintID          string                `json:"sprint_id"`
+	RobotEnvelope
+	SprintID string `json:"sprint_id"`
 	SprintName        string                `json:"sprint_name"`
 	StartDate         time.Time             `json:"start_date"`
 	EndDate           time.Time             `json:"end_date"`
@@ -6863,8 +6918,7 @@ func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Ti
 	idealLine := generateIdealLine(sprint, totalIssues)
 
 	return BurndownOutput{
-		GeneratedAt:       now.UTC(),
-		SprintID:          sprint.ID,
+		SprintID: sprint.ID,
 		SprintName:        sprint.Name,
 		StartDate:         sprint.StartDate,
 		EndDate:           sprint.EndDate,
@@ -7551,6 +7605,15 @@ func generateRobotSchemas() RobotSchemas {
 			"data_hash": map[string]interface{}{
 				"type":        "string",
 				"description": "Fingerprint of source beads.jsonl for cache validation",
+			},
+			"output_format": map[string]interface{}{
+				"type":        "string",
+				"enum":        []string{"json", "toon"},
+				"description": "Output format used (json or toon)",
+			},
+			"version": map[string]interface{}{
+				"type":        "string",
+				"description": "bv version that generated this output",
 			},
 		},
 		"required": []string{"generated_at", "data_hash"},
