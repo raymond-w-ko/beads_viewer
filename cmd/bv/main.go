@@ -51,6 +51,7 @@ import (
 
 func main() {
 	cpuProfile := flag.String("cpu-profile", "", "Write CPU profile to file")
+	dbPath := flag.String("db", "", "Path to beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR env vars)")
 	help := flag.Bool("help", false, "Show help")
 	versionFlag := flag.Bool("version", false, "Show version")
 	// Update flags (bv-182)
@@ -114,6 +115,7 @@ func main() {
 	searchWeights := flag.String("search-weights", "", "Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency)")
 	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date)")
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
+	noCache := flag.Bool("no-cache", false, "Bypass disk cache for robot triage (also: BV_NO_CACHE=1)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
 	profileStartup := flag.Bool("profile-startup", false, "Output detailed startup timing profile for diagnostics")
 	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup)")
@@ -233,6 +235,22 @@ func main() {
 			os.Exit(1)
 		}
 		defer pprof.StopCPUProfile()
+	}
+
+	// Apply --db flag: set BEADS_DB env var so all downstream code respects it.
+	// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
+	if *dbPath != "" {
+		absDB, err := filepath.Abs(*dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
+			os.Exit(1)
+		}
+		os.Setenv(loader.BeadsDBEnvVar, absDB)
+	}
+
+	// Apply --no-cache flag: set BV_NO_CACHE=1 so disk cache is bypassed.
+	if *noCache {
+		os.Setenv("BV_NO_CACHE", "1")
 	}
 
 	// Ensure static export flags are retained even when build tags strip features in some environments.
@@ -782,6 +800,20 @@ func main() {
 		fmt.Println("")
 		fmt.Println("      --pages-include-closed=false")
 		fmt.Println("          Exclude closed issues from export (default: include all)")
+		fmt.Println("")
+		fmt.Println("  Database Path Configuration:")
+		fmt.Println("      --db <path>")
+		fmt.Println("          Specify path to beads database file or .beads directory.")
+		fmt.Println("          Accepts a .beads/ directory, a beads.jsonl file, or a beads.db file.")
+		fmt.Println("          Overrides all environment variables.")
+		fmt.Println("          Example: bv --db /path/to/repo/.beads --robot-triage")
+		fmt.Println("          Example: bv --db /path/to/.beads/beads.jsonl --robot-next")
+		fmt.Println("")
+		fmt.Println("      Environment variables (in priority order):")
+		fmt.Println("        BEADS_DB   - Path to beads database file or .beads directory")
+		fmt.Println("        BEADS_DIR  - Path to .beads directory (existing, lower priority)")
+		fmt.Println("")
+		fmt.Println("      Resolution priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery")
 		fmt.Println("")
 		fmt.Println("  Drift Detection Configuration (.bv/drift.yaml)")
 		fmt.Println("      Customize drift detection thresholds:")
@@ -1351,7 +1383,7 @@ func main() {
 		issues, err = datasource.LoadIssues("")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'bd init'.")
+			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'br init'.")
 			os.Exit(1)
 		}
 		// Get beads file path for live reload (respects BEADS_DIR env var)
@@ -7756,6 +7788,8 @@ func generateRobotDocs(topic string) map[string]interface{} {
 	}
 
 	envVars := map[string]string{
+		"BEADS_DB":            "Path to beads database file or .beads directory (overrides BEADS_DIR; overridden by --db flag)",
+		"BEADS_DIR":           "Path to .beads directory (fallback when BEADS_DB and --db are not set)",
 		"BV_OUTPUT_FORMAT":    "Default output format: json or toon (overridden by --format)",
 		"TOON_DEFAULT_FORMAT": "Fallback format if BV_OUTPUT_FORMAT not set",
 		"TOON_STATS":          "Set to 1 to show JSON vs TOON token estimates on stderr",

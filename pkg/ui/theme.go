@@ -2,6 +2,7 @@ package ui
 
 import (
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/lipgloss"
@@ -11,8 +12,20 @@ import (
 // package init so every style helper can branch without re-detecting.
 var TermProfile colorprofile.Profile
 
+// BVThemeOverride holds the user's explicit theme preference from BV_THEME.
+// Values: "" (auto-detect), "dark", "light".
+var BVThemeOverride string
+
 func init() {
 	TermProfile = colorprofile.Detect(os.Stdout, os.Environ())
+
+	// BV_THEME allows users to override auto-detection of light/dark background.
+	// This is useful when the terminal reports the wrong background color or
+	// when using themes that confuse auto-detection (e.g., Windows Terminal
+	// custom schemes, tmux, SSH). (bv-128)
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("BV_THEME"))); v == "light" || v == "dark" {
+		BVThemeOverride = v
+	}
 }
 
 // ThemeBg returns the given hex color for TrueColor terminals and
@@ -50,6 +63,7 @@ type Theme struct {
 	Deferred   lipgloss.AdaptiveColor
 	Pinned     lipgloss.AdaptiveColor
 	Hooked     lipgloss.AdaptiveColor
+	Review     lipgloss.AdaptiveColor
 	Closed     lipgloss.AdaptiveColor
 	Tombstone  lipgloss.AdaptiveColor
 
@@ -85,8 +99,13 @@ type Theme struct {
 	TriageUnblocksAlt lipgloss.Style // Secondary unblocks ↪
 }
 
-// DefaultTheme returns the standard Dracula-inspired theme (adaptive)
+// DefaultTheme returns the standard Dracula-inspired theme (adaptive).
+// Respects BV_THEME=light|dark to override background detection. (bv-128)
 func DefaultTheme(r *lipgloss.Renderer) Theme {
+	// Apply BV_THEME override so AdaptiveColor picks the right variant
+	if r != nil && BVThemeOverride != "" {
+		r.SetHasDarkBackground(BVThemeOverride == "dark")
+	}
 	t := Theme{
 		Renderer: r,
 
@@ -102,6 +121,7 @@ func DefaultTheme(r *lipgloss.Renderer) Theme {
 		Deferred:   lipgloss.AdaptiveColor{Light: "#B06800", Dark: "#FFB86C"}, // Orange - on ice
 		Pinned:     lipgloss.AdaptiveColor{Light: "#0066CC", Dark: "#6699FF"}, // Blue - persistent
 		Hooked:     lipgloss.AdaptiveColor{Light: "#008080", Dark: "#00CED1"}, // Teal - agent-attached
+		Review:     lipgloss.AdaptiveColor{Light: "#6B47D9", Dark: "#BD93F9"}, // Purple - awaiting review
 		Closed:     lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"}, // Gray
 		Tombstone:  lipgloss.AdaptiveColor{Light: "#888888", Dark: "#44475A"}, // Muted gray - deleted
 
@@ -155,8 +175,18 @@ func (t Theme) GetStatusColor(s string) lipgloss.AdaptiveColor {
 		return t.InProgress
 	case "blocked":
 		return t.Blocked
+	case "deferred", "draft":
+		return t.Deferred
+	case "pinned":
+		return t.Pinned
+	case "hooked":
+		return t.Hooked
+	case "review":
+		return t.Review
 	case "closed":
 		return t.Closed
+	case "tombstone":
+		return t.Tombstone
 	default:
 		return t.Subtext
 	}

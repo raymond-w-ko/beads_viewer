@@ -698,12 +698,13 @@ func TestOpenInEditorTerminalEditorGuard(t *testing.T) {
 
 	origEditor := os.Getenv("EDITOR")
 	defer os.Setenv("EDITOR", origEditor)
-	_ = os.Setenv("EDITOR", "vim") // triggers terminal-editor guard, no exec
+	_ = os.Setenv("EDITOR", "vim") // terminal editor — now dispatches via TUI suspend (bv-134)
 
+	// With no issues selected, terminal editor dispatch returns "No issue selected"
 	m := NewModel(nil, nil, "")
 	m.openInEditor()
-	if !m.statusIsError || !strings.Contains(m.statusMsg, "terminal editor") {
-		t.Fatalf("expected terminal editor warning, got %q", m.statusMsg)
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "No issue selected") {
+		t.Fatalf("expected 'No issue selected' for terminal editor with no selection, got %q", m.statusMsg)
 	}
 }
 
@@ -738,11 +739,12 @@ func TestOpenInEditorWithArguments(t *testing.T) {
 	}
 
 	// Also test terminal editor detection with arguments (e.g., "vim -u NONE")
+	// Now dispatches via TUI suspend (bv-134); with no issue selected, returns error
 	_ = os.Setenv("EDITOR", "vim -u NONE")
 	m2 := NewModel(nil, nil, "")
 	m2.openInEditor()
-	if !m2.statusIsError || !strings.Contains(m2.statusMsg, "terminal editor") {
-		t.Fatalf("expected terminal editor warning for 'vim -u NONE', got %q", m2.statusMsg)
+	if !m2.statusIsError || !strings.Contains(m2.statusMsg, "No issue selected") {
+		t.Fatalf("expected 'No issue selected' for 'vim -u NONE', got %q", m2.statusMsg)
 	}
 }
 
@@ -1303,5 +1305,310 @@ func TestHelpOverlayScroll(t *testing.T) {
 	}
 	if m.helpScroll != 0 {
 		t.Fatalf("expected helpScroll=0 after Space, got %d", m.helpScroll)
+	}
+}
+
+// Tests for terminal editor dispatch (bv-134)
+
+func TestExportIssueFrontmatter(t *testing.T) {
+	issue := model.Issue{
+		ID:          "bv-134",
+		Title:       "Smart editor dispatch",
+		Priority:    2,
+		Status:      model.StatusOpen,
+		Assignee:    "alice",
+		IssueType:   model.TypeFeature,
+		Labels:      []string{"ui", "editor"},
+		Description: "Implement terminal editor support.",
+	}
+
+	content := exportIssueFrontmatter(issue)
+
+	// Verify frontmatter structure
+	if !strings.HasPrefix(content, "---\n") {
+		t.Fatal("expected frontmatter to start with ---")
+	}
+	if !strings.Contains(content, "title: Smart editor dispatch\n") {
+		t.Fatalf("missing title in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "priority: 2\n") {
+		t.Fatalf("missing priority in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "status: open\n") {
+		t.Fatalf("missing status in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "assignee: alice\n") {
+		t.Fatalf("missing assignee in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "type: feature\n") {
+		t.Fatalf("missing type in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "# labels (read-only): [ui, editor]\n") {
+		t.Fatalf("missing labels comment in frontmatter: %s", content)
+	}
+	if !strings.Contains(content, "Implement terminal editor support.") {
+		t.Fatalf("missing description body: %s", content)
+	}
+}
+
+func TestExportIssueFrontmatterEmptyAssignee(t *testing.T) {
+	issue := model.Issue{
+		ID:        "bv-135",
+		Title:     "No assignee",
+		Priority:  1,
+		Status:    model.StatusOpen,
+		IssueType: model.TypeBug,
+	}
+
+	content := exportIssueFrontmatter(issue)
+	if !strings.Contains(content, "assignee:\n") {
+		t.Fatalf("expected empty assignee line, got: %s", content)
+	}
+}
+
+func TestExportIssueFrontmatterSpecialChars(t *testing.T) {
+	issue := model.Issue{
+		ID:        "bv-136",
+		Title:     `Fix: "colon" and #hash problems`,
+		Priority:  3,
+		Status:    model.StatusInProgress,
+		IssueType: model.TypeBug,
+	}
+
+	content := exportIssueFrontmatter(issue)
+	// Title with special chars should be quoted
+	if !strings.Contains(content, `title: "Fix`) {
+		t.Fatalf("expected quoted title for special chars, got: %s", content)
+	}
+}
+
+func TestParseIssueFrontmatter(t *testing.T) {
+	content := `---
+title: Updated title
+priority: 3
+status: in_progress
+assignee: bob
+type: bug
+---
+
+New description here.
+`
+
+	fields := parseIssueFrontmatter(content)
+	if fields["title"] != "Updated title" {
+		t.Fatalf("expected title 'Updated title', got %q", fields["title"])
+	}
+	if fields["priority"] != "3" {
+		t.Fatalf("expected priority '3', got %q", fields["priority"])
+	}
+	if fields["status"] != "in_progress" {
+		t.Fatalf("expected status 'in_progress', got %q", fields["status"])
+	}
+	if fields["assignee"] != "bob" {
+		t.Fatalf("expected assignee 'bob', got %q", fields["assignee"])
+	}
+	if fields["type"] != "bug" {
+		t.Fatalf("expected type 'bug', got %q", fields["type"])
+	}
+}
+
+func TestParseIssueFrontmatterNoFrontmatter(t *testing.T) {
+	content := "Just plain text without frontmatter."
+	fields := parseIssueFrontmatter(content)
+	if len(fields) != 0 {
+		t.Fatalf("expected no fields, got %v", fields)
+	}
+}
+
+func TestParseIssueFrontmatterQuotedValues(t *testing.T) {
+	content := `---
+title: "Title with: colon"
+assignee: "someone"
+---
+`
+
+	fields := parseIssueFrontmatter(content)
+	if fields["title"] != "Title with: colon" {
+		t.Fatalf("expected unquoted title, got %q", fields["title"])
+	}
+}
+
+func TestParseBodyFromFrontmatter(t *testing.T) {
+	content := `---
+title: test
+---
+
+This is the body.
+With multiple lines.
+`
+	body := parseBodyFromFrontmatter(content)
+	if !strings.Contains(body, "This is the body.") {
+		t.Fatalf("expected body content, got %q", body)
+	}
+	if !strings.Contains(body, "With multiple lines.") {
+		t.Fatalf("expected multiline body, got %q", body)
+	}
+}
+
+func TestParseBodyFromFrontmatterEmpty(t *testing.T) {
+	content := `---
+title: test
+---
+`
+	body := parseBodyFromFrontmatter(content)
+	if body != "" {
+		t.Fatalf("expected empty body, got %q", body)
+	}
+}
+
+func TestYamlEscapeString(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"simple", "simple"},
+		{"", `""`},
+		{"has: colon", `"has: colon"`},
+		{`has "quotes"`, `"has \"quotes\""`},
+		{"has\nnewline", `"has\nnewline"`},
+		{" leading space", `" leading space"`},
+	}
+	for _, tt := range tests {
+		got := yamlEscapeString(tt.input)
+		if got != tt.want {
+			t.Errorf("yamlEscapeString(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestFrontmatterRoundTrip(t *testing.T) {
+	issue := model.Issue{
+		ID:          "bv-rt",
+		Title:       "Round trip test",
+		Priority:    2,
+		Status:      model.StatusOpen,
+		Assignee:    "charlie",
+		IssueType:   model.TypeTask,
+		Description: "Original description.",
+	}
+
+	content := exportIssueFrontmatter(issue)
+	fields := parseIssueFrontmatter(content)
+	body := parseBodyFromFrontmatter(content)
+
+	if fields["title"] != issue.Title {
+		t.Errorf("title roundtrip: got %q, want %q", fields["title"], issue.Title)
+	}
+	if fields["priority"] != "2" {
+		t.Errorf("priority roundtrip: got %q, want %q", fields["priority"], "2")
+	}
+	if fields["status"] != string(issue.Status) {
+		t.Errorf("status roundtrip: got %q, want %q", fields["status"], issue.Status)
+	}
+	if fields["assignee"] != issue.Assignee {
+		t.Errorf("assignee roundtrip: got %q, want %q", fields["assignee"], issue.Assignee)
+	}
+	if fields["type"] != string(issue.IssueType) {
+		t.Errorf("type roundtrip: got %q, want %q", fields["type"], issue.IssueType)
+	}
+	if body != issue.Description {
+		t.Errorf("body roundtrip: got %q, want %q", body, issue.Description)
+	}
+}
+
+func TestTerminalEditorClassification(t *testing.T) {
+	// Verify all new terminal editors are correctly classified (bv-134)
+	newEditors := []string{"helix", "hx", "micro", "kakoune", "kak", "jed", "mg", "mcedit"}
+	for _, editor := range newEditors {
+		_, kind := classifyEditorCommand([]string{editor})
+		if kind != editorCommandTerminal {
+			t.Errorf("classifyEditorCommand(%q) = %v, want editorCommandTerminal", editor, kind)
+		}
+	}
+}
+
+func TestLaunchTerminalEditorNoSelection(t *testing.T) {
+	tmp := t.TempDir()
+	oldCwd, _ := os.Getwd()
+	defer os.Chdir(oldCwd)
+	_ = os.MkdirAll(filepath.Join(tmp, ".beads"), 0755)
+	_ = os.WriteFile(filepath.Join(tmp, ".beads", "beads.jsonl"), []byte("{}"), 0644)
+	_ = os.Chdir(tmp)
+
+	origEditor := os.Getenv("EDITOR")
+	defer os.Setenv("EDITOR", origEditor)
+	_ = os.Setenv("EDITOR", "helix")
+
+	m := NewModel(nil, nil, "")
+	cmd := m.openInEditor()
+	if cmd != nil {
+		t.Fatal("expected nil cmd when no issue is selected")
+	}
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "No issue selected") {
+		t.Fatalf("expected 'No issue selected' error, got %q", m.statusMsg)
+	}
+}
+
+func TestEditorExitMsgNoChanges(t *testing.T) {
+	original := `---
+title: Test
+priority: 1
+status: open
+assignee:
+type: task
+---
+
+Description.
+`
+	// Write temp file with identical content
+	tmpFile, err := os.CreateTemp("", "bv-test-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	_, _ = tmpFile.WriteString(original)
+	tmpFile.Close()
+
+	m := NewModel([]model.Issue{{ID: "t1", Title: "Test", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	msg := editorExitMsg{
+		issueID:  "t1",
+		tmpFile:  tmpFile.Name(),
+		original: original,
+		err:      nil,
+	}
+
+	result, _ := m.Update(msg)
+	resultModel := result.(Model)
+	if resultModel.statusIsError {
+		t.Fatalf("expected no error, got %q", resultModel.statusMsg)
+	}
+	if !strings.Contains(resultModel.statusMsg, "No changes") {
+		t.Fatalf("expected 'No changes' message, got %q", resultModel.statusMsg)
+	}
+}
+
+func TestEditorExitMsgWithError(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "bv-test-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	m := NewModel(nil, nil, "")
+	msg := editorExitMsg{
+		issueID:  "t1",
+		tmpFile:  tmpFile.Name(),
+		original: "original",
+		err:      errors.New("editor crashed"),
+	}
+
+	result, _ := m.Update(msg)
+	resultModel := result.(Model)
+	if !resultModel.statusIsError {
+		t.Fatal("expected error status")
+	}
+	if !strings.Contains(resultModel.statusMsg, "Editor exited with error") {
+		t.Fatalf("expected editor error message, got %q", resultModel.statusMsg)
 	}
 }

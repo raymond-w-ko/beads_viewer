@@ -7,6 +7,7 @@ package export
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -76,26 +77,100 @@ func CheckWranglerStatus() (*CloudflareStatus, error) {
 	status.Installed = err == nil
 
 	if status.Installed {
-		// Check authentication via whoami
-		cmd := exec.Command("wrangler", "whoami")
-		output, err := cmd.CombinedOutput()
-		outputStr := string(output)
+		// First check for CLOUDFLARE_API_TOKEN env var (used in CI and headless environments).
+		if token := os.Getenv("CLOUDFLARE_API_TOKEN"); token != "" {
+			status.Authenticated = true
+			status.AccountName = "(API token)"
+			status.AccountID = os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+		}
 
-		// wrangler whoami returns 0 even when not authenticated
-		// Check output for authentication indicators
-		status.Authenticated = err == nil &&
-			!strings.Contains(outputStr, "not authenticated") &&
-			!strings.Contains(outputStr, "You are not authenticated") &&
-			(strings.Contains(outputStr, "Account ID") ||
-				strings.Contains(outputStr, "account") ||
-				strings.Contains(outputStr, "@"))
+		// Fall back to checking the wrangler config file directly. This avoids
+		// the unreliable `wrangler whoami` which can hang on headless servers.
+		if !status.Authenticated {
+			status.Authenticated = checkWranglerConfigFile()
+		}
 
-		if status.Authenticated {
-			status.AccountName, status.AccountID = parseWranglerWhoami(outputStr)
+		// Finally try `wrangler whoami` with a timeout to extract account details,
+		// but only if we haven't already confirmed auth above.
+		if !status.Authenticated {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "wrangler", "whoami")
+			output, err := cmd.CombinedOutput()
+			outputStr := string(output)
+
+			// wrangler whoami returns 0 even when not authenticated
+			// Check output for authentication indicators
+			status.Authenticated = err == nil &&
+				!strings.Contains(outputStr, "not authenticated") &&
+				!strings.Contains(outputStr, "You are not authenticated") &&
+				(strings.Contains(outputStr, "Account ID") ||
+					strings.Contains(outputStr, "account") ||
+					strings.Contains(outputStr, "@"))
+
+			if status.Authenticated {
+				status.AccountName, status.AccountID = parseWranglerWhoami(outputStr)
+			}
 		}
 	}
 
 	return status, nil
+}
+
+// checkWranglerConfigFile checks if a valid wrangler OAuth config file exists.
+// Wrangler stores credentials in different locations depending on version:
+//   - ~/.wrangler/config/default.toml (wrangler v3+)
+//   - ~/.config/.wrangler/config/default.toml (some installations)
+//   - $XDG_CONFIG_HOME/.wrangler/config/default.toml (XDG-aware)
+func checkWranglerConfigFile() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	// Build list of candidate paths (checked in order).
+	candidates := []string{
+		filepath.Join(home, ".wrangler", "config", "default.toml"),
+		filepath.Join(home, ".config", ".wrangler", "config", "default.toml"),
+	}
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, ".wrangler", "config", "default.toml"))
+	}
+
+	for _, configPath := range candidates {
+		if validWranglerConfig(configPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// validWranglerConfig reads a wrangler config TOML and returns true if it
+// contains an oauth_token that hasn't expired (or has a refresh_token).
+func validWranglerConfig(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	if !strings.Contains(content, "oauth_token") {
+		return false
+	}
+	hasRefreshToken := strings.Contains(content, "refresh_token")
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "expiration_time") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				timeStr := strings.Trim(strings.TrimSpace(parts[1]), "\"")
+				expiry, err := time.Parse(time.RFC3339, timeStr)
+				if err == nil && time.Now().After(expiry) && !hasRefreshToken {
+					return false // Token expired and no refresh token
+				}
+			}
+		}
+	}
+	return true
 }
 
 // parseWranglerWhoami extracts account info from wrangler whoami output.

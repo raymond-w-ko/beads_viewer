@@ -134,6 +134,14 @@ func WaitForPhase2Cmd(stats *analysis.GraphStats) tea.Cmd {
 // FileChangedMsg is sent when the beads file changes on disk
 type FileChangedMsg struct{}
 
+// editorExitMsg is sent when a terminal editor process exits after editing an issue (bv-134).
+type editorExitMsg struct {
+	issueID  string // The issue that was being edited
+	tmpFile  string // Path to the temp file with edited content
+	original string // Original content for diff comparison
+	err      error  // Non-nil if the editor process failed
+}
+
 // semanticDebounceTickMsg is sent after debounce delay to trigger semantic computation
 type semanticDebounceTickMsg struct{}
 
@@ -1156,6 +1164,90 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case editorExitMsg:
+		// Terminal editor exited — parse changes and apply via br update (bv-134)
+		defer os.Remove(msg.tmpFile)
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("❌ Editor exited with error: %v", msg.err)
+			m.statusIsError = true
+			return m, nil
+		}
+		editedBytes, err := os.ReadFile(msg.tmpFile)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("❌ Failed to read edited file: %v", err)
+			m.statusIsError = true
+			return m, nil
+		}
+		editedContent := string(editedBytes)
+		if editedContent == msg.original {
+			m.statusMsg = "No changes made"
+			m.statusIsError = false
+			return m, nil
+		}
+
+		// Parse changed frontmatter fields
+		editedFields := parseIssueFrontmatter(editedContent)
+		// Find the original issue to compare against — if the issue was
+		// removed from the map while the editor was open (e.g., file reload),
+		// abort to avoid corrupting data by diffing against zero values.
+		var originalIssue model.Issue
+		if m.issueMap != nil {
+			if orig, ok := m.issueMap[msg.issueID]; ok {
+				originalIssue = *orig
+			} else {
+				m.statusMsg = fmt.Sprintf("❌ Issue %s no longer exists — changes not applied", msg.issueID)
+				m.statusIsError = true
+				return m, nil
+			}
+		} else {
+			m.statusMsg = "❌ Issue map not loaded — changes not applied"
+			m.statusIsError = true
+			return m, nil
+		}
+
+		// Check for description (body) changes
+		editedBody := parseBodyFromFrontmatter(editedContent)
+		originalBody := parseBodyFromFrontmatter(msg.original)
+
+		var brArgs []string
+		if t, ok := editedFields["title"]; ok && t != originalIssue.Title {
+			brArgs = append(brArgs, "--title", t)
+		}
+		if s, ok := editedFields["status"]; ok && model.Status(s) != originalIssue.Status {
+			brArgs = append(brArgs, "--status", s)
+		}
+		if p, ok := editedFields["priority"]; ok && p != fmt.Sprintf("%d", originalIssue.Priority) {
+			brArgs = append(brArgs, "--priority", p)
+		}
+		if a, ok := editedFields["assignee"]; ok && a != originalIssue.Assignee {
+			brArgs = append(brArgs, "--assignee", a)
+		}
+		if t, ok := editedFields["type"]; ok && model.IssueType(t) != originalIssue.IssueType {
+			brArgs = append(brArgs, "--type", t)
+		}
+		if editedBody != originalBody {
+			brArgs = append(brArgs, "--description", editedBody)
+		}
+
+		if len(brArgs) == 0 {
+			m.statusMsg = "No field changes detected"
+			m.statusIsError = false
+			return m, nil
+		}
+
+		cmdArgs := append([]string{"update", msg.issueID}, brArgs...)
+		brCmd := exec.Command("br", cmdArgs...)
+		output, brErr := brCmd.CombinedOutput()
+		if brErr != nil {
+			m.statusMsg = fmt.Sprintf("❌ br update failed: %v — %s", brErr, strings.TrimSpace(string(output)))
+			m.statusIsError = true
+			return m, nil
+		}
+		fieldCount := len(brArgs) / 2
+		m.statusMsg = fmt.Sprintf("✅ Updated %d field(s) for %s", fieldCount, msg.issueID)
+		m.statusIsError = false
+		return m, nil
+
 	case ReadyTimeoutMsg:
 		// bv-7wl7: Legacy fallback handler (no longer used).
 		// The model is now initialized as ready with default dimensions in NewModel(),
@@ -1645,7 +1737,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					include = isClosedLikeStatus(issue.Status)
 				case "ready":
 					// Ready = Open/InProgress AND NO Open Blockers
-					if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusBlocked {
+					// Exclude draft/deferred - not ready for execution
+					if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusBlocked &&
+						issue.Status != model.StatusDraft && issue.Status != model.StatusDeferred {
 						isBlocked := false
 						for _, dep := range issue.Dependencies {
 							if dep == nil || !dep.Type.IsBlocking() {
@@ -3183,9 +3277,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.handleFlowMatrixKeys(msg)
 
 			case focusList:
+				// Intercept "O" before handleListKeys so we can return a tea.Cmd
+				// for terminal editor dispatch (bv-134)
+				if msg.String() == "O" {
+					if editorCmd := m.openInEditor(); editorCmd != nil {
+						return m, editorCmd
+					}
+					return m, nil
+				}
 				m = m.handleListKeys(msg)
 
 			case focusDetail:
+				// Intercept "O" in detail view for editor dispatch (bv-134)
+				if msg.String() == "O" {
+					if editorCmd := m.openInEditor(); editorCmd != nil {
+						return m, editorCmd
+					}
+					return m, nil
+				}
 				m.viewport, cmd = m.viewport.Update(msg)
 				cmds = append(cmds, cmd)
 			}
@@ -4270,9 +4379,7 @@ func (m Model) handleListKeys(msg tea.KeyMsg) Model {
 	case "C":
 		// Copy selected issue to clipboard
 		m.copyIssueToClipboard()
-	case "O":
-		// Open beads.jsonl in editor
-		m.openInEditor()
+	// Note: "O" (open in editor) is handled at the Update level for tea.Cmd support (bv-134)
 	case "h":
 		// Toggle history view
 		if !m.isHistoryView {
@@ -5548,7 +5655,7 @@ func (m *Model) renderFooter() string {
 	}
 
 	labelHint := lipgloss.NewStyle().
-		Foreground(ColorMuted).
+		Foreground(ColorFooterHint).
 		Padding(0, 1).
 		Render("L:labels • h:detail")
 
@@ -5561,7 +5668,7 @@ func (m *Model) renderFooter() string {
 				matchInfo = fmt.Sprintf(" [%d/%d]", m.board.SearchCursorPos(), m.board.SearchMatchCount())
 			}
 			labelHint = lipgloss.NewStyle().
-				Foreground(ColorMuted).
+				Foreground(ColorFooterHint).
 				Padding(0, 1).
 				Render(fmt.Sprintf("/%s%s • n/N:match • enter:done • esc:cancel", m.board.SearchQuery(), matchInfo))
 		} else {
@@ -5573,13 +5680,13 @@ func (m *Model) renderFooter() string {
 				filterInfo = fmt.Sprintf("[%s:%d/%d] ", m.currentFilter, shown, total)
 			}
 			labelHint = lipgloss.NewStyle().
-				Foreground(ColorMuted).
+				Foreground(ColorFooterHint).
 				Padding(0, 1).
 				Render(fmt.Sprintf("%s1-4:col • o/c/r:filter • L:labels • /:search • ?:help", filterInfo))
 		}
 	} else if m.showAttentionView {
 		labelHint = lipgloss.NewStyle().
-			Foreground(ColorMuted).
+			Foreground(ColorFooterHint).
 			Padding(0, 1).
 			Render("A:attention • 1-9 filter • esc close")
 	}
@@ -5908,10 +6015,10 @@ func (m *Model) renderFooter() string {
 	// KEYBOARD HINTS - Context-aware navigation help
 	// ─────────────────────────────────────────────────────────────────────────
 	keyStyle := lipgloss.NewStyle().
-		Foreground(ColorSecondary).
-		Background(ColorBgSubtle).
+		Foreground(ColorFooterKey).
+		Bold(true).
 		Padding(0, 0)
-	sepStyle := lipgloss.NewStyle().Foreground(ColorMuted)
+	sepStyle := lipgloss.NewStyle().Foreground(ColorFooterSep)
 	sep := sepStyle.Render(" │ ")
 
 	var keyHints []string
@@ -5966,7 +6073,7 @@ func (m *Model) renderFooter() string {
 	}
 
 	keysSection := lipgloss.NewStyle().
-		Foreground(ColorSubtext).
+		Foreground(ColorFooterHint).
 		Padding(0, 1).
 		Render(strings.Join(keyHints, sep))
 
@@ -5974,7 +6081,7 @@ func (m *Model) renderFooter() string {
 	// COUNT BADGE - Total issues displayed
 	// ─────────────────────────────────────────────────────────────────────────
 	countBadge := lipgloss.NewStyle().
-		Foreground(ColorSecondary).
+		Foreground(ColorFooterDim).
 		Padding(0, 1).
 		Render(fmt.Sprintf("%d issues", len(m.list.Items())))
 
@@ -6150,7 +6257,9 @@ func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 		return isClosedLikeStatus(issue.Status)
 	case "ready":
 		// Ready = Open/InProgress AND NO Open Blockers
-		if isClosedLikeStatus(issue.Status) || issue.Status == model.StatusBlocked {
+		// Exclude draft/deferred - not ready for execution
+		if isClosedLikeStatus(issue.Status) || issue.Status == model.StatusBlocked ||
+			issue.Status == model.StatusDraft || issue.Status == model.StatusDeferred {
 			return false
 		}
 		for _, dep := range issue.Dependencies {
@@ -7575,14 +7684,22 @@ const (
 )
 
 var terminalEditorExecutables = map[string]bool{
-	"vim":   true,
-	"vi":    true,
-	"nvim":  true,
-	"nano":  true,
-	"emacs": true,
-	"pico":  true,
-	"joe":   true,
-	"ne":    true,
+	"vim":    true,
+	"vi":     true,
+	"nvim":   true,
+	"nano":   true,
+	"emacs":  true,
+	"pico":   true,
+	"joe":    true,
+	"ne":     true,
+	"helix":  true,
+	"hx":     true,
+	"micro":  true,
+	"kakoune": true,
+	"kak":    true,
+	"jed":    true,
+	"mg":     true,
+	"mcedit": true,
 }
 
 var forbiddenEditorExecutables = map[string]bool{
@@ -7743,9 +7860,13 @@ func startAllowlistedGUIEditor(kind allowlistedGUIEditorKind, targetFile string)
 	}
 }
 
-// openInEditor opens the beads file in the user's preferred editor
-// Uses m.beadsPath which respects issues.jsonl (canonical per beads upstream)
-func (m *Model) openInEditor() {
+// openInEditor opens the beads file in the user's preferred editor.
+// For terminal editors (vim, helix, nano, etc.) it exports the focused issue as
+// frontmatter markdown, suspends the TUI, launches the editor, and returns a
+// tea.Cmd that will produce an editorExitMsg when the editor exits (bv-134).
+// For GUI editors it launches them in the background as before.
+// Uses m.beadsPath which respects issues.jsonl (canonical per beads upstream).
+func (m *Model) openInEditor() tea.Cmd {
 	// Use the configured beadsPath instead of hardcoded path
 	beadsFile := m.beadsPath
 	if beadsFile == "" {
@@ -7757,12 +7878,12 @@ func (m *Model) openInEditor() {
 	if beadsFile == "" {
 		m.statusMsg = "❌ No .beads directory or beads.jsonl found"
 		m.statusIsError = true
-		return
+		return nil
 	}
 	if _, err := os.Stat(beadsFile); os.IsNotExist(err) {
 		m.statusMsg = fmt.Sprintf("❌ Beads file not found: %s", beadsFile)
 		m.statusIsError = true
-		return
+		return nil
 	}
 
 	// Determine editor - prefer GUI editors that work in background
@@ -7778,23 +7899,22 @@ func (m *Model) openInEditor() {
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("❌ Invalid $EDITOR/$VISUAL: %v", err)
 			m.statusIsError = true
-			return
+			return nil
 		}
 
 		editorBase, kind := classifyEditorCommand(editorArgs)
 		switch kind {
 		case editorCommandTerminal:
-			m.statusMsg = fmt.Sprintf("⚠️ %s is a terminal editor - set $EDITOR to a GUI editor or quit first", editorBase)
-			m.statusIsError = true
-			return
+			// Smart dispatch: suspend TUI and launch terminal editor with issue markdown (bv-134)
+			return m.launchTerminalEditor(editorArgs)
 		case editorCommandForbidden:
 			m.statusMsg = fmt.Sprintf("❌ Refusing to run %s as editor (shell/interpreter). Set $EDITOR to a GUI editor", editorBase)
 			m.statusIsError = true
-			return
+			return nil
 		case editorCommandEmpty:
 			m.statusMsg = "❌ Invalid $EDITOR/$VISUAL: empty command"
 			m.statusIsError = true
-			return
+			return nil
 		default:
 			requestedEditorKind = allowlistedGUIEditorKindForBase(editorBase)
 			if requestedEditorKind == allowlistedGUIEditorUnknown {
@@ -7825,14 +7945,14 @@ func (m *Model) openInEditor() {
 	if requestedEditorKind == allowlistedGUIEditorUnknown {
 		m.statusMsg = "❌ No GUI editor found. Set $EDITOR to a GUI editor"
 		m.statusIsError = true
-		return
+		return nil
 	}
 
 	actualKind, err := startAllowlistedGUIEditor(requestedEditorKind, beadsFile)
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("❌ Failed to open editor: %v", err)
 		m.statusIsError = true
-		return
+		return nil
 	}
 	requestedEditorKind = actualKind
 
@@ -7842,6 +7962,193 @@ func (m *Model) openInEditor() {
 		m.statusMsg = fmt.Sprintf("📝 Opened in %s", allowlistedGUIEditorDisplayName(requestedEditorKind))
 	}
 	m.statusIsError = false
+	return nil
+}
+
+// launchTerminalEditor exports the focused issue as frontmatter markdown, suspends
+// the TUI, and launches the terminal editor. Returns a tea.Cmd for tea.ExecProcess (bv-134).
+func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
+	// Get the currently selected issue
+	selectedItem := m.list.SelectedItem()
+	if selectedItem == nil {
+		m.statusMsg = "❌ No issue selected"
+		m.statusIsError = true
+		return nil
+	}
+	issueItem, ok := selectedItem.(IssueItem)
+	if !ok {
+		m.statusMsg = "❌ Invalid item type"
+		m.statusIsError = true
+		return nil
+	}
+	issue := issueItem.Issue
+
+	// Export the issue as frontmatter markdown
+	content := exportIssueFrontmatter(issue)
+
+	// Write to a temp file
+	tmpFile, err := os.CreateTemp("", "bv-edit-*.md")
+	if err != nil {
+		m.statusMsg = fmt.Sprintf("❌ Failed to create temp file: %v", err)
+		m.statusIsError = true
+		return nil
+	}
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		m.statusMsg = fmt.Sprintf("❌ Failed to write temp file: %v", err)
+		m.statusIsError = true
+		return nil
+	}
+	tmpFile.Close()
+
+	// Build the editor command: editorArgs[0] is the binary, rest are flags, then the file
+	cmdArgs := append(editorArgs[1:], tmpFile.Name())
+	editorCmd := exec.Command(editorArgs[0], cmdArgs...)
+	editorCmd.Stdin = os.Stdin
+	editorCmd.Stdout = os.Stdout
+	editorCmd.Stderr = os.Stderr
+
+	issueID := issue.ID
+	originalContent := content
+	tmpPath := tmpFile.Name()
+
+	m.statusMsg = fmt.Sprintf("📝 Opening %s in %s...", issue.ID, filepath.Base(editorArgs[0]))
+	m.statusIsError = false
+
+	return tea.ExecProcess(editorCmd, func(err error) tea.Msg {
+		return editorExitMsg{
+			issueID:  issueID,
+			tmpFile:  tmpPath,
+			original: originalContent,
+			err:      err,
+		}
+	})
+}
+
+// exportIssueFrontmatter renders an issue as a markdown document with YAML frontmatter.
+// This format is used for terminal editor dispatch so users can edit fields inline (bv-134).
+func exportIssueFrontmatter(issue model.Issue) string {
+	var sb strings.Builder
+	sb.WriteString("---\n")
+	sb.WriteString(fmt.Sprintf("title: %s\n", yamlEscapeString(issue.Title)))
+	sb.WriteString(fmt.Sprintf("priority: %d\n", issue.Priority))
+	sb.WriteString(fmt.Sprintf("status: %s\n", yamlEscapeString(string(issue.Status))))
+	if issue.Assignee != "" {
+		sb.WriteString(fmt.Sprintf("assignee: %s\n", yamlEscapeString(issue.Assignee)))
+	} else {
+		sb.WriteString("assignee:\n")
+	}
+	sb.WriteString(fmt.Sprintf("type: %s\n", yamlEscapeString(string(issue.IssueType))))
+	if len(issue.Labels) > 0 {
+		escapedLabels := make([]string, len(issue.Labels))
+		for i, l := range issue.Labels {
+			escapedLabels[i] = yamlEscapeString(l)
+		}
+		sb.WriteString(fmt.Sprintf("# labels (read-only): [%s]\n", strings.Join(escapedLabels, ", ")))
+	}
+	sb.WriteString("---\n\n")
+	if issue.Description != "" {
+		sb.WriteString(issue.Description)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// yamlEscapeString escapes a string for safe inclusion in YAML frontmatter.
+// Wraps in quotes if the string contains special YAML characters.
+func yamlEscapeString(s string) string {
+	if s == "" {
+		return `""`
+	}
+	// If the string contains characters that need quoting in YAML
+	if strings.ContainsAny(s, ":#{}[]|>&*!%@`,?\\\"'\n") ||
+		strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") {
+		// Use double-quoted YAML scalar with escaping
+		escaped := strings.ReplaceAll(s, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		escaped = strings.ReplaceAll(escaped, "\n", `\n`)
+		return `"` + escaped + `"`
+	}
+	return s
+}
+
+// parseIssueFrontmatter parses YAML frontmatter from a markdown document.
+// Returns a map of field names to values for changed fields (bv-134).
+func parseIssueFrontmatter(content string) map[string]string {
+	fields := make(map[string]string)
+
+	// Find frontmatter delimiters
+	if !strings.HasPrefix(content, "---\n") {
+		return fields
+	}
+	endIdx := strings.Index(content[4:], "\n---")
+	if endIdx < 0 {
+		return fields
+	}
+	frontmatter := content[4 : 4+endIdx]
+
+	for _, line := range strings.Split(frontmatter, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:colonIdx])
+		value := strings.TrimSpace(line[colonIdx+1:])
+		// Strip surrounding quotes if present and unescape in a single pass
+		// to correctly handle sequences like \\n (literal backslash + n).
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			value = value[1 : len(value)-1]
+			var unescaped strings.Builder
+			unescaped.Grow(len(value))
+			for i := 0; i < len(value); i++ {
+				if value[i] == '\\' && i+1 < len(value) {
+					switch value[i+1] {
+					case '\\':
+						unescaped.WriteByte('\\')
+					case '"':
+						unescaped.WriteByte('"')
+					case 'n':
+						unescaped.WriteByte('\n')
+					default:
+						unescaped.WriteByte(value[i+1])
+					}
+					i++ // skip the escaped character
+				} else {
+					unescaped.WriteByte(value[i])
+				}
+			}
+			value = unescaped.String()
+		}
+		if key != "" {
+			fields[key] = value
+		}
+	}
+	return fields
+}
+
+// parseBodyFromFrontmatter extracts the body text after the closing --- frontmatter delimiter.
+// Uses strings.TrimRight for trailing whitespace only, and strips at most two leading newlines
+// (the blank line between --- and body) to preserve significant leading whitespace in the
+// description (e.g., indented code blocks).
+func parseBodyFromFrontmatter(content string) string {
+	if !strings.HasPrefix(content, "---\n") {
+		return content
+	}
+	endIdx := strings.Index(content[4:], "\n---")
+	if endIdx < 0 {
+		return ""
+	}
+	body := content[4+endIdx+4:] // skip past "\n---"
+	// Strip the expected separator (1-2 newlines between closing --- and body)
+	// but preserve any further leading whitespace that may be significant.
+	body = strings.TrimLeft(body, "\n")
+	body = strings.TrimRight(body, " \t\n\r")
+	return body
 }
 
 // Stop cleans up resources (file watcher, instance lock, background worker, etc.)

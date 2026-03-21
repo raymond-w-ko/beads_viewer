@@ -225,7 +225,7 @@ func (m *VelocityComparisonModel) View() string {
 
 	// Separator
 	sepStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
-	separator := strings.Repeat("─", min(len(header)+2, m.width-2))
+	separator := strings.Repeat("─", max(min(len(header)+2, m.width-2), 0))
 	sb.WriteString(sepStyle.Render(separator))
 	sb.WriteString("\n")
 
@@ -320,7 +320,7 @@ func (m *VelocityComparisonModel) View() string {
 
 	// Footer hints
 	footerStyle := t.Renderer.NewStyle().
-		Foreground(t.Secondary).
+		Foreground(ColorFooterHint).
 		Italic(true)
 	sb.WriteString("\n")
 	sb.WriteString(footerStyle.Render("j/k: navigate | enter: filter by label | esc: back"))
