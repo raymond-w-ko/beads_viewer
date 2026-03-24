@@ -203,12 +203,20 @@ func TestCalculateDataHash(t *testing.T) {
 		{ID: "bv-1", Status: "open"},
 		{ID: "bv-2", Status: "open"}, // Different status
 	}
+	beads3 := []BeadInfo{
+		{ID: "bv-2", Status: "closed"},
+		{ID: "bv-1", Status: "open"},
+	}
 
 	hash1 := c.calculateDataHash(beads1)
 	hash2 := c.calculateDataHash(beads2)
+	hash3 := c.calculateDataHash(beads3)
 
 	if hash1 == hash2 {
 		t.Error("different bead data should produce different hashes")
+	}
+	if hash1 != hash3 {
+		t.Error("equivalent bead data in different order should produce the same hash")
 	}
 
 	// Same data should produce same hash

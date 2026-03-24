@@ -122,6 +122,7 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 		reason := t.generateTemporalReason(window, files, pathHints)
 
 		commits = append(commits, CorrelatedCommit{
+			BeadID:      window.BeadID,
 			SHA:         sha,
 			ShortSHA:    shortSHA(sha),
 			Message:     info.Message,

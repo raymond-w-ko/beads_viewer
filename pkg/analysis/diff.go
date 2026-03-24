@@ -63,6 +63,10 @@ func (s *Snapshot) computeCounts() {
 			s.OpenCount++ // Blocked is a type of open
 		case model.StatusOpen, model.StatusInProgress:
 			s.OpenCount++
+		default:
+			// Other non-closed statuses (deferred, draft, pinned, hooked, review)
+			// are still open work items
+			s.OpenCount++
 		}
 	}
 }

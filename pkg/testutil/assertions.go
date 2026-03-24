@@ -47,7 +47,7 @@ func AssertDependencyExists(t *testing.T, issues []model.Issue, fromID, toID str
 	for _, issue := range issues {
 		if issue.ID == fromID {
 			for _, dep := range issue.Dependencies {
-				if dep.DependsOnID == toID {
+				if dep != nil && dep.DependsOnID == toID {
 					return
 				}
 			}
@@ -67,6 +67,9 @@ func AssertNoCycles(t *testing.T, issues []model.Issue) {
 	adj := make(map[string][]string)
 	for _, issue := range issues {
 		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
 			adj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)
 		}
 	}
@@ -110,6 +113,9 @@ func AssertHasCycle(t *testing.T, issues []model.Issue) {
 	adj := make(map[string][]string)
 	for _, issue := range issues {
 		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
 			adj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)
 		}
 	}

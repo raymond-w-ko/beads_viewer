@@ -148,6 +148,15 @@ type semanticDebounceTickMsg struct{}
 // workerPollTickMsg drives a small background-mode status refresh (spinner + freshness) (bv-9nfy).
 type workerPollTickMsg struct{}
 
+// comboTickMsg fires after the combo timeout expires (bv-6fm0).
+// If a combo key is pending and this fires, the pending key is dispatched as a single press.
+type comboTickMsg struct {
+	key string // The key that was pending
+}
+
+// comboTimeout is the window for detecting gg-style combos.
+const comboTimeout = 200 * time.Millisecond
+
 var workerSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 const (
@@ -165,6 +174,14 @@ func freshnessStaleThreshold() time.Duration {
 func workerPollTickCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
 		return workerPollTickMsg{}
+	})
+}
+
+// comboTickCmd returns a command that fires after the combo timeout (bv-6fm0).
+// Used to detect single-key presses that don't form a combo (e.g., single g -> graph toggle).
+func comboTickCmd(key string) tea.Cmd {
+	return tea.Tick(comboTimeout, func(time.Time) tea.Msg {
+		return comboTickMsg{key: key}
 	})
 }
 
@@ -368,6 +385,7 @@ type Model struct {
 	insightsPanel      InsightsModel
 	flowMatrix         FlowMatrixModel // Cross-label flow matrix
 	theme              Theme
+	keyRegistry        *KeyRegistry // Centralized key dispatch (bv-3bsx)
 
 	// Update State
 	updateAvailable bool
@@ -401,10 +419,15 @@ type Model struct {
 	labelGraphAnalysisResult *LabelGraphAnalysisResult
 	showAttentionView        bool
 	showShortcutsSidebar     bool // bv-3qi5 toggleable shortcuts sidebar
-	labelHealthCached        bool
-	labelHealthCache         analysis.LabelAnalysisResult
-	attentionCached          bool
-	attentionCache           analysis.LabelAttentionResult
+
+	// Key combo state (bv-6fm0)
+	pendingComboKey   string    // Key waiting for potential combo (e.g., "g" for gg)
+	pendingComboTime  time.Time // When the pending key was pressed
+	pendingComboFocus focus     // Focus context where combo started (prevents cross-view dispatch)
+	labelHealthCached bool
+	labelHealthCache  analysis.LabelAnalysisResult
+	attentionCached   bool
+	attentionCache    analysis.LabelAttentionResult
 
 	// Actionable view
 	actionableView ActionableModel
@@ -729,25 +752,64 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		descending := r.Sort.Direction == "desc"
 
 		sort.Slice(issues, func(i, j int) bool {
-			less := false
+			ii := issues[i]
+			jj := issues[j]
+			cmp := 0
 			switch r.Sort.Field {
 			case "priority":
-				less = issues[i].Priority < issues[j].Priority
+				switch {
+				case ii.Priority < jj.Priority:
+					cmp = -1
+				case ii.Priority > jj.Priority:
+					cmp = 1
+				}
 			case "created", "created_at":
-				less = issues[i].CreatedAt.Before(issues[j].CreatedAt)
+				switch {
+				case ii.CreatedAt.Before(jj.CreatedAt):
+					cmp = -1
+				case ii.CreatedAt.After(jj.CreatedAt):
+					cmp = 1
+				}
 			case "updated", "updated_at":
-				less = issues[i].UpdatedAt.Before(issues[j].UpdatedAt)
+				switch {
+				case ii.UpdatedAt.Before(jj.UpdatedAt):
+					cmp = -1
+				case ii.UpdatedAt.After(jj.UpdatedAt):
+					cmp = 1
+				}
 			case "impact":
-				less = graphStats.GetCriticalPathScore(issues[i].ID) < graphStats.GetCriticalPathScore(issues[j].ID)
+				iScore := graphStats.GetCriticalPathScore(ii.ID)
+				jScore := graphStats.GetCriticalPathScore(jj.ID)
+				switch {
+				case iScore < jScore:
+					cmp = -1
+				case iScore > jScore:
+					cmp = 1
+				}
 			case "pagerank":
-				less = graphStats.GetPageRankScore(issues[i].ID) < graphStats.GetPageRankScore(issues[j].ID)
+				iScore := graphStats.GetPageRankScore(ii.ID)
+				jScore := graphStats.GetPageRankScore(jj.ID)
+				switch {
+				case iScore < jScore:
+					cmp = -1
+				case iScore > jScore:
+					cmp = 1
+				}
 			default:
-				less = issues[i].Priority < issues[j].Priority
+				switch {
+				case ii.Priority < jj.Priority:
+					cmp = -1
+				case ii.Priority > jj.Priority:
+					cmp = 1
+				}
+			}
+			if cmp == 0 {
+				return ii.ID < jj.ID
 			}
 			if descending {
-				return !less
+				return cmp > 0
 			}
-			return less
+			return cmp < 0
 		})
 	} else {
 		// Default Sort: Open first, then by Priority (ascending), then by date (newest first)
@@ -760,7 +822,10 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			if issues[i].Priority != issues[j].Priority {
 				return issues[i].Priority < issues[j].Priority // Lower priority number = higher priority
 			}
-			return issues[i].CreatedAt.After(issues[j].CreatedAt) // Newer first
+			if !issues[i].CreatedAt.Equal(issues[j].CreatedAt) {
+				return issues[i].CreatedAt.After(issues[j].CreatedAt) // Newer first
+			}
+			return issues[i].ID < issues[j].ID
 		})
 	}
 
@@ -868,7 +933,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	labelDashboard := NewLabelDashboardModel(theme)
 	labelDashboard.SetSize(defaultWidth, defaultHeight-1)
 	velocityComparison := NewVelocityComparisonModel(theme) // bv-125
+	keyRegistry := NewKeyRegistry()                         // bv-xl6g: create early for sidebar
 	shortcutsSidebar := NewShortcutsSidebar(theme)          // bv-3qi5
+	shortcutsSidebar.SetKeyRegistry(keyRegistry)            // bv-xl6g: auto-generate help
 	ins := graphStats.GenerateInsights(len(issues))         // allow UI to show as many as fit
 	insightsPanel := NewInsightsModel(ins, issueMap, theme)
 	insightsPanel.SetSize(defaultWidth, defaultHeight-1)
@@ -1031,7 +1098,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		treeModel.SetBeadsDir(filepath.Dir(beadsPath))
 	}
 
-	return Model{
+	m := Model{
 		issues:                 issues,
 		issueMap:               issueMap,
 		analyzer:               analyzer,
@@ -1051,7 +1118,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		graphView:              graphView,
 		tree:                   treeModel,
 		insightsPanel:          insightsPanel,
+		historyView:            NewHistoryModel(nil, theme), // Initialize with empty report for safe search access
 		theme:                  theme,
+		keyRegistry:            keyRegistry,
 		currentFilter:          "all",
 		semanticSearch:         semanticSearch,
 		semanticHybridEnabled:  false,
@@ -1105,6 +1174,49 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		// Tutorial integration (bv-8y31)
 		tutorialModel: NewTutorialModel(theme),
 	}
+
+	m.registerKeyBindings()
+	return m
+}
+
+// rebuildInsightsPanel refreshes the underlying insights view model from the
+// current snapshot/analysis while preserving in-panel navigation state.
+func (m *Model) rebuildInsightsPanel() {
+	var ins analysis.Insights
+	switch {
+	case m.snapshot != nil:
+		ins = m.snapshot.GetInsights()
+	case m.analysis != nil:
+		ins = m.analysis.GenerateInsights(len(m.issues))
+	}
+
+	prev := m.insightsPanel
+	panel := NewInsightsModel(ins, m.issueMap, m.theme)
+	panel.focusedPanel = prev.focusedPanel
+	panel.selectedIndex = prev.selectedIndex
+	panel.scrollOffset = prev.scrollOffset
+	panel.heatmapRow = prev.heatmapRow
+	panel.heatmapCol = prev.heatmapCol
+	panel.heatmapDrill = prev.heatmapDrill
+	panel.heatmapDrillIdx = prev.heatmapDrillIdx
+	panel.showExplanations = prev.showExplanations
+	panel.showCalculation = prev.showCalculation
+	panel.showDetailPanel = prev.showDetailPanel
+	panel.showHeatmap = prev.showHeatmap
+
+	if m.analyzer != nil && m.analysis != nil {
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
+		panel.SetTopPicks(triage.QuickRef.TopPicks)
+		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
+		panel.SetRecommendations(triage.Recommendations, dataHash)
+	}
+
+	panelHeight := m.height - 2
+	if panelHeight < 3 {
+		panelHeight = 3
+	}
+	panel.SetSize(m.width, panelHeight)
+	m.insightsPanel = panel
 }
 
 func (m Model) Init() tea.Cmd {
@@ -1349,6 +1461,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case comboTickMsg:
+		// Combo timeout expired (bv-6fm0). If pending key matches AND we're still
+		// in the same focus context, dispatch it as single key.
+		if m.pendingComboKey == msg.key && (m.pendingComboFocus == focusBoard || m.pendingComboFocus == focusTree) && m.focused == m.pendingComboFocus {
+			// Clear pending state
+			m.pendingComboKey = ""
+			m.pendingComboTime = time.Time{}
+
+			// Dispatch single "g" as graph toggle
+			if msg.key == "g" && !m.isGraphView {
+				m.isGraphView = true
+				m.isBoardView = false
+				m.isActionableView = false
+				m.isHistoryView = false
+				m.focused = focusGraph
+				m.applyFilter()
+			}
+		} else if m.pendingComboKey == msg.key {
+			// Focus changed or combo was cancelled - just clear pending state
+			m.pendingComboKey = ""
+			m.pendingComboTime = time.Time{}
+		}
+
 	case workerPollTickMsg:
 		if m.backgroundWorker != nil {
 			state := m.backgroundWorker.State()
@@ -1368,16 +1503,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Mark snapshot as Phase 2 ready for consistency with Phase2UpdateMsg (bv-e3ub)
-		if m.snapshot != nil {
-			m.snapshot.Phase2Ready = true
-		}
-
-		// Phase 2 analysis complete - update insights with full data (computed off-thread).
+		// Create new immutable snapshot with Phase 2 data (bv-b5q1)
 		ins := msg.Insights
 		if m.snapshot != nil {
-			m.snapshot.Insights = ins
+			newSnap := m.snapshot.WithPhase2(msg.Stats, ins, m.issues, m.analyzer)
+			m.snapshot = newSnap
+			m.triageScores = newSnap.TriageScores
+			m.triageReasons = newSnap.TriageReasons
+			m.quickWinSet = newSnap.QuickWinSet
+			m.blockerSet = newSnap.BlockerSet
+			m.unblocksMap = newSnap.UnblocksMap
 		}
+
+		// Update UI components with Phase 2 insights
 		m.insightsPanel.SetInsights(ins)
 		m.insightsPanel.issueMap = m.issueMap
 		bodyHeight := m.height - 1
@@ -1386,46 +1524,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.insightsPanel.SetSize(m.width, bodyHeight)
 		if m.snapshot != nil {
-			if m.snapshot.GraphLayout != nil {
-				m.snapshot.GraphLayout.UpdatePhase2Ranks(msg.Stats)
-			}
 			m.graphView.SetSnapshot(m.snapshot)
 		} else {
 			m.graphView.SetIssues(m.issues, &ins)
 		}
 
-		// Generate triage for priority panel (bv-91) - reuse existing analyzer/stats (bv-runn.12)
+		// Compute triage for insights panel (separate from snapshot triage for UI-specific features)
 		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
-		triageScores := make(map[string]float64, len(triage.Recommendations))
-		triageReasons := make(map[string]analysis.TriageReasons, len(triage.Recommendations))
-		quickWinSet := make(map[string]bool, len(triage.QuickWins))
-		blockerSet := make(map[string]bool, len(triage.BlockersToClear))
-		unblocksMap := make(map[string][]string, len(triage.Recommendations))
-
-		for _, rec := range triage.Recommendations {
-			triageScores[rec.ID] = rec.Score
-			if len(rec.Reasons) > 0 {
-				triageReasons[rec.ID] = analysis.TriageReasons{
-					Primary:    rec.Reasons[0],
-					All:        rec.Reasons,
-					ActionHint: rec.Action,
-				}
-			}
-			unblocksMap[rec.ID] = rec.UnblocksIDs
-		}
-		for _, qw := range triage.QuickWins {
-			quickWinSet[qw.ID] = true
-		}
-		for _, bl := range triage.BlockersToClear {
-			blockerSet[bl.ID] = true
-		}
-
-		m.triageScores = triageScores
-		m.triageReasons = triageReasons
-		m.quickWinSet = quickWinSet
-		m.blockerSet = blockerSet
-		m.unblocksMap = unblocksMap
-
 		m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
 
 		// Set full recommendations with breakdown for priority radar (bv-93)
@@ -1517,7 +1622,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Mark snapshot as Phase 2 ready
-		m.snapshot.Phase2Ready = true
+		m.snapshot.phase2Ready = true
 
 		// Note: Phase2ReadyMsg handler (via WaitForPhase2Cmd) already handles
 		// all the UI updates (insights, graph view, alerts, etc.). This message
@@ -1628,7 +1733,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Preserve existing triage data unless the snapshot has Phase 2 results.
 		// Avoid flicker when Phase 1 snapshots arrive without triage data.
-		if msg.Snapshot.Phase2Ready || len(msg.Snapshot.TriageScores) > 0 {
+		if msg.Snapshot.IsPhase2Ready() || len(msg.Snapshot.TriageScores) > 0 {
 			m.triageScores = msg.Snapshot.TriageScores
 			m.triageReasons = msg.Snapshot.TriageReasons
 			m.unblocksMap = msg.Snapshot.UnblocksMap
@@ -1660,7 +1765,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Regenerate sub-views (Phase 1 data; Phase 2 will update via Phase2ReadyMsg)
-		m.insightsPanel.SetInsights(m.snapshot.Insights)
+		m.insightsPanel.SetInsights(m.snapshot.GetInsights())
 		m.insightsPanel.issueMap = m.issueMap
 		bodyHeight := m.height - 1
 		if bodyHeight < 5 {
@@ -1778,10 +1883,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.board.SetIssues(filteredIssues)
 			}
-			if m.snapshot != nil && m.snapshot.GraphLayout != nil && len(filteredIssues) == len(m.snapshot.Issues) {
+			if m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && len(filteredIssues) == len(m.snapshot.Issues) {
 				m.graphView.SetSnapshot(m.snapshot)
 			} else {
-				m.graphView.SetIssues(filteredIssues, &m.snapshot.Insights)
+				ins := m.snapshot.GetInsights()
+				m.graphView.SetIssues(filteredIssues, &ins)
 			}
 
 			// Restore selection if possible
@@ -2178,7 +2284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, time.Now().UTC())
 			m.attentionCached = true
 			attText, _ := ComputeAttentionView(m.issues, max(40, m.width-4))
-			m.insightsPanel = NewInsightsModel(analysis.Insights{}, m.issueMap, m.theme)
+			m.rebuildInsightsPanel()
 			m.insightsPanel.labelAttention = m.attentionCache.Labels
 			m.insightsPanel.extraText = attText
 			panelHeight := m.height - 2
@@ -2807,8 +2913,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Search/file-tree submodes must consume keys before the global key block.
+		// Otherwise printable input, q, and esc leak into global view toggles and
+		// close the active view instead of updating the focused submode.
+		if m.focused == focusBoard && m.board.IsSearchMode() {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m = m.handleBoardKeys(msg)
+			return m, nil
+		}
+		if m.focused == focusHistory && (m.historyView.IsSearchActive() || m.historyView.FileTreeHasFocus()) {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m = m.handleHistoryKeys(msg)
+			return m, nil
+		}
+
 		// Handle keys when not filtering
 		if m.list.FilterState() != list.Filtering {
+			// ═══════════════════════════════════════════════════════════════
+			// Truly global keys: ctrl+c, q, esc, tab, split-pane resize
+			// These run regardless of which view has focus.
+			// ═══════════════════════════════════════════════════════════════
 			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
@@ -2839,6 +2967,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.isBoardView {
 					m.isBoardView = false
+					m.focused = focusList
+					return m, nil
+				}
+				if m.isActionableView {
+					m.isActionableView = false
+					m.focused = focusList
+					return m, nil
+				}
+				if m.isHistoryView {
+					m.isHistoryView = false
+					m.focused = focusList
+					return m, nil
+				}
+				if m.showLabelPicker {
+					m.showLabelPicker = false
+					m.focused = focusList
+					return m, nil
+				}
+				if m.focused == focusLabelDashboard {
+					m.focused = focusList
+					return m, nil
+				}
+				if m.focused == focusTree {
+					m.focused = focusList
+					return m, nil
+				}
+				if m.focused == focusSprint {
 					m.focused = focusList
 					return m, nil
 				}
@@ -2932,7 +3087,230 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.recalculateSplitPaneSizes()
 				}
+			}
 
+			// ═══════════════════════════════════════════════════════════════
+			// Focus-specific key handling — runs BEFORE list-level view
+			// toggles so that views like board/graph/tree/history receive
+			// keys (h, l, g, f, etc.) for their own navigation first.
+			//
+			// Each case dispatches to its handler for keys the handler
+			// actually uses, then falls through to the view-toggle block
+			// for unhandled keys (like view-switch keys b/g/a/i/E/etc.)
+			// so cross-view switching still works.
+			// ═══════════════════════════════════════════════════════════════
+			keyStr := msg.String()
+			viewToggleHandled := false
+
+			switch m.focused {
+			case focusRecipePicker:
+				m = m.handleRecipePickerKeys(msg)
+				return m, nil
+
+			case focusRepoPicker:
+				m = m.handleRepoPickerKeys(msg)
+				return m, nil
+
+			case focusLabelPicker:
+				m = m.handleLabelPickerKeys(msg)
+				return m, nil
+
+			case focusInsights:
+				// Insights uses h/l for panel nav — intercept those.
+				// Let other view-toggle keys (b/g/a/E/f/etc.) fall through.
+				switch keyStr {
+				case "h", "l",
+					"j", "k", "up", "down", "left", "right",
+					"ctrl+j", "ctrl+k", "tab",
+					"e", "x", "m", "enter", "esc":
+					m = m.handleInsightsKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusBoard:
+				// Board uses h/l for nav — intercept those.
+				// "g" handled via gg-combo (bv-6fm0): gg jumps to top, single g -> graph.
+				switch keyStr {
+				case "g":
+					// gg-combo logic (bv-6fm0)
+					if m.pendingComboKey == "g" && m.pendingComboFocus == focusBoard && time.Since(m.pendingComboTime) < comboTimeout {
+						// Second g within window: gg-combo (jump to top)
+						m.board.MoveToTop()
+						m.pendingComboKey = ""
+						m.pendingComboTime = time.Time{}
+						viewToggleHandled = true
+					} else {
+						// First g: start combo timer
+						m.pendingComboKey = "g"
+						m.pendingComboTime = time.Now()
+						m.pendingComboFocus = focusBoard
+						cmds = append(cmds, comboTickCmd("g"))
+						viewToggleHandled = true
+					}
+				case "h", "l",
+					"j", "k", "left", "right", "up", "down",
+					"home", "end", "G", "ctrl+d", "ctrl+u",
+					"1", "2", "3", "4", "H", "L", "0", "$",
+					"/", "n", "N", "y", "o", "c", "r", "s", "e", "d",
+					"tab", "enter", "ctrl+j", "ctrl+k":
+					// Cancel any pending combo when pressing other keys
+					m.pendingComboKey = ""
+					m = m.handleBoardKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusLabelDashboard:
+				if selectedLabel, cmd := m.labelDashboard.Update(msg); selectedLabel != "" {
+					// Filter list by selected label and jump back to list view
+					m.currentFilter = "label:" + selectedLabel
+					m.applyFilter()
+					m.focused = focusList
+					return m, cmd
+				}
+				// Open detail modal on 'h'
+				if keyStr == "h" && len(m.labelDashboard.labels) > 0 {
+					idx := m.labelDashboard.cursor
+					if idx >= 0 && idx < len(m.labelDashboard.labels) {
+						lh := m.labelDashboard.labels[idx]
+						m.showLabelHealthDetail = true
+						m.labelHealthDetail = &lh
+						// Precompute cross-label flows for this label
+						m.labelHealthDetailFlow = m.getCrossFlowsForLabel(lh.Label)
+						return m, nil
+					}
+				}
+				// Open drilldown overlay on 'd'
+				if keyStr == "d" && len(m.labelDashboard.labels) > 0 {
+					idx := m.labelDashboard.cursor
+					if idx >= 0 && idx < len(m.labelDashboard.labels) {
+						lh := m.labelDashboard.labels[idx]
+						m.labelDrilldownLabel = lh.Label
+						m.labelDrilldownIssues = m.filterIssuesByLabel(lh.Label)
+						m.showLabelDrilldown = true
+						return m, nil
+					}
+				}
+				return m, nil
+
+			case focusGraph:
+				// Graph uses h/l for nav — intercept those.
+				// Let other view-toggle keys (b/a/i/E/f/etc.) fall through.
+				switch keyStr {
+				case "h", "l",
+					"j", "k", "left", "right", "up", "down",
+					"H", "L", "ctrl+d", "ctrl+u", "pgup", "pgdown",
+					"enter":
+					m = m.handleGraphKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusTree:
+				// Tree uses h/l for nav — intercept those.
+				// "g" handled via gg-combo (bv-6fm0): gg jumps to top, single g -> graph.
+				// Let other view-toggle keys (b/a/i/f/etc.) fall through.
+				switch keyStr {
+				case "g":
+					// gg-combo logic (bv-6fm0)
+					if m.pendingComboKey == "g" && m.pendingComboFocus == focusTree && time.Since(m.pendingComboTime) < comboTimeout {
+						// Second g within window: gg-combo (jump to top)
+						m.tree.JumpToTop()
+						m.pendingComboKey = ""
+						m.pendingComboTime = time.Time{}
+						viewToggleHandled = true
+					} else {
+						// First g: start combo timer
+						m.pendingComboKey = "g"
+						m.pendingComboTime = time.Now()
+						m.pendingComboFocus = focusTree
+						cmds = append(cmds, comboTickCmd("g"))
+						viewToggleHandled = true
+					}
+				case "h", "l",
+					"j", "k", "left", "right", "up", "down",
+					"G", "o", "O", "E", "esc",
+					"enter", " ", "tab",
+					"ctrl+d", "ctrl+u", "pgup", "pgdown":
+					// Cancel any pending combo when pressing other keys
+					m.pendingComboKey = ""
+					m = m.handleTreeKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusActionable:
+				// Actionable uses j/k/enter — no conflicts with view-toggles.
+				switch keyStr {
+				case "j", "k", "up", "down", "enter":
+					m = m.handleActionableKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusHistory:
+				// History uses h/f/g for nav — intercept those.
+				// Let other view-toggle keys (b/a/i/E/etc.) fall through.
+				// In search or file-tree mode, all keys go to the handler.
+				if m.historyView.IsSearchActive() || m.historyView.FileTreeHasFocus() {
+					m = m.handleHistoryKeys(msg)
+					viewToggleHandled = true
+				} else {
+					switch keyStr {
+					case "h", "f", "g",
+						"j", "k", "up", "down",
+						"J", "K", "v", "tab", "enter",
+						"y", "c", "F", "o", "/":
+						m = m.handleHistoryKeys(msg)
+						viewToggleHandled = true
+					}
+				}
+
+			case focusSprint:
+				// Sprint uses only P/esc/j/k — no conflicts with view-toggles.
+				switch keyStr {
+				case "P", "esc", "j", "k", "up", "down":
+					m = m.handleSprintKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusFlowMatrix:
+				// Flow matrix uses f/g for close/go-to-start — intercept those.
+				// Let other view-toggle keys fall through.
+				switch keyStr {
+				case "f", "g",
+					"j", "k", "up", "down",
+					"G", "end", "home",
+					"tab", "enter", "esc", "q":
+					m = m.handleFlowMatrixKeys(msg)
+					viewToggleHandled = true
+				}
+
+			case focusDetail:
+				// Intercept "O" in detail view for editor dispatch (bv-134)
+				if keyStr == "O" {
+					if editorCmd := m.openInEditor(); editorCmd != nil {
+						return m, editorCmd
+					}
+					return m, nil
+				}
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+				return m, tea.Batch(cmds...)
+
+			case focusList:
+				// Fall through to list-level view toggles below
+			}
+
+			if viewToggleHandled {
+				if len(cmds) > 0 {
+					return m, tea.Batch(cmds...)
+				}
+				return m, nil
+			}
+
+			// ═══════════════════════════════════════════════════════════════
+			// View toggle keys — reachable from focusList and also from
+			// other views when the key isn't claimed by their handler
+			// (enabling cross-view switching, e.g. 'g' from board -> graph).
+			// ═══════════════════════════════════════════════════════════════
+			switch msg.String() {
 			case "b":
 				m.clearAttentionOverlay()
 				m.isBoardView = !m.isBoardView
@@ -3012,30 +3390,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isActionableView = false
 					m.isHistoryView = false
 					m.focused = focusInsights
-					// Refresh insights using the current snapshot when available (bv-mpqz).
-					var ins analysis.Insights
-					hasInsights := false
-					if m.snapshot != nil {
-						ins = m.snapshot.Insights
-						hasInsights = true
-					} else if m.analysis != nil {
-						ins = m.analysis.GenerateInsights(len(m.issues))
-						hasInsights = true
-					}
-					if hasInsights {
-						m.insightsPanel = NewInsightsModel(ins, m.issueMap, m.theme)
-						// Include priority triage (bv-91) - reuse existing analyzer/stats (bv-runn.12)
-						triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
-						m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
-						// Set full recommendations with breakdown for priority radar (bv-93)
-						dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
-						m.insightsPanel.SetRecommendations(triage.Recommendations, dataHash)
-						panelHeight := m.height - 2
-						if panelHeight < 3 {
-							panelHeight = 3
-						}
-						m.insightsPanel.SetSize(m.width, panelHeight)
-					}
+					m.rebuildInsightsPanel()
 				}
 				return m, nil
 
@@ -3111,7 +3466,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isHistoryView = false
 				m.focused = focusInsights
 				m.showAttentionView = true
-				m.insightsPanel = NewInsightsModel(analysis.Insights{}, m.issueMap, m.theme)
+				m.rebuildInsightsPanel()
 				m.insightsPanel.labelAttention = m.attentionCache.Labels
 				m.insightsPanel.extraText = attText
 				panelHeight := m.height - 2
@@ -3207,97 +3562,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = focusLabelPicker
 				return m, nil
 
+			case "O":
+				// Open in terminal editor (bv-134)
+				if editorCmd := m.openInEditor(); editorCmd != nil {
+					return m, editorCmd
+				}
+				return m, nil
 			}
 
-			// Focus-specific key handling
-			switch m.focused {
-			case focusRecipePicker:
-				m = m.handleRecipePickerKeys(msg)
-
-			case focusRepoPicker:
-				m = m.handleRepoPickerKeys(msg)
-
-			case focusLabelPicker:
-				m = m.handleLabelPickerKeys(msg)
-
-			case focusInsights:
-				m = m.handleInsightsKeys(msg)
-
-			case focusBoard:
-				m = m.handleBoardKeys(msg)
-
-			case focusLabelDashboard:
-				if selectedLabel, cmd := m.labelDashboard.Update(msg); selectedLabel != "" {
-					// Filter list by selected label and jump back to list view
-					m.currentFilter = "label:" + selectedLabel
-					m.applyFilter()
-					m.focused = focusList
-					return m, cmd
-				}
-				// Open detail modal on 'h'
-				if msg.String() == "h" && len(m.labelDashboard.labels) > 0 {
-					idx := m.labelDashboard.cursor
-					if idx >= 0 && idx < len(m.labelDashboard.labels) {
-						lh := m.labelDashboard.labels[idx]
-						m.showLabelHealthDetail = true
-						m.labelHealthDetail = &lh
-						// Precompute cross-label flows for this label
-						m.labelHealthDetailFlow = m.getCrossFlowsForLabel(lh.Label)
-						return m, nil
-					}
-				}
-				// Open drilldown overlay on 'd'
-				if msg.String() == "d" && len(m.labelDashboard.labels) > 0 {
-					idx := m.labelDashboard.cursor
-					if idx >= 0 && idx < len(m.labelDashboard.labels) {
-						lh := m.labelDashboard.labels[idx]
-						m.labelDrilldownLabel = lh.Label
-						m.labelDrilldownIssues = m.filterIssuesByLabel(lh.Label)
-						m.showLabelDrilldown = true
-						return m, nil
-					}
-				}
-
-			case focusGraph:
-				m = m.handleGraphKeys(msg)
-
-			case focusTree:
-				m = m.handleTreeKeys(msg)
-
-			case focusActionable:
-				m = m.handleActionableKeys(msg)
-
-			case focusHistory:
-				m = m.handleHistoryKeys(msg)
-
-			case focusSprint:
-				m = m.handleSprintKeys(msg)
-
-			case focusFlowMatrix:
-				m = m.handleFlowMatrixKeys(msg)
-
-			case focusList:
-				// Intercept "O" before handleListKeys so we can return a tea.Cmd
-				// for terminal editor dispatch (bv-134)
-				if msg.String() == "O" {
-					if editorCmd := m.openInEditor(); editorCmd != nil {
-						return m, editorCmd
-					}
-					return m, nil
-				}
-				m = m.handleListKeys(msg)
-
-			case focusDetail:
-				// Intercept "O" in detail view for editor dispatch (bv-134)
-				if msg.String() == "O" {
-					if editorCmd := m.openInEditor(); editorCmd != nil {
-						return m, editorCmd
-					}
-					return m, nil
-				}
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
+			// Remaining list-level keys handled by handleListKeys
+			m = m.handleListKeys(msg)
 		}
 
 	case tea.MouseMsg:
@@ -3542,8 +3816,7 @@ func (m Model) handleBoardKeys(msg tea.KeyMsg) Model {
 		m.board.JumpToLastColumn()
 
 	// Vim-style navigation (bv-yg39)
-	case "g":
-		m.board.SetWaitingForG() // Wait for second 'g'
+	// Note: "g" is handled via pendingComboKey mechanism in Update() for gg-combo (bv-6fm0)
 	case "0":
 		m.board.MoveToTop() // First item in column
 	case "$":
@@ -3713,9 +3986,6 @@ func (m Model) handleTreeKeys(msg tea.KeyMsg) Model {
 		m.tree.CollapseOrJumpToParent()
 	case "l", "right":
 		m.tree.ExpandOrMoveToChild()
-	case "g":
-		// Jump to top (vim-style)
-		m.tree.JumpToTop()
 	case "G":
 		m.tree.JumpToBottom()
 	case "o":
@@ -3791,8 +4061,8 @@ func (m Model) handleHistoryKeys(msg tea.KeyMsg) Model {
 			m.statusIsError = false
 			return m
 		case "enter":
-			// Confirm search (just blur input, keep filter active)
-			m.historyView.CancelSearch() // For now, just close search
+			// Confirm search (blur input, keep current query/filter active)
+			m.historyView.FinishSearch()
 			return m
 		default:
 			// Forward to search input
@@ -4636,8 +4906,8 @@ func (m Model) View() string {
 
 	// Add shortcuts sidebar if enabled (bv-3qi5)
 	if m.showShortcutsSidebar {
-		// Update sidebar context based on current focus
-		m.shortcutsSidebar.SetContext(ContextFromFocus(m.focused))
+		// Update sidebar focus for registry-based bindings (bv-xl6g)
+		m.shortcutsSidebar.SetFocus(m.focused)
 		m.shortcutsSidebar.SetSize(m.shortcutsSidebar.Width(), m.height-2)
 		sidebar := m.shortcutsSidebar.View()
 		body = lipgloss.JoinHorizontal(lipgloss.Top, body, sidebar)
@@ -5466,9 +5736,7 @@ func (m Model) renderLabelGraphAnalysis() string {
 			if maxTitleLen < 20 {
 				maxTitleLen = 20
 			}
-			if len(title) > maxTitleLen {
-				title = title[:maxTitleLen-1] + "…"
-			}
+			title = truncateRunesHelper(title, maxTitleLen, "…")
 
 			height := r.CriticalPath.AllHeights[issueID]
 			line := fmt.Sprintf("%s %-12s [h=%d] %s", arrow, issueID, height, title)
@@ -5511,9 +5779,7 @@ func (m Model) renderLabelGraphAnalysis() string {
 			if maxTitleLen < 15 {
 				maxTitleLen = 15
 			}
-			if len(title) > maxTitleLen {
-				title = title[:maxTitleLen-1] + "…"
-			}
+			title = truncateRunesHelper(title, maxTitleLen, "…")
 
 			normalized := r.PageRank.Normalized[item.ID]
 			line := fmt.Sprintf("  %s %-12s PR=%.4f (%.0f%%) %s",
@@ -5832,7 +6098,7 @@ func (m *Model) renderFooter() string {
 	// PHASE 2 PROGRESS - show while metrics are still computing (bv-tspo)
 	// ─────────────────────────────────────────────────────────────────────────
 	phase2Section := ""
-	if m.snapshot != nil && !m.snapshot.Phase2Ready {
+	if m.snapshot != nil && !m.snapshot.IsPhase2Ready() {
 		phase2Style := lipgloss.NewStyle().
 			Background(ColorBgHighlight).
 			Foreground(ColorInfo).
@@ -6334,7 +6600,7 @@ func (m *Model) refreshBoardAndGraphForCurrentFilter() {
 	}
 
 	if m.isGraphView {
-		useSnapshot := m.snapshot != nil && m.snapshot.GraphLayout != nil && len(filteredIssues) == len(m.snapshot.Issues)
+		useSnapshot := m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && len(filteredIssues) == len(m.snapshot.Issues)
 		if useSnapshot {
 			if recipeFilterActive {
 				useSnapshot = m.snapshot.RecipeName == m.activeRecipe.Name && m.snapshot.RecipeHash == recipeFingerprint(m.activeRecipe)
@@ -6389,7 +6655,7 @@ func (m *Model) applyFilter() {
 	} else {
 		m.board.SetIssues(filteredIssues)
 	}
-	if m.snapshot != nil && m.snapshot.GraphLayout != nil && m.currentFilter == "all" && len(filteredIssues) == len(m.snapshot.Issues) {
+	if m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && m.currentFilter == "all" && len(filteredIssues) == len(m.snapshot.Issues) {
 		m.graphView.SetSnapshot(m.snapshot)
 	} else {
 		// Generate insights for graph view (for metric rankings and sorting)
@@ -6465,20 +6731,31 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 	sort.Slice(indices, func(i, j int) bool {
 		iItem := items[indices[i]].(IssueItem)
 		jItem := items[indices[j]].(IssueItem)
+		if iItem.Issue.ID == jItem.Issue.ID {
+			return false
+		}
 
 		switch m.sortMode {
 		case SortCreatedAsc:
 			// Oldest first
-			return iItem.Issue.CreatedAt.Before(jItem.Issue.CreatedAt)
+			if !iItem.Issue.CreatedAt.Equal(jItem.Issue.CreatedAt) {
+				return iItem.Issue.CreatedAt.Before(jItem.Issue.CreatedAt)
+			}
 		case SortCreatedDesc:
 			// Newest first
-			return iItem.Issue.CreatedAt.After(jItem.Issue.CreatedAt)
+			if !iItem.Issue.CreatedAt.Equal(jItem.Issue.CreatedAt) {
+				return iItem.Issue.CreatedAt.After(jItem.Issue.CreatedAt)
+			}
 		case SortPriority:
 			// Priority ascending (P0 first)
-			return iItem.Issue.Priority < jItem.Issue.Priority
+			if iItem.Issue.Priority != jItem.Issue.Priority {
+				return iItem.Issue.Priority < jItem.Issue.Priority
+			}
 		case SortUpdated:
 			// Most recently updated first
-			return iItem.Issue.UpdatedAt.After(jItem.Issue.UpdatedAt)
+			if !iItem.Issue.UpdatedAt.Equal(jItem.Issue.UpdatedAt) {
+				return iItem.Issue.UpdatedAt.After(jItem.Issue.UpdatedAt)
+			}
 		default:
 			// Default: Open first, then priority, then newest
 			iClosed := isClosedLikeStatus(iItem.Issue.Status)
@@ -6489,8 +6766,11 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 			if iItem.Issue.Priority != jItem.Issue.Priority {
 				return iItem.Issue.Priority < jItem.Issue.Priority
 			}
-			return iItem.Issue.CreatedAt.After(jItem.Issue.CreatedAt)
+			if !iItem.Issue.CreatedAt.Equal(jItem.Issue.CreatedAt) {
+				return iItem.Issue.CreatedAt.After(jItem.Issue.CreatedAt)
+			}
 		}
+		return iItem.Issue.ID < jItem.Issue.ID
 	})
 
 	// Reorder items and issues based on sorted indices
@@ -6930,6 +7210,9 @@ func (m *Model) updateViewportContent() {
 	if len(item.Comments) > 0 {
 		sb.WriteString(fmt.Sprintf("### Comments (%d)\n", len(item.Comments)))
 		for _, comment := range item.Comments {
+			if comment == nil {
+				continue
+			}
 			sb.WriteString(fmt.Sprintf("> **%s** (%s)\n> \n> %s\n\n",
 				comment.Author,
 				FormatTimeRel(comment.CreatedAt),
@@ -7252,10 +7535,8 @@ func (m Model) TimeTravelDiff() *analysis.SnapshotDiff {
 	return m.timeTravelDiff
 }
 
-// FocusState returns the current focus state as a string for testing (bv-5e5q).
-// This enables testing focus transitions without exposing the internal focus type.
-func (m Model) FocusState() string {
-	switch m.focused {
+func (f focus) String() string {
+	switch f {
 	case focusList:
 		return "list"
 	case focusDetail:
@@ -7303,6 +7584,12 @@ func (m Model) FocusState() string {
 	default:
 		return "unknown"
 	}
+}
+
+// FocusState returns the current focus state as a string for testing (bv-5e5q).
+// This enables testing focus transitions without exposing the internal focus type.
+func (m Model) FocusState() string {
+	return m.focused.String()
 }
 
 // IsBoardView returns true if the board view is active (bv-5e5q).
@@ -7684,22 +7971,22 @@ const (
 )
 
 var terminalEditorExecutables = map[string]bool{
-	"vim":    true,
-	"vi":     true,
-	"nvim":   true,
-	"nano":   true,
-	"emacs":  true,
-	"pico":   true,
-	"joe":    true,
-	"ne":     true,
-	"helix":  true,
-	"hx":     true,
-	"micro":  true,
+	"vim":     true,
+	"vi":      true,
+	"nvim":    true,
+	"nano":    true,
+	"emacs":   true,
+	"pico":    true,
+	"joe":     true,
+	"ne":      true,
+	"helix":   true,
+	"hx":      true,
+	"micro":   true,
 	"kakoune": true,
-	"kak":    true,
-	"jed":    true,
-	"mg":     true,
-	"mcedit": true,
+	"kak":     true,
+	"jed":     true,
+	"mg":      true,
+	"mcedit":  true,
 }
 
 var forbiddenEditorExecutables = map[string]bool{
@@ -8166,6 +8453,10 @@ func (m *Model) Stop() {
 	if len(m.pooledIssues) > 0 {
 		loader.ReturnIssuePtrsToPool(m.pooledIssues)
 		m.pooledIssues = nil
+	}
+	if m.snapshot != nil && len(m.snapshot.pooledIssues) > 0 {
+		loader.ReturnIssuePtrsToPool(m.snapshot.pooledIssues)
+		m.snapshot.pooledIssues = nil
 	}
 }
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"regexp"
@@ -38,8 +37,7 @@ type robotSearchOutput struct {
 }
 
 func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
+	enc := newRobotEncoder(w)
 	return enc.Encode(out)
 }
 

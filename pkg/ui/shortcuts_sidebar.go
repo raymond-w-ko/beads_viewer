@@ -14,7 +14,9 @@ type ShortcutsSidebar struct {
 	height       int
 	scrollOffset int
 	theme        Theme
-	context      string // Current context for filtering shortcuts
+	context      string       // Current context for filtering shortcuts
+	keyRegistry  *KeyRegistry // Registry for auto-generated bindings (bv-xl6g)
+	focusHint    focus        // Current focus for registry lookup (bv-xl6g)
 }
 
 // shortcutItem represents a single keyboard shortcut
@@ -48,6 +50,17 @@ func (s *ShortcutsSidebar) SetSize(width, height int) {
 // SetContext updates the current context for filtering shortcuts
 func (s *ShortcutsSidebar) SetContext(ctx string) {
 	s.context = ctx
+}
+
+// SetFocus updates the current focus for registry-based bindings (bv-xl6g)
+func (s *ShortcutsSidebar) SetFocus(f focus) {
+	s.focusHint = f
+	s.context = ContextFromFocus(f)
+}
+
+// SetKeyRegistry sets the key registry for auto-generated bindings (bv-xl6g)
+func (s *ShortcutsSidebar) SetKeyRegistry(r *KeyRegistry) {
+	s.keyRegistry = r
 }
 
 // ScrollUp scrolls the sidebar content up
@@ -85,8 +98,64 @@ func (s *ShortcutsSidebar) Width() int {
 	return s.width
 }
 
-// allSections returns all shortcut sections with their contexts
+// sectionsFromRegistry builds shortcut sections from the key registry (bv-xl6g).
+// Returns nil if registry is nil or has no bindings for current focus.
+func (s *ShortcutsSidebar) sectionsFromRegistry() []shortcutSection {
+	if s.keyRegistry == nil {
+		return nil
+	}
+
+	bindings := s.keyRegistry.AllBindingsForFocus(s.focusHint)
+	if len(bindings) == 0 {
+		return nil
+	}
+
+	// Group by Category
+	categoryItems := make(map[string][]shortcutItem)
+	categoryOrder := []string{} // Preserve order of first appearance
+
+	for _, b := range bindings {
+		cat := b.Category
+		if cat == "" {
+			cat = "Other"
+		}
+		if _, exists := categoryItems[cat]; !exists {
+			categoryOrder = append(categoryOrder, cat)
+		}
+		categoryItems[cat] = append(categoryItems[cat], shortcutItem{
+			key:  b.Key,
+			desc: b.Desc,
+		})
+	}
+
+	// Build sections in category order
+	sections := make([]shortcutSection, 0, len(categoryOrder))
+	for _, cat := range categoryOrder {
+		sections = append(sections, shortcutSection{
+			title:    cat,
+			items:    categoryItems[cat],
+			contexts: []string{}, // Registry bindings are already focus-filtered
+		})
+	}
+
+	return sections
+}
+
+// allSections returns all shortcut sections with their contexts.
+// Tries registry-based sections first, falls back to hardcoded (bv-xl6g).
 func (s *ShortcutsSidebar) allSections() []shortcutSection {
+	// Try registry-based sections first
+	if sections := s.sectionsFromRegistry(); len(sections) > 0 {
+		return sections
+	}
+
+	// Fallback to hardcoded sections
+	return s.hardcodedSections()
+}
+
+// hardcodedSections returns the manually maintained shortcut sections.
+// Used as fallback when registry has no bindings (bv-xl6g).
+func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 	return []shortcutSection{
 		{
 			title:    "Navigation",

@@ -1785,6 +1785,9 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	if len(issue.Dependencies) > 0 {
 		sb.WriteString(fmt.Sprintf("### Dependencies (%d)\n\n", len(issue.Dependencies)))
 		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
 			depIssue := m.issueMap[dep.DependsOnID]
 			if depIssue != nil {
 				sb.WriteString(fmt.Sprintf("- **%s:** %s\n", dep.Type, depIssue.Title))
@@ -2028,7 +2031,7 @@ func (m *InsightsModel) findDependents(targetID string) []string {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
-			if dep.DependsOnID == targetID {
+			if dep != nil && dep.DependsOnID == targetID {
 				dependents = append(dependents, id)
 				break
 			}
@@ -2053,6 +2056,9 @@ func (m *InsightsModel) findDependencies(targetID string) []string {
 	}
 	var deps []string
 	for _, dep := range issue.Dependencies {
+		if dep == nil {
+			continue
+		}
 		deps = append(deps, dep.DependsOnID)
 	}
 	return deps

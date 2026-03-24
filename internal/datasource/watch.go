@@ -17,6 +17,7 @@ type SourceWatcher struct {
 	lastChange  map[string]time.Time
 	mu          sync.Mutex
 	done        chan struct{}
+	stopOnce    sync.Once
 	verbose     bool
 	logger      func(msg string)
 }
@@ -86,10 +87,12 @@ func (sw *SourceWatcher) Start() {
 	go sw.run()
 }
 
-// Stop stops watching for file changes
+// Stop stops watching for file changes. Safe to call multiple times.
 func (sw *SourceWatcher) Stop() {
-	close(sw.done)
-	sw.watcher.Close()
+	sw.stopOnce.Do(func() {
+		close(sw.done)
+		sw.watcher.Close()
+	})
 }
 
 // run is the main event loop for the watcher

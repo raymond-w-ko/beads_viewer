@@ -66,7 +66,8 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 
 	g.issues = snapshot.Issues
 	g.issueMap = snapshot.IssueMap
-	g.insights = &snapshot.Insights
+	ins := snapshot.GetInsights()
+	g.insights = &ins
 
 	if g.issueMap == nil {
 		g.issueMap = make(map[string]*model.Issue, len(g.issues))
@@ -75,19 +76,20 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 		}
 	}
 
-	if snapshot.GraphLayout != nil && len(snapshot.GraphLayout.SortedIDs) > 0 {
-		g.blockers = snapshot.GraphLayout.Blockers
-		g.dependents = snapshot.GraphLayout.Dependents
-		g.sortedIDs = snapshot.GraphLayout.SortedIDs
+	layout := snapshot.GetGraphLayout()
+	if layout != nil && len(layout.SortedIDs) > 0 {
+		g.blockers = layout.Blockers
+		g.dependents = layout.Dependents
+		g.sortedIDs = layout.SortedIDs
 
-		g.rankPageRank = snapshot.GraphLayout.RankPageRank
-		g.rankBetweenness = snapshot.GraphLayout.RankBetweenness
-		g.rankEigenvector = snapshot.GraphLayout.RankEigenvector
-		g.rankHubs = snapshot.GraphLayout.RankHubs
-		g.rankAuthorities = snapshot.GraphLayout.RankAuthorities
-		g.rankCriticalPath = snapshot.GraphLayout.RankCriticalPath
-		g.rankInDegree = snapshot.GraphLayout.RankInDegree
-		g.rankOutDegree = snapshot.GraphLayout.RankOutDegree
+		g.rankPageRank = layout.RankPageRank
+		g.rankBetweenness = layout.RankBetweenness
+		g.rankEigenvector = layout.RankEigenvector
+		g.rankHubs = layout.RankHubs
+		g.rankAuthorities = layout.RankAuthorities
+		g.rankCriticalPath = layout.RankCriticalPath
+		g.rankInDegree = layout.RankInDegree
+		g.rankOutDegree = layout.RankOutDegree
 	} else {
 		g.rebuildGraph()
 	}
@@ -261,7 +263,7 @@ func (g *GraphModel) ScrollRight() {}
 func (g *GraphModel) ensureVisible() {}
 
 func (g *GraphModel) SelectedIssue() *model.Issue {
-	if len(g.sortedIDs) == 0 {
+	if len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {
 		return nil
 	}
 	id := g.sortedIDs[g.selectedIdx]
@@ -290,7 +292,7 @@ func (g *GraphModel) View(width, height int) string {
 	g.height = height
 	t := g.theme
 
-	if len(g.sortedIDs) == 0 {
+	if len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {
 		return t.Renderer.NewStyle().
 			Width(width).
 			Height(height).

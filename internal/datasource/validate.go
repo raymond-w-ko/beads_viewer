@@ -50,7 +50,7 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 	if opts.Logger == nil {
 		opts.Logger = func(string) {}
 	}
-	if opts.MaxJSONLErrorRate == 0 {
+	if opts.MaxJSONLErrorRate < 0 {
 		opts.MaxJSONLErrorRate = 0.10
 	}
 	if len(opts.RequiredFields) == 0 {
@@ -133,6 +133,9 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 			return fmt.Errorf("cannot scan column info: %w", err)
 		}
 		columns[strings.ToLower(name)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating column info: %w", err)
 	}
 
 	requiredCols := []string{"id", "title", "status"}

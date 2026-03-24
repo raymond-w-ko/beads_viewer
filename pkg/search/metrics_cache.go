@@ -35,3 +35,14 @@ type MetricsLoader interface {
 	LoadMetrics() (map[string]IssueMetrics, error)
 	ComputeDataHash() (string, error)
 }
+
+// MetricsLoaderAtomic extends MetricsLoader with atomic load-and-hash capability.
+// Loaders implementing this interface can return metrics and their data hash together,
+// preventing TOCTOU race conditions between loading metrics and computing hash.
+type MetricsLoaderAtomic interface {
+	MetricsLoader
+	// LoadMetricsWithHash returns metrics and their corresponding data hash atomically.
+	// The hash is computed from the same data used to generate the metrics, ensuring
+	// consistency even if the underlying data changes between calls.
+	LoadMetricsWithHash() (map[string]IssueMetrics, string, error)
+}

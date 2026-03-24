@@ -126,26 +126,27 @@ func TestViewTransitionListToGraph(t *testing.T) {
 	}
 }
 
-// TestViewTransitionFullCycle verifies List → Board → Graph → Tree → List cycle
+// TestViewTransitionFullCycle verifies List → Graph → Board → Tree → List cycle
+// Note: 'g' in board uses gg-combo (async timeout), so we test graph→board instead.
 func TestViewTransitionFullCycle(t *testing.T) {
 	issues := createTestIssues(10)
 	m := ui.NewModel(issues, nil, "")
 
-	// Enter board view
-	newM, _ := m.Update(integrationKeyMsg("b"))
-	m = newM.(ui.Model)
-	if !m.IsBoardView() {
-		t.Error("Should be in board view")
-	}
-
-	// Enter graph view (clears board)
-	newM, _ = m.Update(integrationKeyMsg("g"))
+	// Enter graph view from list (immediate toggle)
+	newM, _ := m.Update(integrationKeyMsg("g"))
 	m = newM.(ui.Model)
 	if !m.IsGraphView() {
 		t.Error("Should be in graph view")
 	}
 
-	// Enter tree view (clears graph)
+	// Enter board view (clears graph)
+	newM, _ = m.Update(integrationKeyMsg("b"))
+	m = newM.(ui.Model)
+	if !m.IsBoardView() {
+		t.Error("Should be in board view")
+	}
+
+	// Enter tree view (clears board)
 	newM, _ = m.Update(integrationKeyMsg("E"))
 	m = newM.(ui.Model)
 	if m.FocusState() != "tree" {
@@ -166,35 +167,36 @@ func TestViewTransitionFullCycle(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // TestViewTransitionClearsOtherViews verifies entering one view clears others
+// Note: 'g' in board uses gg-combo (async timeout), so we test graph→board instead.
 func TestViewTransitionClearsOtherViews(t *testing.T) {
 	issues := createTestIssues(10)
 	m := ui.NewModel(issues, nil, "")
 
-	// Enter board view
-	newM, _ := m.Update(integrationKeyMsg("b"))
+	// Enter graph view from list (immediate toggle)
+	newM, _ := m.Update(integrationKeyMsg("g"))
 	m = newM.(ui.Model)
 
-	if !m.IsBoardView() {
-		t.Error("Should be in board view")
-	}
-
-	// Enter graph view (should clear board)
-	newM, _ = m.Update(integrationKeyMsg("g"))
-	m = newM.(ui.Model)
-
-	if m.IsBoardView() {
-		t.Error("Board view should be cleared when entering graph")
-	}
 	if !m.IsGraphView() {
 		t.Error("Should be in graph view")
 	}
 
-	// Enter tree view (should clear graph)
-	newM, _ = m.Update(integrationKeyMsg("E"))
+	// Enter board view (should clear graph)
+	newM, _ = m.Update(integrationKeyMsg("b"))
 	m = newM.(ui.Model)
 
 	if m.IsGraphView() {
-		t.Error("Graph view should be cleared when entering tree")
+		t.Error("Graph view should be cleared when entering board")
+	}
+	if !m.IsBoardView() {
+		t.Error("Should be in board view")
+	}
+
+	// Enter tree view (should clear board)
+	newM, _ = m.Update(integrationKeyMsg("E"))
+	m = newM.(ui.Model)
+
+	if m.IsBoardView() {
+		t.Error("Board view should be cleared when entering tree")
 	}
 	if m.FocusState() != "tree" {
 		t.Error("Should be in tree view")

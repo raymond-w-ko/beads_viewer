@@ -242,7 +242,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 			continue
 		}
 		for _, dep := range blocked.Dependencies {
-			if dep == nil || dep.Type != model.DepBlocks {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			blocker, ok := issueMap[dep.DependsOnID]
@@ -508,27 +508,49 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	flow := FlowMetrics{}
 	seenIn := make(map[string]struct{})
 	seenOut := make(map[string]struct{})
+	labeledSet := make(map[string]bool, len(labeled))
 	for _, iss := range labeled {
+		labeledSet[iss.ID] = true
+	}
+	// Incoming: other labels' issues block this label's issues
+	for _, iss := range labeled {
+		hasExternalBlocker := false
 		for _, dep := range iss.Dependencies {
-			if dep == nil || dep.Type != model.DepBlocks {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			blockerLabels := GetLabelsForIssue(issues, dep.DependsOnID)
-			targetLabels := iss.Labels
-			// incoming: other label blocks this
 			for _, bl := range blockerLabels {
 				if bl != label {
 					flow.IncomingDeps++
 					seenIn[bl] = struct{}{}
+					hasExternalBlocker = true
 				}
 			}
-			// outgoing: this label blocks others
-			for _, tl := range targetLabels {
-				if tl == label {
-					continue
+		}
+		if hasExternalBlocker {
+			flow.BlockedByExternal++
+		}
+	}
+	// Outgoing: this label's issues block other labels' issues
+	for _, other := range issues {
+		if labeledSet[other.ID] {
+			continue
+		}
+		for _, dep := range other.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			if labeledSet[dep.DependsOnID] {
+				otherLabels := other.Labels
+				for _, ol := range otherLabels {
+					if ol != label {
+						flow.OutgoingDeps++
+						seenOut[ol] = struct{}{}
+					}
 				}
-				flow.OutgoingDeps++
-				seenOut[tl] = struct{}{}
+				flow.BlockingExternal++
+				break // count this other issue once
 			}
 		}
 	}
@@ -855,14 +877,15 @@ func ExtractLabels(issues []model.Issue) LabelExtractionResult {
 
 			// Count by status
 			switch issue.Status {
-			case model.StatusOpen:
-				stats.OpenCount++
 			case model.StatusClosed, model.StatusTombstone:
 				stats.ClosedCount++
 			case model.StatusInProgress:
 				stats.InProgress++
 			case model.StatusBlocked:
 				stats.Blocked++
+			default:
+				// Open plus other non-closed statuses (deferred, draft, pinned, hooked, review)
+				stats.OpenCount++
 			}
 
 			// Count by priority
@@ -1208,7 +1231,7 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 	blockerImpact := make(map[string]int) // issueID -> transitive unblock count
 	for _, blockedIssue := range blockedIssues {
 		for _, dep := range blockedIssue.Dependencies {
-			if dep == nil || dep.Type != model.DepBlocks {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			blocker, exists := issueMap[dep.DependsOnID]
@@ -1419,7 +1442,7 @@ func ComputeLabelSubgraph(issues []model.Issue, label string) LabelSubgraph {
 	for _, id := range result.AllIssues {
 		iss := result.IssueMap[id]
 		for _, dep := range iss.Dependencies {
-			if dep == nil || dep.Type != model.DepBlocks {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			blockerID := dep.DependsOnID
@@ -1966,15 +1989,17 @@ func ComputeLabelAttentionScores(issues []model.Issue, cfg LabelHealthConfig, no
 	result.Labels = scores
 	result.TotalLabels = len(scores)
 
-	// Extract top/low attention labels
+	// Extract top/low attention labels (avoid overlap for small sets)
 	topN := min(3, len(scores))
 	for i := 0; i < topN; i++ {
 		result.TopAttention = append(result.TopAttention, scores[i].Label)
 	}
-	for i := len(scores) - topN; i < len(scores); i++ {
-		if i >= 0 {
-			result.LowAttention = append(result.LowAttention, scores[i].Label)
-		}
+	lowStart := len(scores) - topN
+	if lowStart < topN {
+		lowStart = topN // Don't overlap with top attention labels
+	}
+	for i := lowStart; i < len(scores); i++ {
+		result.LowAttention = append(result.LowAttention, scores[i].Label)
 	}
 
 	return result
@@ -2032,7 +2057,7 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 				continue
 			}
 			for _, dep := range other.Dependencies {
-				if dep != nil && dep.DependsOnID == iss.ID && dep.Type == model.DepBlocks {
+				if dep != nil && dep.DependsOnID == iss.ID && dep.Type.IsBlocking() {
 					blockImpact++
 				}
 			}
@@ -2081,6 +2106,9 @@ func (r *LabelAttentionResult) GetLabelAttention(label string) *LabelAttentionSc
 // This enables trend analysis, anomaly detection, and forecasting.
 // Uses ClosedAt timestamps from issues to bucket closures into weeks.
 func ComputeHistoricalVelocity(issues []model.Issue, label string, numWeeks int, now time.Time) HistoricalVelocity {
+	if numWeeks <= 0 {
+		numWeeks = 8
+	}
 	result := HistoricalVelocity{
 		Label:          label,
 		WeeklyVelocity: make([]WeeklySnapshot, numWeeks),
@@ -2237,18 +2265,19 @@ func ComputeAllHistoricalVelocity(issues []model.Issue, numWeeks int, now time.T
 // GetVelocityTrend analyzes the historical velocity to detect trends
 // Returns "accelerating", "decelerating", "stable", or "erratic"
 func (hv *HistoricalVelocity) GetVelocityTrend() string {
-	if hv.WeeksAnalyzed < 4 {
+	n := len(hv.WeeklyVelocity)
+	if n < 4 {
 		return "insufficient_data"
 	}
 
 	// Compare first half vs second half of the period
-	halfPoint := hv.WeeksAnalyzed / 2
+	halfPoint := n / 2
 	var recentSum, olderSum int
 
 	for i := 0; i < halfPoint; i++ {
 		recentSum += hv.WeeklyVelocity[i].Closed
 	}
-	for i := halfPoint; i < hv.WeeksAnalyzed; i++ {
+	for i := halfPoint; i < n; i++ {
 		olderSum += hv.WeeklyVelocity[i].Closed
 	}
 

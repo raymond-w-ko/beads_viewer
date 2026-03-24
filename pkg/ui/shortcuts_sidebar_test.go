@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -165,4 +166,68 @@ func TestShortcutsSidebarWidth(t *testing.T) {
 	if sidebar.Width() != 34 {
 		t.Errorf("Expected Width() = 34, got %d", sidebar.Width())
 	}
+}
+
+// TestShortcutsSidebar_MatchesRegistry verifies that sidebar uses registry bindings
+// when available, falling back to hardcoded data when registry is empty (bv-xl6g).
+func TestShortcutsSidebar_MatchesRegistry(t *testing.T) {
+	theme := Theme{
+		Renderer:  lipgloss.DefaultRenderer(),
+		Primary:   lipgloss.AdaptiveColor{Light: "#00ff00", Dark: "#00ff00"},
+		Secondary: lipgloss.AdaptiveColor{Light: "#888888", Dark: "#888888"},
+		Base:      lipgloss.NewStyle(),
+	}
+
+	t.Run("uses hardcoded when registry empty", func(t *testing.T) {
+		sidebar := NewShortcutsSidebar(theme)
+		sidebar.SetSize(34, 40)
+		registry := NewKeyRegistry() // Empty registry
+		sidebar.SetKeyRegistry(registry)
+		sidebar.SetFocus(focusList)
+
+		view := sidebar.View()
+		// Should use hardcoded sections - expect Navigation
+		if !strings.Contains(view, "Navigation") {
+			t.Error("Expected hardcoded 'Navigation' section when registry empty")
+		}
+	})
+
+	t.Run("uses registry when bindings exist", func(t *testing.T) {
+		sidebar := NewShortcutsSidebar(theme)
+		sidebar.SetSize(34, 40)
+		registry := NewKeyRegistry()
+
+		// Register test bindings with a unique category
+		registry.RegisterBinding(KeyBinding{
+			Focus:    focusList,
+			Key:      "test-key",
+			Desc:     "Test action",
+			Category: "TestCategory",
+			Handler:  func(m Model, msg tea.KeyMsg) (Model, bool) { return m, true },
+		})
+
+		sidebar.SetKeyRegistry(registry)
+		sidebar.SetFocus(focusList)
+
+		view := sidebar.View()
+		// Should use registry bindings - expect TestCategory
+		if !strings.Contains(view, "TestCategory") {
+			t.Error("Expected registry 'TestCategory' section when bindings registered")
+		}
+		if !strings.Contains(view, "test-key") {
+			t.Error("Expected 'test-key' from registry bindings")
+		}
+	})
+
+	t.Run("SetFocus updates both focus and context", func(t *testing.T) {
+		sidebar := NewShortcutsSidebar(theme)
+		sidebar.SetFocus(focusGraph)
+
+		if sidebar.focusHint != focusGraph {
+			t.Errorf("Expected focusHint = focusGraph, got %v", sidebar.focusHint)
+		}
+		if sidebar.context != "graph" {
+			t.Errorf("Expected context = 'graph', got %q", sidebar.context)
+		}
+	})
 }

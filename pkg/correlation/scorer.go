@@ -144,6 +144,12 @@ func (s *Scorer) ExplainConfidence(method CorrelationMethod, confidence float64,
 		range_ = 1.0 // Avoid division by zero
 	}
 	normalized := (confidence - r.Min) / range_
+	if normalized < 0 {
+		normalized = 0
+	}
+	if normalized > 1 {
+		normalized = 1
+	}
 
 	switch {
 	case normalized >= 0.8:

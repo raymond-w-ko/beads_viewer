@@ -370,8 +370,9 @@ func (b *BoardModel) regroupIssues() {
 	}
 
 	b.updateActiveColumns()
-	b.CancelSearch()    // Clear stale search matches
-	b.lastDetailID = "" // Force detail panel refresh
+	b.CancelSearch()      // Clear stale search matches
+	b.lastDetailID = ""   // Force detail panel refresh
+	b.expandedCardID = "" // Clear expanded card on mode change
 }
 
 // getColumnHeaders returns the column header titles based on swimlane mode (bv-wjs0)
@@ -445,6 +446,9 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.lastDetailID = ""
 
+	// Clear expanded card - stale ID may reference a removed issue
+	b.expandedCardID = ""
+
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
 		if b.selectedRow[i] >= len(b.columns[i]) {
@@ -477,8 +481,9 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 	}
 
 	// Prefer snapshot-precomputed reverse-dependency index when available.
-	if s.GraphLayout != nil && s.GraphLayout.Dependents != nil {
-		b.blocksIndex = s.GraphLayout.Dependents
+	graphLayout := s.GetGraphLayout()
+	if graphLayout != nil && graphLayout.Dependents != nil {
+		b.blocksIndex = graphLayout.Dependents
 	} else {
 		b.blocksIndex = buildBlocksIndex(s.Issues)
 	}
@@ -491,6 +496,9 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.lastDetailID = ""
+
+	// Clear expanded card - stale ID may reference a removed issue
+	b.expandedCardID = ""
 
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
@@ -1058,7 +1066,7 @@ func (b BoardModel) View(width, height int) string {
 		}
 
 		headerStyle := t.Renderer.NewStyle().
-			Width(baseWidth + borderOverhead). // Match total column width (content + border)
+			Width(baseWidth+borderOverhead). // Match total column width (content + border)
 			Align(lipgloss.Center).
 			Bold(true).
 			Padding(0, 1)

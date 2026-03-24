@@ -397,34 +397,34 @@ func TestViewSwitchClearsOthers(t *testing.T) {
 	}
 	m := ui.NewModel(issues, nil, "")
 
-	// Enter board view
-	newM, _ := m.Update(keyMsg("b"))
-	m = newM.(ui.Model)
-
-	if !m.IsBoardView() {
-		t.Fatal("IsBoardView should be true after 'b'")
-	}
-
-	// Switch to graph view - board should be cleared
-	newM, _ = m.Update(keyMsg("g"))
+	// Enter graph view from list (immediate toggle)
+	newM, _ := m.Update(keyMsg("g"))
 	m = newM.(ui.Model)
 
 	if !m.IsGraphView() {
-		t.Error("IsGraphView should be true after 'g'")
-	}
-	if m.IsBoardView() {
-		t.Error("IsBoardView should be false after switching to graph")
+		t.Fatal("IsGraphView should be true after 'g' from list")
 	}
 
-	// Switch to actionable view - graph should be cleared
+	// Switch to board view - graph should be cleared
+	newM, _ = m.Update(keyMsg("b"))
+	m = newM.(ui.Model)
+
+	if !m.IsBoardView() {
+		t.Error("IsBoardView should be true after 'b'")
+	}
+	if m.IsGraphView() {
+		t.Error("IsGraphView should be false after switching to board")
+	}
+
+	// Switch to actionable view - board should be cleared
 	newM, _ = m.Update(keyMsg("a"))
 	m = newM.(ui.Model)
 
 	if !m.IsActionableView() {
 		t.Error("IsActionableView should be true after 'a'")
 	}
-	if m.IsGraphView() {
-		t.Error("IsGraphView should be false after switching to actionable")
+	if m.IsBoardView() {
+		t.Error("IsBoardView should be false after switching to actionable")
 	}
 }
 

@@ -1362,8 +1362,13 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 		dataHash = ComputeDataHash(issues)
 		robotCacheKey = dataHash + "|" + configHash
 
-		if cached, ok := getRobotDiskCachedStats(robotCacheKey); ok {
-			return cached
+		if cached, xfetchRefresh, ok := getRobotDiskCachedStats(robotCacheKey); ok {
+			if !xfetchRefresh || ctx.Err() != nil {
+				return cached
+			}
+			// XFetch selected this caller to refresh early. Fall through and
+			// recompute now so the cache is actually renewed instead of serving
+			// the stale entry forever.
 		}
 	}
 
@@ -1977,10 +1982,12 @@ func (a *Analyzer) computePhase2(ctx context.Context, stats *GraphStats, config 
 	// Use the profiled version logic to avoid duplication
 	// We discard the profile data as this is the standard run
 	dummyProfile := &StartupProfile{}
+	computeStart := time.Now()
 	a.computePhase2WithProfile(ctx, stats, config, dummyProfile)
+	computeDuration := time.Since(computeStart)
 
 	if cacheKey != "" {
-		putRobotDiskCachedStats(cacheKey, dataHash, configHash, stats)
+		putRobotDiskCachedStats(cacheKey, dataHash, configHash, stats, computeDuration)
 	}
 }
 
@@ -2326,10 +2333,11 @@ func findArticulationPoints(adj undirectedAdjacency) map[int64]bool {
 
 // GetActionableIssues returns issues that can be worked on immediately.
 // An issue is actionable if:
-// 1. It is not closed or tombstone
-// 2. All its blocking dependencies (type "blocks") are closed or tombstone
-// 3. None of its parent issues (via "parent-child" deps) are themselves blocked
-//    (transitive parent-blocked propagation, matching br's behavior)
+//  1. It is not closed or tombstone
+//  2. All its blocking dependencies (type "blocks") are closed or tombstone
+//  3. None of its parent issues (via "parent-child" deps) are themselves blocked
+//     (transitive parent-blocked propagation, matching br's behavior)
+//
 // Missing blockers don't block (graceful degradation).
 // Returns list sorted by ID for determinism.
 func (a *Analyzer) GetActionableIssues() []model.Issue {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
 )
 
 const (
@@ -617,8 +618,20 @@ func (ca *CachedAnalyzer) Analyze() GraphStats {
 		hubs:              stats.hubs,
 		authorities:       stats.authorities,
 		criticalPathScore: stats.criticalPathScore,
+		pageRankRank:      stats.pageRankRank,
+		betweennessRank:   stats.betweennessRank,
+		eigenvectorRank:   stats.eigenvectorRank,
+		hubsRank:          stats.hubsRank,
+		authoritiesRank:   stats.authoritiesRank,
+		criticalPathRank:  stats.criticalPathRank,
+		inDegreeRank:      stats.inDegreeRank,
+		outDegreeRank:     stats.outDegreeRank,
+		coreNumber:        stats.coreNumber,
+		articulation:      stats.articulation,
+		slack:             stats.slack,
 		cycles:            stats.cycles,
 		phase2Ready:       true,
+		status:            stats.status,
 	}
 }
 
@@ -638,11 +651,12 @@ type robotAnalysisDiskCacheFile struct {
 }
 
 type robotAnalysisDiskCacheEntry struct {
-	CreatedAt  time.Time           `json:"created_at"`
-	AccessedAt time.Time           `json:"accessed_at"`
-	DataHash   string              `json:"data_hash"`
-	ConfigHash string              `json:"config_hash"`
-	Result     graphStatsCacheBlob `json:"result"`
+	CreatedAt       time.Time           `json:"created_at"`
+	AccessedAt      time.Time           `json:"accessed_at"`
+	DataHash        string              `json:"data_hash"`
+	ConfigHash      string              `json:"config_hash"`
+	ComputeDuration time.Duration       `json:"compute_duration"` // For XFetch probabilistic refresh
+	Result          graphStatsCacheBlob `json:"result"`
 }
 
 type graphStatsCacheBlob struct {
@@ -863,24 +877,27 @@ func evictRobotDiskCacheLRU(entries map[string]robotAnalysisDiskCacheEntry) {
 	}
 }
 
-func getRobotDiskCachedStats(fullKey string) (*GraphStats, bool) {
+// getRobotDiskCachedStats returns cached stats, whether XFetch suggests early refresh, and cache hit.
+// The xfetchRefresh flag uses probabilistic early refresh to prevent cache stampedes:
+// if true, the caller should consider recomputing in the background while still using the cached result.
+func getRobotDiskCachedStats(fullKey string) (stats *GraphStats, xfetchRefresh bool, cacheHit bool) {
 	if !robotDiskCacheEnabled() {
-		return nil, false
+		return nil, false, false
 	}
 
 	path, err := robotAnalysisDiskCachePath(false)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	defer f.Close()
 
 	if err := lockFile(f); err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	defer func() { _ = unlockFile(f) }()
 
@@ -892,7 +909,7 @@ func getRobotDiskCachedStats(fullKey string) (*GraphStats, bool) {
 	if !ok {
 		// Best-effort: persist prunes.
 		_ = writeRobotDiskCacheLocked(f, cf)
-		return nil, false
+		return nil, false, false
 	}
 
 	// Mtime-based staleness check: if the .beads/ directory (or any file
@@ -903,18 +920,25 @@ func getRobotDiskCachedStats(fullKey string) (*GraphStats, bool) {
 	if !dirMtime.IsZero() && dirMtime.After(entry.CreatedAt) {
 		delete(cf.Entries, fullKey)
 		_ = writeRobotDiskCacheLocked(f, cf)
-		return nil, false
+		return nil, false, false
 	}
+
+	// XFetch: probabilistically suggest early refresh to prevent cache stampedes.
+	// Do not refresh again before at least one prior compute-duration window has
+	// elapsed, otherwise newly written entries can get selected immediately.
+	shouldXFetchRefresh := entry.ComputeDuration > 0 &&
+		!now.Before(entry.CreatedAt.Add(entry.ComputeDuration)) &&
+		xfetch.ShouldRefresh(entry.CreatedAt, entry.ComputeDuration, 1.0, now)
 
 	entry.AccessedAt = now.UTC()
 	cf.Entries[fullKey] = entry
 	evictRobotDiskCacheLRU(cf.Entries)
 	_ = writeRobotDiskCacheLocked(f, cf)
 
-	return entry.Result.toGraphStats(), true
+	return entry.Result.toGraphStats(), shouldXFetchRefresh, true
 }
 
-func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphStats) {
+func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphStats, computeDuration time.Duration) {
 	if !robotDiskCacheEnabled() {
 		return
 	}
@@ -981,11 +1005,12 @@ func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphS
 	}
 
 	cf.Entries[fullKey] = robotAnalysisDiskCacheEntry{
-		CreatedAt:  now,
-		AccessedAt: now,
-		DataHash:   dataHash,
-		ConfigHash: configHash,
-		Result:     blob,
+		CreatedAt:       now,
+		AccessedAt:      now,
+		DataHash:        dataHash,
+		ConfigHash:      configHash,
+		ComputeDuration: computeDuration,
+		Result:          blob,
 	}
 
 	evictRobotDiskCacheLRU(cf.Entries)

@@ -55,15 +55,16 @@ func (s Section) Render(theme Theme, width int) string {
 	return title + "\n" + underline
 }
 
-// KeyBinding represents a single key binding
-type KeyBinding struct {
+// KeyHint represents a single key hint for tutorial/help display.
+// This is a display-only type; for runtime dispatch, use KeyBinding from keybindings.go.
+type KeyHint struct {
 	Key  string
 	Desc string
 }
 
-// KeyTable renders a table of key bindings using lipgloss/table for proper alignment
+// KeyTable renders a table of key hints using lipgloss/table for proper alignment
 type KeyTable struct {
-	Bindings []KeyBinding
+	Bindings []KeyHint
 }
 
 func (kt KeyTable) Render(theme Theme, width int) string {

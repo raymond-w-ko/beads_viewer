@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	flag "github.com/spf13/pflag"
 	"fmt"
 	"html"
 	"io"
@@ -22,6 +21,8 @@ import (
 	"time"
 
 	json "github.com/goccy/go-json"
+	"github.com/spf13/cobra"
+	flag "github.com/spf13/pflag"
 
 	toon "github.com/Dicklesworthstone/toon-go"
 	"golang.org/x/term"
@@ -36,7 +37,6 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/hooks"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
-	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
@@ -49,10 +49,398 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+type flagHelpSection struct {
+	title string
+	match func(string) bool
+}
+
+var rootHelpSections = []flagHelpSection{
+	{
+		title: "General Flags",
+		match: func(name string) bool {
+			return isOneOf(name,
+				"help",
+				"version",
+				"cpu-profile",
+				"db",
+				"update",
+				"check-update",
+				"rollback",
+				"yes",
+				"format",
+				"stats",
+				"profile-startup",
+				"profile-json",
+				"no-cache",
+				"force-full-analysis",
+				"background-mode",
+				"no-background-mode",
+			)
+		},
+	},
+	{
+		title: "Search & Filters",
+		match: func(name string) bool {
+			return isOneOf(name,
+				"recipe",
+				"search",
+				"label",
+				"severity",
+				"alert-type",
+				"alert-label",
+				"workspace",
+				"repo",
+				"robot-min-confidence",
+				"robot-max-results",
+				"robot-by-label",
+				"robot-by-assignee",
+			) || hasAnyPrefix(name, "search-")
+		},
+	},
+	{
+		title: "Robot & Planning Flags",
+		match: func(name string) bool {
+			return strings.HasPrefix(name, "robot-") ||
+				isOneOf(name,
+					"attention-limit",
+					"schema-command",
+					"suggest-type",
+					"suggest-confidence",
+					"suggest-bead",
+					"graph-format",
+					"graph-root",
+					"graph-depth",
+					"orphans-min-score",
+					"file-beads-limit",
+					"hotspots-limit",
+					"relations-threshold",
+					"relations-limit",
+					"related-min-relevance",
+					"related-max-results",
+					"related-include-closed",
+					"forecast-label",
+					"forecast-sprint",
+					"forecast-agents",
+					"agents",
+					"capacity-label",
+				) ||
+				hasAnyPrefix(name, "correlation-")
+		},
+	},
+	{
+		title: "History & Drift",
+		match: func(name string) bool {
+			return isOneOf(name,
+				"diff-since",
+				"as-of",
+				"save-baseline",
+				"baseline-info",
+				"check-drift",
+				"bead-history",
+				"history-since",
+				"history-limit",
+				"min-confidence",
+			)
+		},
+	},
+	{
+		title: "Export & Reporting",
+		match: func(name string) bool {
+			return isOneOf(name,
+				"export-md",
+				"no-hooks",
+				"export-graph",
+				"graph-preset",
+				"graph-title",
+				"emit-script",
+				"script-limit",
+				"script-format",
+				"priority-brief",
+				"agent-brief",
+				"export-pages",
+				"pages-title",
+				"pages-include-closed",
+				"pages-include-history",
+				"preview-pages",
+				"no-live-reload",
+				"watch-export",
+				"pages",
+				"debug-render",
+				"debug-width",
+				"debug-height",
+			)
+		},
+	},
+	{
+		title: "Agent File Management",
+		match: func(name string) bool {
+			return strings.HasPrefix(name, "agents-")
+		},
+	},
+}
+
+func isOneOf(name string, values ...string) bool {
+	for _, value := range values {
+		if name == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyPrefix(name string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+type modifierFlagRule struct {
+	modifier string
+	requires []string
+}
+
+type enumFlagRule struct {
+	name    string
+	allowed []string
+}
+
+type primaryCommandGroup struct {
+	flags []string
+}
+
+func validateModifierFlags(flags *flag.FlagSet, rules []modifierFlagRule) error {
+	for _, rule := range rules {
+		if !flags.Changed(rule.modifier) {
+			continue
+		}
+		if hasActiveRequiredFlag(flags, rule.requires...) {
+			continue
+		}
+
+		return fmt.Errorf("--%s requires %s", rule.modifier, formatRequiredFlags(rule.requires))
+	}
+
+	return nil
+}
+
+func validateEnumFlags(flags *flag.FlagSet, rules []enumFlagRule) error {
+	for _, rule := range rules {
+		if !flags.Changed(rule.name) {
+			continue
+		}
+
+		value, err := flags.GetString(rule.name)
+		if err != nil {
+			return fmt.Errorf("reading --%s: %w", rule.name, err)
+		}
+
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			return fmt.Errorf("invalid --%s %q (expected one of %s)", rule.name, value, joinAllowedValues(rule.allowed))
+		}
+
+		valid := false
+		for _, allowed := range rule.allowed {
+			if normalized == allowed {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("invalid --%s %q (expected one of %s)", rule.name, value, joinAllowedValues(rule.allowed))
+		}
+	}
+
+	return nil
+}
+
+func validateExclusivePrimaryCommands(flags *flag.FlagSet, groups []primaryCommandGroup) error {
+	activeGroups := make([]string, 0, len(groups))
+	for _, group := range groups {
+		active := activePrimaryFlags(flags, group.flags)
+		if len(active) == 0 {
+			continue
+		}
+		activeGroups = append(activeGroups, strings.Join(active, ", "))
+	}
+
+	if len(activeGroups) <= 1 {
+		return nil
+	}
+
+	return fmt.Errorf("multiple primary robot commands specified: %s", strings.Join(activeGroups, " | "))
+}
+
+func activePrimaryFlags(flags *flag.FlagSet, names []string) []string {
+	active := make([]string, 0, len(names))
+	for _, name := range names {
+		if isFlagActive(flags, name) {
+			active = append(active, "--"+name)
+		}
+	}
+	return active
+}
+
+func joinAllowedValues(values []string) string {
+	return strings.Join(values, ", ")
+}
+
+func hasActiveRequiredFlag(flags *flag.FlagSet, names ...string) bool {
+	for _, name := range names {
+		if isFlagActive(flags, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFlagActive(flags *flag.FlagSet, name string) bool {
+	f := flags.Lookup(name)
+	if f == nil {
+		return false
+	}
+
+	switch f.Value.Type() {
+	case "bool":
+		v, err := flags.GetBool(name)
+		return err == nil && v
+	case "string":
+		v, err := flags.GetString(name)
+		return err == nil && strings.TrimSpace(v) != ""
+	default:
+		return flags.Changed(name)
+	}
+}
+
+func formatRequiredFlags(names []string) string {
+	if len(names) == 0 {
+		return "another flag"
+	}
+	if len(names) == 1 {
+		return "--" + names[0]
+	}
+
+	var parts []string
+	for _, name := range names {
+		parts = append(parts, "--"+name)
+	}
+	return "one of " + strings.Join(parts[:len(parts)-1], ", ") + " or " + parts[len(parts)-1]
+}
+
+func newRootCommand(run func() error) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:                   "bv",
+		Short:                 "A TUI viewer for beads issue tracker.",
+		Args:                  cobra.NoArgs,
+		SilenceUsage:          true,
+		DisableFlagsInUseLine: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run()
+		},
+	}
+
+	cmd.Flags().SortFlags = false
+	cmd.Flags().AddFlagSet(flag.CommandLine)
+	cmd.SetUsageFunc(func(cmd *cobra.Command) error {
+		printRootHelp(cmd)
+		return nil
+	})
+	cmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		printRootHelp(cmd)
+	})
+
+	return cmd
+}
+
+func rewriteSingleDashLongFlags(args []string, flags *flag.FlagSet) []string {
+	rewritten := make([]string, 0, len(args))
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || len(arg) <= 2 {
+			rewritten = append(rewritten, arg)
+			continue
+		}
+
+		name := arg[1:]
+		if eq := strings.IndexRune(name, '='); eq >= 0 {
+			name = name[:eq]
+		}
+		if len(name) <= 1 || flags.Lookup(name) == nil {
+			rewritten = append(rewritten, arg)
+			continue
+		}
+
+		rewritten = append(rewritten, "-"+arg)
+	}
+	return rewritten
+}
+
+func printRootHelp(cmd *cobra.Command) {
+	out := cmd.OutOrStdout()
+	allFlags := cmd.Flags()
+	seen := make(map[string]bool)
+
+	fmt.Fprintln(out, "Usage: bv [flags]")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "A TUI viewer for beads issue tracker.")
+	fmt.Fprintln(out)
+
+	for _, section := range rootHelpSections {
+		names := collectFlagNames(allFlags, seen, section.match)
+		printFlagSection(out, allFlags, section.title, names)
+		markFlagNamesSeen(seen, names)
+	}
+
+	otherNames := collectFlagNames(allFlags, seen, func(string) bool { return true })
+	printFlagSection(out, allFlags, "Other Flags", otherNames)
+
+	fmt.Fprintln(out, "Run `bv --robot-help` for detailed AI/robot command documentation.")
+}
+
+func collectFlagNames(flags *flag.FlagSet, seen map[string]bool, match func(string) bool) []string {
+	var names []string
+	flags.VisitAll(func(f *flag.Flag) {
+		if f.Hidden || seen[f.Name] || !match(f.Name) {
+			return
+		}
+		names = append(names, f.Name)
+	})
+	return names
+}
+
+func markFlagNamesSeen(seen map[string]bool, names []string) {
+	for _, name := range names {
+		seen[name] = true
+	}
+}
+
+func printFlagSection(out io.Writer, allFlags *flag.FlagSet, title string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+
+	sectionFlags := flag.NewFlagSet(title, flag.ContinueOnError)
+	sectionFlags.SortFlags = false
+	sectionFlags.SetOutput(io.Discard)
+
+	for _, name := range names {
+		if f := allFlags.Lookup(name); f != nil {
+			sectionFlags.AddFlag(f)
+		}
+	}
+
+	fmt.Fprintf(out, "%s:\n", title)
+	fmt.Fprint(out, sectionFlags.FlagUsagesWrapped(100))
+	fmt.Fprintln(out)
+}
+
 func main() {
+	flag.CommandLine.SortFlags = false
+
 	cpuProfile := flag.String("cpu-profile", "", "Write CPU profile to file")
 	dbPath := flag.String("db", "", "Path to beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR env vars)")
-	help := flag.Bool("help", false, "Show help")
 	versionFlag := flag.Bool("version", false, "Show version")
 	// Update flags (bv-182)
 	updateFlag := flag.Bool("update", false, "Update bv to the latest version")
@@ -62,7 +450,7 @@ func main() {
 	exportFile := flag.String("export-md", "", "Export issues to a Markdown file (e.g., report.md)")
 	robotHelp := flag.Bool("robot-help", false, "Show AI agent help")
 	robotDocs := flag.String("robot-docs", "", "Machine-readable JSON docs for AI agents. Topics: guide, commands, examples, env, exit-codes, all")
-	outputFormat := flag.String("format", "", "Structured output format for --robot-* commands: json or toon (env: BV_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)")
+	outputFormat := flag.StringP("format", "f", "", "Structured output format for --robot-* commands: json or toon (env: BV_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT)")
 	toonStats := flag.Bool("stats", false, "Show JSON vs TOON token estimates on stderr (env: TOON_STATS=1)")
 	robotInsights := flag.Bool("robot-insights", false, "Output graph analysis and insights as JSON for AI agents")
 	robotPlan := flag.Bool("robot-plan", false, "Output dependency-respecting execution plan as JSON for AI agents")
@@ -102,7 +490,7 @@ func main() {
 	robotByLabel := flag.String("robot-by-label", "", "Filter robot outputs by label (exact match)")
 	robotByAssignee := flag.String("robot-by-assignee", "", "Filter robot outputs by assignee (exact match)")
 	// Label subgraph scoping (bv-122)
-	labelScope := flag.String("label", "", "Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority)")
+	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority)")
 	alertSeverity := flag.String("severity", "", "Filter robot alerts by severity (info|warning|critical)")
 	alertType := flag.String("alert-type", "", "Filter robot alerts by alert type (e.g., stale_issue)")
 	alertLabel := flag.String("alert-label", "", "Filter robot alerts by label match")
@@ -214,2788 +602,2112 @@ func main() {
 	agentsCheck := flag.Bool("agents-check", false, "Check AGENTS.md blurb status (default if no --agents-* action)")
 	agentsDryRun := flag.Bool("agents-dry-run", false, "Show what would happen without executing (use with --agents-*)")
 	agentsForce := flag.Bool("agents-force", false, "Skip confirmation prompts (use with --agents-*)")
-	// Override pflag's default usage so -h/--help prints our custom header.
-	flag.Usage = func() {
-		fmt.Println("Usage: bv [options]")
-		fmt.Println("\nA TUI viewer for beads issue tracker.")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	// CPU profiling support
-	if *cpuProfile != "" {
-		f, err := os.Create(*cpuProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Could not create CPU profile: %v\n", err)
+	var recipeLoader *recipe.Loader
+	phaseOneRobotRegistry := newRobotRegistry()
+	registerPhaseOneRobotHandlers(&phaseOneRobotRegistry, phaseOneRobotHandlerConfig{
+		RobotHelpFlag:    robotHelp,
+		RobotSchemaFlag:  robotSchema,
+		RobotRecipesFlag: robotRecipes,
+		RobotMetricsFlag: robotMetrics,
+		RobotDocsFlag:    robotDocs,
+		VersionFlag:      versionFlag,
+		SchemaCommand:    schemaCommand,
+		RecipeLoader: func() *recipe.Loader {
+			return recipeLoader
+		},
+	})
+	phaseTwoRobotRegistry := newRobotRegistry()
+	registerPhaseTwoRobotHandlers(&phaseTwoRobotRegistry, phaseTwoRobotHandlerConfig{
+		RobotPlanFlag:       robotPlan,
+		RobotPriorityFlag:   robotPriority,
+		RobotAlertsFlag:     robotAlerts,
+		RobotSuggestFlag:    robotSuggest,
+		RobotBurndownFlag:   robotBurndown,
+		RobotForecastFlag:   robotForecast,
+		RobotSprintListFlag: robotSprintList,
+		RobotGraphFlag:      robotGraph,
+		RobotSearchFlag:     robotSearch,
+		RobotDiffFlag:       robotDiff,
+		ForceFullAnalysis:   forceFullAnalysis,
+		GraphFormat:         graphFormat,
+		GraphRoot:           graphRoot,
+		GraphDepth:          graphDepth,
+		AlertSeverity:       alertSeverity,
+		AlertType:           alertType,
+		AlertLabel:          alertLabel,
+		SuggestType:         suggestType,
+		SuggestConfidence:   suggestConfidence,
+		SuggestBead:         suggestBead,
+		RobotMinConf:        robotMinConf,
+		RobotMaxResults:     robotMaxResults,
+		RobotByLabel:        robotByLabel,
+		RobotByAssignee:     robotByAssignee,
+		ForecastLabel:       forecastLabel,
+		ForecastSprint:      forecastSprint,
+		ForecastAgents:      forecastAgents,
+	})
+	phaseThreeRobotRegistry := newRobotRegistry()
+	registerPhaseThreeRobotHandlers(&phaseThreeRobotRegistry, phaseThreeRobotHandlerConfig{
+		RobotInsightsFlag:       robotInsights,
+		RobotTriageFlag:         robotTriage,
+		RobotTriageByTrackFlag:  robotTriageByTrack,
+		RobotTriageByLabelFlag:  robotTriageByLabel,
+		RobotNextFlag:           robotNext,
+		RobotHistoryFlag:        robotHistory,
+		BeadHistoryFlag:         beadHistory,
+		RobotExplainCorrFlag:    robotExplainCorrelation,
+		RobotConfirmCorrFlag:    robotConfirmCorrelation,
+		RobotRejectCorrFlag:     robotRejectCorrelation,
+		RobotCorrStatsFlag:      robotCorrelationStats,
+		CorrelationFeedbackBy:   correlationFeedbackBy,
+		CorrelationReason:       correlationFeedbackReason,
+		RobotLabelHealthFlag:    robotLabelHealth,
+		RobotLabelFlowFlag:      robotLabelFlow,
+		RobotLabelAttentionFlag: robotLabelAttention,
+		RobotOrphansFlag:        robotOrphans,
+		OrphansMinScore:         orphansMinScore,
+		RobotFileBeadsFlag:      robotFileBeads,
+		FileBeadsLimit:          fileBeadsLimit,
+		RobotImpactFlag:         robotImpact,
+		RobotFileRelationsFlag:  robotFileRelations,
+		RobotRelatedFlag:        robotRelatedWork,
+		RobotBlockerChainFlag:   robotBlockerChain,
+		RobotImpactNetworkFlag:  robotImpactNetwork,
+		RobotCausalityFlag:      robotCausality,
+		RobotSprintShowFlag:     robotSprintShow,
+		RobotCapacityFlag:       robotCapacity,
+		ForceFullAnalysis:       forceFullAnalysis,
+		HistoryLimit:            historyLimit,
+		HistorySince:            historySince,
+		MinConfidence:           minConfidence,
+		AttentionLimit:          attentionLimit,
+		RelationsThreshold:      relationsThreshold,
+		RelationsLimit:          relationsLimit,
+		RelatedMinRelevance:     relatedMinRelevance,
+		RelatedMaxResults:       relatedMaxResults,
+		RelatedIncludeClosed:    relatedIncludeClosed,
+		NetworkDepth:            networkDepth,
+		CapacityAgents:          capacityAgents,
+		CapacityLabel:           capacityLabel,
+	})
+	rootCmd := newRootCommand(func() error {
+		modifierRules := []modifierFlagRule{
+			{modifier: "robot-diff", requires: []string{"diff-since"}},
+			{modifier: "robot-search", requires: []string{"search"}},
+			{modifier: "search-limit", requires: []string{"search"}},
+			{modifier: "search-mode", requires: []string{"search"}},
+			{modifier: "search-preset", requires: []string{"search"}},
+			{modifier: "search-weights", requires: []string{"search"}},
+			{modifier: "attention-limit", requires: []string{"robot-label-attention"}},
+			{modifier: "schema-command", requires: []string{"robot-schema"}},
+			{modifier: "suggest-type", requires: []string{"robot-suggest"}},
+			{modifier: "suggest-confidence", requires: []string{"robot-suggest"}},
+			{modifier: "suggest-bead", requires: []string{"robot-suggest"}},
+			{modifier: "graph-format", requires: []string{"robot-graph"}},
+			{modifier: "graph-root", requires: []string{"robot-graph"}},
+			{modifier: "graph-depth", requires: []string{"robot-graph"}},
+			{modifier: "graph-preset", requires: []string{"export-graph"}},
+			{modifier: "graph-title", requires: []string{"export-graph"}},
+			{modifier: "severity", requires: []string{"robot-alerts"}},
+			{modifier: "alert-type", requires: []string{"robot-alerts"}},
+			{modifier: "alert-label", requires: []string{"robot-alerts"}},
+			{modifier: "profile-json", requires: []string{"profile-startup"}},
+			{modifier: "robot-drift", requires: []string{"check-drift"}},
+			{modifier: "history-since", requires: []string{"robot-history", "bead-history"}},
+			{modifier: "history-limit", requires: []string{"robot-history", "bead-history"}},
+			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
+			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
+			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
+			{modifier: "orphans-min-score", requires: []string{"robot-orphans"}},
+			{modifier: "file-beads-limit", requires: []string{"robot-file-beads"}},
+			{modifier: "hotspots-limit", requires: []string{"robot-file-hotspots"}},
+			{modifier: "relations-threshold", requires: []string{"robot-file-relations"}},
+			{modifier: "relations-limit", requires: []string{"robot-file-relations"}},
+			{modifier: "related-min-relevance", requires: []string{"robot-related"}},
+			{modifier: "related-max-results", requires: []string{"robot-related"}},
+			{modifier: "related-include-closed", requires: []string{"robot-related"}},
+			{modifier: "network-depth", requires: []string{"robot-impact-network"}},
+			{modifier: "forecast-label", requires: []string{"robot-forecast"}},
+			{modifier: "forecast-sprint", requires: []string{"robot-forecast"}},
+			{modifier: "forecast-agents", requires: []string{"robot-forecast"}},
+			{modifier: "agents", requires: []string{"robot-capacity"}},
+			{modifier: "capacity-label", requires: []string{"robot-capacity"}},
+			{modifier: "robot-by-label", requires: []string{"robot-priority"}},
+			{modifier: "robot-by-assignee", requires: []string{"robot-priority"}},
+			{modifier: "script-limit", requires: []string{"emit-script"}},
+			{modifier: "script-format", requires: []string{"emit-script"}},
+			{modifier: "pages-title", requires: []string{"export-pages"}},
+			{modifier: "pages-include-closed", requires: []string{"export-pages"}},
+			{modifier: "pages-include-history", requires: []string{"export-pages"}},
+			{modifier: "no-live-reload", requires: []string{"preview-pages"}},
+			{modifier: "watch-export", requires: []string{"export-pages"}},
+			{modifier: "debug-width", requires: []string{"debug-render"}},
+			{modifier: "debug-height", requires: []string{"debug-render"}},
+		}
+		enumRules := []enumFlagRule{
+			{name: "graph-format", allowed: []string{"json", "dot", "mermaid"}},
+			{name: "script-format", allowed: []string{"bash", "fish", "zsh"}},
+		}
+		primaryRobotCommandGroups := []primaryCommandGroup{
+			{flags: []string{"robot-help"}},
+			{flags: []string{"robot-docs"}},
+			{flags: []string{"robot-insights"}},
+			{flags: []string{"robot-plan"}},
+			{flags: []string{"robot-priority"}},
+			{flags: []string{"robot-triage", "robot-next", "robot-triage-by-track", "robot-triage-by-label"}},
+			{flags: []string{"robot-diff"}},
+			{flags: []string{"robot-recipes"}},
+			{flags: []string{"robot-label-health"}},
+			{flags: []string{"robot-label-flow"}},
+			{flags: []string{"robot-label-attention"}},
+			{flags: []string{"robot-alerts"}},
+			{flags: []string{"robot-metrics"}},
+			{flags: []string{"robot-schema"}},
+			{flags: []string{"robot-suggest"}},
+			{flags: []string{"robot-graph"}},
+			{flags: []string{"robot-search"}},
+			{flags: []string{"robot-drift"}},
+			{flags: []string{"robot-history", "bead-history"}},
+			{flags: []string{"robot-explain-correlation"}},
+			{flags: []string{"robot-confirm-correlation"}},
+			{flags: []string{"robot-reject-correlation"}},
+			{flags: []string{"robot-correlation-stats"}},
+			{flags: []string{"robot-orphans"}},
+			{flags: []string{"robot-file-beads"}},
+			{flags: []string{"file-hotspots"}},
+			{flags: []string{"robot-impact"}},
+			{flags: []string{"robot-file-relations"}},
+			{flags: []string{"robot-related"}},
+			{flags: []string{"robot-blocker-chain"}},
+			{flags: []string{"robot-impact-network"}},
+			{flags: []string{"robot-causality"}},
+			{flags: []string{"robot-sprint-list"}},
+			{flags: []string{"robot-sprint-show"}},
+			{flags: []string{"robot-forecast"}},
+			{flags: []string{"robot-burndown"}},
+			{flags: []string{"robot-capacity"}},
+		}
+		if err := validateModifierFlags(flag.CommandLine, modifierRules); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "Could not start CPU profile: %v\n", err)
+		if err := validateEnumFlags(flag.CommandLine, enumRules); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		defer pprof.StopCPUProfile()
-	}
-
-	// Apply --db flag: set BEADS_DB env var so all downstream code respects it.
-	// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
-	if *dbPath != "" {
-		absDB, err := filepath.Abs(*dbPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
-			os.Exit(1)
-		}
-		os.Setenv(loader.BeadsDBEnvVar, absDB)
-	}
-
-	// Apply --no-cache flag: set BV_NO_CACHE=1 so disk cache is bypassed.
-	if *noCache {
-		os.Setenv("BV_NO_CACHE", "1")
-	}
-
-	// Ensure static export flags are retained even when build tags strip features in some environments.
-	_ = exportPages
-	_ = pagesTitle
-	_ = pagesIncludeClosed
-	_ = pagesIncludeHistory
-	_ = previewPages
-	_ = previewNoLiveReload
-	_ = pagesWizard
-	_ = watchExport
-	_ = debugRender
-	_ = debugWidth
-	_ = debugHeight
-	_ = robotForecast
-	_ = forecastLabel
-	_ = forecastSprint
-	_ = forecastAgents
-	_ = robotCapacity
-	_ = capacityAgents
-	_ = capacityLabel
-	_ = labelScope
-	_ = agentBrief
-
-	envRobot := os.Getenv("BV_ROBOT") == "1"
-	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
-
-	robotMode := envRobot ||
-		*robotHelp ||
-		*robotInsights ||
-		*robotPlan ||
-		*robotPriority ||
-		*robotTriage ||
-		*robotTriageByTrack ||
-		*robotTriageByLabel ||
-		*robotNext ||
-		*robotDiff ||
-		*robotRecipes ||
-		*robotLabelHealth ||
-		*robotLabelFlow ||
-		*robotLabelAttention ||
-		*robotAlerts ||
-		*robotMetrics ||
-		*robotSchema ||
-		*robotSuggest ||
-		*robotGraph ||
-		*robotSearch ||
-		*robotDriftCheck ||
-		*robotHistory ||
-		*robotFileBeads != "" ||
-		*fileHotspots ||
-		*robotImpact != "" ||
-		*robotFileRelations != "" ||
-		*robotRelatedWork != "" ||
-		*robotBlockerChain != "" ||
-		*robotImpactNetwork != "" ||
-		*robotCausality != "" ||
-		*robotSprintList ||
-		*robotSprintShow != "" ||
-		*robotForecast != "" ||
-		*robotBurndown != "" ||
-		*robotByLabel != "" ||
-		*robotByAssignee != "" ||
-		*robotCapacity ||
-		*robotDocs != "" ||
-		// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
-		// as robot mode early so parsers keep stdout JSON clean.
-		(*diffSince != "" && !stdoutIsTTY)
-
-	// Mark robot mode for downstream packages (e.g., parsers) to keep stdout JSON clean.
-	if robotMode && !envRobot {
-		_ = os.Setenv("BV_ROBOT", "1")
-		envRobot = true
-	}
-
-	// Structured output format for --robot-* commands.
-	robotOutputFormat = resolveRobotOutputFormat(*outputFormat)
-	robotToonEncodeOptions = resolveToonEncodeOptionsFromEnv()
-	robotShowToonStats = *toonStats || strings.TrimSpace(os.Getenv("TOON_STATS")) == "1"
-	if robotOutputFormat != "json" && robotOutputFormat != "toon" {
-		fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
-		os.Exit(2)
-	}
-
-	if *help {
-		fmt.Println("Usage: bv [options]")
-		fmt.Println("\nA TUI viewer for beads issue tracker.")
-		flag.PrintDefaults()
-		os.Exit(0)
-	}
-
-	if *robotHelp {
-		fmt.Println("bv (Beads Viewer) AI Agent Interface")
-		fmt.Println("====================================")
-		fmt.Println("This tool provides structural analysis of the issue tracker graph (DAG).")
-		fmt.Println("Use these commands to understand project state without parsing raw JSONL.")
-		fmt.Println("")
-		fmt.Println("Output format:")
-		fmt.Println("  --format json|toon")
-		fmt.Println("      Structured output encoding for --robot-* commands (default: json).")
-		fmt.Println("      Env: BV_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.")
-		fmt.Println("  --stats")
-		fmt.Println("      Print JSON vs TOON token estimates to stderr (or set TOON_STATS=1).")
-		fmt.Println("")
-		fmt.Println("Commands:")
-		fmt.Println("  --robot-plan")
-		fmt.Println("      Outputs a dependency-respecting execution plan as JSON.")
-		fmt.Println("      Shows what can be worked on now and what it unblocks.")
-		fmt.Println("      Key fields:")
-		fmt.Println("      - tracks: Independent work streams that can be parallelized")
-		fmt.Println("      - items: Actionable issues sorted by priority within each track")
-		fmt.Println("      - unblocks: Issues that become actionable when this item is done")
-		fmt.Println("      - summary: Highlights highest-impact item to work on first")
-		fmt.Println("")
-		fmt.Println("  --robot-insights")
-		fmt.Println("      Outputs a JSON object containing deep graph analysis.")
-		fmt.Println("      Key metrics explained:")
-		fmt.Println("      - PageRank: Measures 'blocking power'. High score = Fundamental dependency.")
-		fmt.Println("      - Betweenness: Measures 'bottleneck status'. High score = Connects disparate clusters.")
-		fmt.Println("      - CriticalPathScore: Heuristic for depth. High score = Blocking a long chain of work.")
-		fmt.Println("      - Hubs/Authorities: HITS algorithm scores for dependency relationships.")
-		fmt.Println("      - Cycles: Lists of circular dependencies (unhealthy state).")
-		fmt.Println("")
-		fmt.Println("  --robot-priority")
-		fmt.Println("      Outputs priority recommendations as JSON.")
-		fmt.Println("      Compares impact scores to current priorities and suggests adjustments.")
-		fmt.Println("      Key fields:")
-		fmt.Println("      - recommendations: Sorted by confidence, then impact score")
-		fmt.Println("      - confidence: 0-1 score indicating strength of recommendation")
-		fmt.Println("      - reasoning: Human-readable explanations for the suggestion")
-		fmt.Println("      - direction: 'increase' or 'decrease' priority")
-		fmt.Println("")
-		fmt.Println("  --robot-triage")
-		fmt.Println("      THE MEGA-COMMAND: Unified triage output combining all analysis.")
-		fmt.Println("      Single entry point for AI agents - one call gets everything needed.")
-		fmt.Println("      Key sections:")
-		fmt.Println("      - meta: Generation timestamp, data stats")
-		fmt.Println("      - quick_ref: At-a-glance summary (open/actionable/blocked counts, top 3 picks)")
-		fmt.Println("      - recommendations: Ranked actionable items with scores and reasoning")
-		fmt.Println("      - quick_wins: Low-complexity, high-impact items")
-		fmt.Println("      - blockers_to_clear: Items that unblock the most downstream work")
-		fmt.Println("      - project_health: Counts, graph metrics, overall status")
-		fmt.Println("      - commands: Copy-paste commands for common next steps")
-		fmt.Println("")
-		fmt.Println("  --robot-next")
-		fmt.Println("      Minimal triage: returns only the single top recommendation.")
-		fmt.Println("      Output includes: id, title, score, reasons, claim_command, show_command")
-		fmt.Println("      Use when you just need to know \"what should I work on next?\"")
-		fmt.Println("")
-		fmt.Println("  --search \"query\" [--robot-search]")
-		fmt.Println("      Semantic vector search over issue titles/descriptions.")
-		fmt.Println("      Builds/updates a local on-disk vector index on first run.")
-		fmt.Println("      Use --robot-search to emit JSON for automation.")
-		fmt.Println("      Optional hybrid re-ranking:")
-		fmt.Println("      - --search-mode=text|hybrid (default: BV_SEARCH_MODE or text)")
-		fmt.Println("      - --search-preset=default|bug-hunting|sprint-planning|impact-first|text-only")
-		fmt.Println("      - --search-weights='{\"text\":0.4,\"pagerank\":0.2,\"status\":0.15,\"impact\":0.1,\"priority\":0.1,\"recency\":0.05}'")
-		fmt.Println("")
-		fmt.Println("  --emit-script [--script-limit=N]")
-		fmt.Println("      Emits a shell script for top-N recommendations (default: 5).")
-		fmt.Println("      Includes hash/config header for deterministic ordering.")
-		fmt.Println("      Output: br show commands for each item, commented claim commands")
-		fmt.Println("      Options: --script-format=bash|fish|zsh, --script-limit=N")
-		fmt.Println("      Example: bv --emit-script > work.sh && bash work.sh")
-		fmt.Println("      Example: bv --emit-script --script-limit=3")
-		fmt.Println("")
-		fmt.Println("  --robot-history")
-		fmt.Println("      Outputs bead-to-commit correlations as JSON.")
-		fmt.Println("      Tracks which code changes relate to which beads via git history analysis.")
-		fmt.Println("      Key sections:")
-		fmt.Println("      - stats: Summary (total beads, beads with commits, avg cycle time)")
-		fmt.Println("      - histories: Per-bead data (events, commits, milestones, cycle_time)")
-		fmt.Println("      - commit_index: Reverse lookup from commit SHA to bead IDs")
-		fmt.Println("      Flags:")
-		fmt.Println("      - --bead-history <id>: Filter to single bead")
-		fmt.Println("      - --history-since <ref>: Limit to recent commits")
-		fmt.Println("      - --history-limit <n>: Max commits to analyze (default: 500)")
-		fmt.Println("      - --min-confidence <0.0-1.0>: Filter by minimum confidence score")
-		fmt.Println("      Example: bv --robot-history --history-since '30 days ago'")
-		fmt.Println("      Example: bv --robot-history --min-confidence 0.7")
-		fmt.Println("")
-		fmt.Println("  --robot-file-beads <path>")
-		fmt.Println("      Outputs beads that have touched a file path as JSON.")
-		fmt.Println("      Answers: 'What beads have touched this file, and why?'")
-		fmt.Println("      Key sections:")
-		fmt.Println("      - file_path: The queried file path")
-		fmt.Println("      - open_beads: Currently open beads that touched this file")
-		fmt.Println("      - closed_beads: Recently closed beads (limited by --file-beads-limit)")
-		fmt.Println("      - total_beads: Total count of beads")
-		fmt.Println("      Each bead includes: bead_id, title, status, commit_shas, last_touch, total_changes")
-		fmt.Println("      Flags:")
-		fmt.Println("      - --file-beads-limit <n>: Max closed beads to show (default: 20)")
-		fmt.Println("      Example: bv --robot-file-beads pkg/auth/token.go")
-		fmt.Println("      Example: bv --robot-file-beads pkg/auth")
-		fmt.Println("")
-		fmt.Println("  --robot-file-hotspots")
-		fmt.Println("      Outputs files touched by the most beads as JSON.")
-		fmt.Println("      Identifies potential conflict zones or high-churn areas.")
-		fmt.Println("      Key sections:")
-		fmt.Println("      - hotspots: Array of {file_path, total_beads, open_beads, closed_beads}")
-		fmt.Println("      - stats: Index statistics (total_files, total_bead_links)")
-		fmt.Println("      Flags:")
-		fmt.Println("      - --hotspots-limit <n>: Max hotspots to show (default: 10)")
-		fmt.Println("      Example: bv --robot-file-hotspots")
-		fmt.Println("")
-		fmt.Println("  --robot-impact <files>")
-		fmt.Println("      Analyzes impact of modifying files - what beads might be affected?")
-		fmt.Println("      Critical for agents: check before making changes to avoid conflicts.")
-		fmt.Println("      Key sections:")
-		fmt.Println("      - risk_level: low/medium/high/critical based on open beads")
-		fmt.Println("      - affected_beads: Beads touching these files with relevance scores")
-		fmt.Println("      - warnings: Actionable warnings about potential conflicts")
-		fmt.Println("      - summary: Human-readable impact summary")
-		fmt.Println("      Input: Comma-separated file paths")
-		fmt.Println("      Example: bv --robot-impact pkg/auth/token.go")
-		fmt.Println("      Example: bv --robot-impact pkg/auth/token.go,pkg/auth/session.go")
-		fmt.Println("")
-		fmt.Println("  --robot-file-relations <path>")
-		fmt.Println("      Outputs files that frequently co-change with the given file.")
-		fmt.Println("      Reveals hidden coupling: what other files typically change together?")
-		fmt.Println("      Key fields:")
-		fmt.Println("      - total_commits: How many commits touched this file")
-		fmt.Println("      - related_files: Files that co-change, with correlation scores")
-		fmt.Println("        - correlation: 0.0-1.0 (e.g., 0.8 = changed together in 80% of commits)")
-		fmt.Println("        - sample_commits: Example commit SHAs showing co-change")
-		fmt.Println("      Options:")
-		fmt.Println("      - --relations-threshold <0.0-1.0>: Min correlation (default 0.5)")
-		fmt.Println("      - --relations-limit <n>: Max related files to return (default 10)")
-		fmt.Println("      Example: bv --robot-file-relations pkg/auth/token.go")
-		fmt.Println("      Example: bv --robot-file-relations pkg/auth/token.go --relations-threshold 0.3")
-		fmt.Println("")
-		fmt.Println("  --robot-related <bead-id>")
-		fmt.Println("      Outputs beads related to a specific bead as JSON.")
-		fmt.Println("      Discovers related work across multiple dimensions:")
-		fmt.Println("      - file_overlap: Beads touching the same files")
-		fmt.Println("      - commit_overlap: Beads sharing commits")
-		fmt.Println("      - dependency_cluster: Beads in the same dependency graph area")
-		fmt.Println("      - concurrent: Beads active in overlapping time windows")
-		fmt.Println("      Key fields per related bead:")
-		fmt.Println("      - relevance: 0-100 score indicating strength of relationship")
-		fmt.Println("      - reason: Human-readable explanation of the connection")
-		fmt.Println("      - shared_files/shared_commits: Evidence of overlap")
-		fmt.Println("      Options:")
-		fmt.Println("      - --related-min-relevance <0-100>: Min relevance score (default 20)")
-		fmt.Println("      - --related-max-results <n>: Max results per category (default 10)")
-		fmt.Println("      - --related-include-closed: Include closed beads")
-		fmt.Println("      Example: bv --robot-related bv-abc1")
-		fmt.Println("      Example: bv --robot-related bv-abc1 --related-include-closed")
-		fmt.Println("")
-		fmt.Println("  --robot-sprint-list")
-		fmt.Println("      Outputs all sprints as JSON for planning and forecasting.")
-		fmt.Println("      Key fields:")
-		fmt.Println("      - generated_at: Timestamp of the output")
-		fmt.Println("      - sprint_count: Number of sprints")
-		fmt.Println("      - sprints: Array of sprint objects (id, name, start_date, end_date, bead_ids)")
-		fmt.Println("      Example: bv --robot-sprint-list")
-		fmt.Println("")
-		fmt.Println("  --robot-sprint-show <id>")
-		fmt.Println("      Outputs details for a specific sprint as JSON.")
-		fmt.Println("      Returns the full sprint object with all fields.")
-		fmt.Println("      Example: bv --robot-sprint-show sprint-1")
-		fmt.Println("")
-		fmt.Println("  --robot-burndown <id|current>")
-		fmt.Println("      Outputs burndown data for a sprint as JSON.")
-		fmt.Println("      Use 'current' to get the active sprint, or specify sprint ID.")
-		fmt.Println("      Key fields:")
-		fmt.Println("      - total_days, elapsed_days, remaining_days")
-		fmt.Println("      - total_issues, completed_issues, remaining_issues")
-		fmt.Println("      - ideal_burn_rate, actual_burn_rate")
-		fmt.Println("      - projected_complete: Estimated completion date")
-		fmt.Println("      - on_track: Whether sprint will complete on time")
-		fmt.Println("      - daily_points: Actual burndown data points")
-		fmt.Println("      - ideal_line: Expected burndown line")
-		fmt.Println("      Example: bv --robot-burndown current")
-		fmt.Println("      Example: bv --robot-burndown sprint-1")
-		fmt.Println("")
-		fmt.Println("  --robot-forecast <id|all>")
-		fmt.Println("      Outputs ETA forecast for a specific bead or all open issues.")
-		fmt.Println("      Returns estimated completion date, confidence, and factors.")
-		fmt.Println("      Options:")
-		fmt.Println("        --forecast-label=X    Filter by label")
-		fmt.Println("        --forecast-sprint=Y   Filter by sprint")
-		fmt.Println("        --forecast-agents=N   Parallel agents (default: 1)")
-		fmt.Println("      Example: bv --robot-forecast bv-123")
-		fmt.Println("      Example: bv --robot-forecast all --forecast-label=backend")
-		fmt.Println("      Example: bv --robot-forecast all --forecast-agents=2")
-		fmt.Println("")
-		fmt.Println("  --robot-capacity [--agents=N] [--capacity-label=X]")
-		fmt.Println("      Outputs capacity simulation and completion projection as JSON.")
-		fmt.Println("      Analyzes work remaining, parallelizability, and bottlenecks.")
-		fmt.Println("      Key fields:")
-		fmt.Println("        - total_minutes: Sum of estimated work across open issues")
-		fmt.Println("        - parallelizable_pct: Percentage that can be parallelized")
-		fmt.Println("        - serial_minutes: Work that must be done sequentially")
-		fmt.Println("        - estimated_days: Projected completion time with N agents")
-		fmt.Println("        - bottlenecks: Issues limiting parallelization")
-		fmt.Println("      Options:")
-		fmt.Println("        --agents=N           Number of parallel agents (default: 1)")
-		fmt.Println("        --capacity-label=X   Filter analysis to label's subgraph")
-		fmt.Println("      Example: bv --robot-capacity --agents=3")
-		fmt.Println("      Example: bv --robot-capacity --capacity-label=backend")
-		fmt.Println("")
-		fmt.Println("  --emit-script [--script-limit=N] [--script-format=bash|fish|zsh]")
-		fmt.Println("      Emits a shell script for top-N priority recommendations.")
-		fmt.Println("      Useful for agent workflows and automation.")
-		fmt.Println("      Output includes:")
-		fmt.Println("        - Header comment with data hash and generation time")
-		fmt.Println("        - br show commands for each recommended item")
-		fmt.Println("        - Commented br update commands to claim items")
-		fmt.Println("      Options:")
-		fmt.Println("        --script-limit=N      Number of items (default: 5)")
-		fmt.Println("        --script-format=X     Script format: bash, fish, zsh")
-		fmt.Println("      Example: bv --emit-script")
-		fmt.Println("      Example: bv --emit-script --script-limit=3")
-		fmt.Println("      Example: bv --emit-script --script-format=fish > work.fish")
-		fmt.Println("      Example: bv --emit-script | bash  # Show top 5 items")
-		fmt.Println("")
-		fmt.Println("  --export-md <file>")
-		fmt.Println("      Generates a readable status report with Mermaid.js visualizations.")
-		fmt.Println("      Runs pre-export and post-export hooks if configured in .bv/hooks.yaml")
-		fmt.Println("")
-		fmt.Println("  --no-hooks")
-		fmt.Println("      Skip running hooks during export. Useful for CI or quick exports.")
-		fmt.Println("")
-		fmt.Println("  Hook Configuration (.bv/hooks.yaml)")
-		fmt.Println("      Configure hooks to automate export workflows:")
-		fmt.Println("      - pre-export: Validation, notifications (failure cancels export)")
-		fmt.Println("      - post-export: Notifications, uploads (failure logged only)")
-		fmt.Println("      Environment variables: BV_EXPORT_PATH, BV_EXPORT_FORMAT,")
-		fmt.Println("        BV_ISSUE_COUNT, BV_TIMESTAMP")
-		fmt.Println("")
-		fmt.Println("  --diff-since <commit|date>")
-		fmt.Println("      Shows changes since a historical point.")
-		fmt.Println("      Accepts: SHA, branch name, tag, HEAD~N, or date (YYYY-MM-DD)")
-		fmt.Println("      Key output:")
-		fmt.Println("      - new_issues: Issues added since then")
-		fmt.Println("      - closed_issues: Issues that were closed")
-		fmt.Println("      - removed_issues: Issues deleted from tracker")
-		fmt.Println("      - modified_issues: Issues with field changes")
-		fmt.Println("      - new_cycles: Circular dependencies introduced")
-		fmt.Println("      - resolved_cycles: Circular dependencies fixed")
-		fmt.Println("      - summary.health_trend: 'improving', 'degrading', or 'stable'")
-		fmt.Println("")
-		fmt.Println("  --as-of <commit|date>")
-		fmt.Println("      View issue state at a point in time (works with all robot commands).")
-		fmt.Println("      Useful for historical analysis without modifying the working tree.")
-		fmt.Println("      Robot outputs include 'as_of' and 'as_of_commit' metadata fields.")
-		fmt.Println("      Examples: --as-of HEAD~30, --as-of v1.0.0, --as-of '2024-01-01'")
-		fmt.Println("")
-		fmt.Println("  --robot-diff")
-		fmt.Println("      Output diff as JSON (use with --diff-since).")
-		fmt.Println("      Fields: generated_at, resolved_revision, from_data_hash, to_data_hash, diff{...}")
-		fmt.Println("      Diff payload includes metric deltas, cycles introduced/resolved, and modified issues.")
-		fmt.Println("")
-		fmt.Println("  --robot-recipes")
-		fmt.Println("      Lists all available recipes as JSON.")
-		fmt.Println("      Output: {recipes: [{name, description, source}]}")
-		fmt.Println("      Sources: 'builtin', 'user' (~/.config/bv/recipes.yaml), 'project' (.bv/recipes.yaml)")
-		fmt.Println("")
-		fmt.Println("  --robot-schema [--schema-command=NAME]")
-		fmt.Println("      Outputs JSON Schema definitions for all robot command outputs.")
-		fmt.Println("      Useful for validation, tool integration, and understanding output structure.")
-		fmt.Println("      Key fields:")
-		fmt.Println("        - schema_version: Version of the schema format")
-		fmt.Println("        - envelope: Common fields present in all robot outputs")
-		fmt.Println("        - commands: Map of command name -> JSON Schema definition")
-		fmt.Println("      Options:")
-		fmt.Println("        --schema-command=NAME: Output schema for specific command only")
-		fmt.Println("      Example: bv --robot-schema")
-		fmt.Println("      Example: bv --robot-schema --schema-command=robot-triage")
-		fmt.Println("")
-		fmt.Println("  --robot-label-health")
-		fmt.Println("      Outputs label health metrics as JSON (velocity, freshness, flow, criticality).")
-		fmt.Println("      Includes label summaries, detailed metrics, and cross-label dependencies.")
-		fmt.Println("      Key fields: health_level (healthy|warning|critical), velocity_score, flow_score.")
-		fmt.Println("")
-		fmt.Println("  --robot-label-flow")
-		fmt.Println("      Outputs cross-label dependency flow as JSON (label->label edges).")
-		fmt.Println("      Key fields: labels[], flow_matrix[from][to], dependencies[{from,to,count,issue_ids}],")
-		fmt.Println("                  bottleneck_labels (highest outgoing), total_cross_label_deps.")
-		fmt.Println("      Use when you need to see which labels are blocking others at a glance.")
-		fmt.Println("")
-		fmt.Println("  --robot-label-attention [--attention-limit=N]")
-		fmt.Println("      Outputs attention-ranked labels as JSON (default limit: 5).")
-		fmt.Println("      Labels ranked by attention score = (pagerank * staleness * block_impact) / velocity.")
-		fmt.Println("      Key fields: rank, label, attention_score, normalized_score, reason, blocked_count, stale_count.")
-		fmt.Println("      Use to identify which labels need the most focus based on centrality and health factors.")
-		fmt.Println("")
-		fmt.Println("  --robot-alerts")
-		fmt.Println("      Outputs drift + proactive alerts as JSON (staleness, cascades, density, cycles).")
-		fmt.Println("      Filters: --severity=<info|warning|critical>, --alert-type=<type>, --alert-label=<label>")
-		fmt.Println("      Fields: type, severity, message, issue_id, label, detected_at, details[].")
-		fmt.Println("")
-		fmt.Println("  --robot-graph [--graph-format=json|dot|mermaid] [--graph-root=ID] [--graph-depth=N]")
-		fmt.Println("      Outputs dependency graph in specified format (default: JSON adjacency).")
-		fmt.Println("      Formats:")
-		fmt.Println("        - json: Adjacency list with nodes[], edges[], metadata")
-		fmt.Println("        - dot: Graphviz DOT format (render with: dot -Tpng file.dot -o graph.png)")
-		fmt.Println("        - mermaid: Mermaid diagram format (paste into GitHub/markdown)")
-		fmt.Println("      Options:")
-		fmt.Println("        --label LABEL: Filter to issues with specific label")
-		fmt.Println("        --graph-root ID: Extract subgraph starting from root issue")
-		fmt.Println("        --graph-depth N: Limit subgraph depth (0 = unlimited)")
-		fmt.Println("      Fields: format, graph (string for dot/mermaid), nodes, edges, filters_applied, explanation")
-		fmt.Println("      Example: bv --robot-graph --graph-format=dot --label=api > api-deps.dot")
-		fmt.Println("")
-		fmt.Println("  --export-graph <path.png|path.svg> [--graph-style=force|grid] [--graph-preset=compact|roomy]")
-		fmt.Println("      Export dependency graph as PNG or SVG image (pure Go, no external dependencies).")
-		fmt.Println("      Format is inferred from file extension (.png or .svg).")
-		fmt.Println("")
-		fmt.Println("      Styles:")
-		fmt.Println("        --graph-style=force (default): Beautiful force-directed layout")
-		fmt.Println("          - Physics-based positioning (Fruchterman-Reingold algorithm)")
-		fmt.Println("          - Dark Dracula-inspired theme with vibrant status colors")
-		fmt.Println("          - Curved bezier edges with glow effects")
-		fmt.Println("          - Node size reflects importance (PageRank + betweenness)")
-		fmt.Println("          - Priority badges, drop shadows, gradients")
-		fmt.Println("")
-		fmt.Println("        --graph-style=grid: Simple hierarchical grid layout")
-		fmt.Println("          - Nodes arranged by critical path depth")
-		fmt.Println("          - Light theme with pastel colors")
-		fmt.Println("")
-		fmt.Println("      Options:")
-		fmt.Println("        --label LABEL: Filter to issues with specific label")
-		fmt.Println("        --graph-preset: Layout spacing - 'compact' (default) or 'roomy'")
-		fmt.Println("        --graph-title: Custom title for the graph header")
-		fmt.Println("")
-		fmt.Println("      Example: bv --export-graph deps.svg --label=api --graph-title='API Dependencies'")
-		fmt.Println("      Example: bv --export-graph full.png --graph-style=force --graph-preset=roomy")
-		fmt.Println("")
-		fmt.Println("  --robot-insights")
-		fmt.Println("      Graph metrics JSON for agents.")
-		fmt.Println("      Top lists: Bottlenecks (betweenness), Keystones (critical path), Influencers (eigenvector),")
-		fmt.Println("                 Cores (k-core), Articulation points (cut vertices), Slack (parallelism headroom).")
-		fmt.Println("      Full maps (capped by BV_INSIGHTS_MAP_LIMIT): pagerank, betweenness, eigenvector, hubs/authorities, core_number, slack.")
-		fmt.Println("      status captures per-metric state: computed|approx|timeout|skipped with elapsed_ms and reasons.")
-		fmt.Println("      Shared fields: data_hash, analysis_config.")
-		fmt.Println("      Quick jq: jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]'   # top k-core nodes")
-		fmt.Println("                 jq '.Articulation'                                                  # structural cut points")
-		fmt.Println("                 jq '.Slack[:5]'                                                     # highest slack (parallel-friendly)")
-		fmt.Println("      advanced_insights: Canonical structure for advanced graph features:")
-		fmt.Println("        - topk_set: Best k issues for maximum downstream unlock (status: pending)")
-		fmt.Println("        - coverage_set: Minimal set covering all critical paths (status: pending)")
-		fmt.Println("        - k_paths: K-shortest critical paths through the graph (status: pending)")
-		fmt.Println("        - parallel_cut: Suggestions for maximizing parallel work (status: pending)")
-		fmt.Println("        - parallel_gain: Parallelization metrics for recommendations (status: pending)")
-		fmt.Println("        - cycle_break: Suggestions for breaking cycles with minimal impact (status: available)")
-		fmt.Println("        Per-feature: status (available|pending|skipped|error), items, usage hints")
-		fmt.Println("        Config: caps for deterministic output (topk<=5, paths<=5, path_len<=50, etc.)")
-		fmt.Println("        Quick jq: jq '.advanced_insights.cycle_break'   # cycle break suggestions")
-		fmt.Println("")
-		fmt.Println("  --robot-plan")
-		fmt.Println("      Execution tracks grouped for parallel work. Includes data_hash, analysis_config, status.")
-		fmt.Println("      plan.tracks[].items[].unblocks shows what completes next; summary.highest_impact surfaces best unblocker.")
-		fmt.Println("")
-		fmt.Println("  --robot-priority")
-		fmt.Println("      Priority recommendations with explanations. Includes data_hash, analysis_config, status.")
-		fmt.Println("      recommendation fields: id, current_priority, suggested_priority, impact_score, confidence, reasoning[].")
-		fmt.Println("      explanation.what_if: impact of completing (direct_unblocks, transitive_unblocks, estimated_days_saved).")
-		fmt.Println("      explanation.top_reasons: top 3 factors (pagerank, betweenness, blockers, staleness, etc.).")
-		fmt.Println("")
-		fmt.Println("  Robot Output Filters (bv-84):")
-		fmt.Println("      --robot-min-confidence 0.6    Filter by minimum confidence (0.0-1.0)")
-		fmt.Println("      --robot-max-results 5         Limit to top N results")
-		fmt.Println("      --robot-by-label bug          Filter by label (exact match)")
-		fmt.Println("      --robot-by-assignee alice     Filter by assignee (exact match)")
-		fmt.Println("")
-		fmt.Println("  Label Subgraph Scoping (bv-122):")
-		fmt.Println("      --label LABEL                 Scope analysis to label's subgraph")
-		fmt.Println("      Affects: --robot-insights, --robot-plan, --robot-priority")
-		fmt.Println("      Filters issues to those with the label, then runs analysis on subgraph.")
-		fmt.Println("      Includes label_scope and label_context in output with health metrics.")
-		fmt.Println("      Example: bv --robot-insights --label api")
-		fmt.Println("")
-		fmt.Println("  --robot-triage / --robot-next")
-		fmt.Println("      Unified triage (mega command) or single top pick. QuickRef includes top picks, quick_wins, blockers_to_clear.")
-		fmt.Println("")
-		fmt.Println("  --recipe NAME, -r NAME")
-		fmt.Println("      Apply a named recipe to filter and sort issues.")
-		fmt.Println("      Example: bv --recipe actionable")
-		fmt.Println("      Built-in recipes: default, actionable, recent, blocked, high-impact, stale,")
-		fmt.Println("                        triage, closed, release-cut, quick-wins, bottlenecks")
-		fmt.Println("")
-		fmt.Println("  --profile-startup")
-		fmt.Println("      Outputs detailed startup timing profile for diagnostics.")
-		fmt.Println("      Shows Phase 1 (blocking) and Phase 2 (async) breakdown.")
-		fmt.Println("      Provides recommendations based on timing analysis.")
-		fmt.Println("      Use with --profile-json for machine-readable output.")
-		fmt.Println("")
-		fmt.Println("  --workspace CONFIG")
-		fmt.Println("      Load issues from workspace configuration file.")
-		fmt.Println("      Path: typically .bv/workspace.yaml")
-		fmt.Println("      Aggregates issues from multiple repositories with namespaced IDs.")
-		fmt.Println("      Example: bv --workspace .bv/workspace.yaml")
-		fmt.Println("")
-		fmt.Println("  --repo PREFIX")
-		fmt.Println("      Filter issues by repository prefix.")
-		fmt.Println("      Use with --workspace to focus on one repo in a multi-repo view.")
-		fmt.Println("      Matches ID prefixes like 'api-', 'web-', or partial 'api'.")
-		fmt.Println("      Example: bv --workspace .bv/workspace.yaml --repo api")
-		fmt.Println("")
-		fmt.Println("  --save-baseline \"description\"")
-		fmt.Println("      Save current metrics as a baseline snapshot.")
-		fmt.Println("      Stores graph stats, top metrics, and cycle info in .bv/baseline.json.")
-		fmt.Println("      Use for drift detection: compare current state to saved baseline.")
-		fmt.Println("      Example: bv --save-baseline \"Before major refactor\"")
-		fmt.Println("")
-		fmt.Println("  --baseline-info")
-		fmt.Println("      Show information about the saved baseline.")
-		fmt.Println("      Displays: creation date, git commit, graph stats, top metrics.")
-		fmt.Println("")
-		fmt.Println("  --check-drift")
-		fmt.Println("      Check current metrics against saved baseline for drift.")
-		fmt.Println("      Exit codes for CI integration:")
-		fmt.Println("        0 = No critical or warning alerts (info-only OK)")
-		fmt.Println("        1 = Critical alerts (new cycles detected)")
-		fmt.Println("        2 = Warning alerts (blocked increase, density growth)")
-		fmt.Println("      Human-readable output by default, use --robot-drift for JSON.")
-		fmt.Println("")
-		fmt.Println("  --robot-drift")
-		fmt.Println("      Output drift check as JSON (use with --check-drift).")
-		fmt.Println("      Output: {has_drift, exit_code, summary, alerts, baseline}")
-		fmt.Println("")
-		fmt.Println("  Static Site Export & GitHub Pages (bv-7pu):")
-		fmt.Println("      --pages")
-		fmt.Println("          Launch interactive Pages deployment wizard.")
-		fmt.Println("          Guides you through export -> preview -> deploy to GitHub Pages.")
-		fmt.Println("          Handles gh CLI authentication and repository creation.")
-		fmt.Println("")
-		fmt.Println("      --export-pages <dir>")
-		fmt.Println("          Export static HTML site to directory.")
-		fmt.Println("          Creates self-contained bundle viewable in any browser.")
-		fmt.Println("          Output: index.html, beads.sqlite3, data/*.json, viewer assets")
-		fmt.Println("          Example: bv --export-pages ./bv-pages")
-		fmt.Println("")
-		fmt.Println("      --preview-pages <dir>")
-		fmt.Println("          Start local server to preview existing export.")
-		fmt.Println("          Opens http://localhost:9000 (or next available port) in your browser.")
-		fmt.Println("          Live-reload is enabled by default: browser auto-refreshes on file changes.")
-		fmt.Println("          Example: bv --preview-pages ./bv-pages")
-		fmt.Println("")
-		fmt.Println("      --no-live-reload")
-		fmt.Println("          Disable live-reload for --preview-pages (default: live-reload is enabled).")
-		fmt.Println("")
-		fmt.Println("      --pages-title <title>")
-		fmt.Println("          Custom title for the static site (default: 'Project Issues')")
-		fmt.Println("")
-		fmt.Println("      --pages-include-closed=false")
-		fmt.Println("          Exclude closed issues from export (default: include all)")
-		fmt.Println("")
-		fmt.Println("  Database Path Configuration:")
-		fmt.Println("      --db <path>")
-		fmt.Println("          Specify path to beads database file or .beads directory.")
-		fmt.Println("          Accepts a .beads/ directory, a beads.jsonl file, or a beads.db file.")
-		fmt.Println("          Overrides all environment variables.")
-		fmt.Println("          Example: bv --db /path/to/repo/.beads --robot-triage")
-		fmt.Println("          Example: bv --db /path/to/.beads/beads.jsonl --robot-next")
-		fmt.Println("")
-		fmt.Println("      Environment variables (in priority order):")
-		fmt.Println("        BEADS_DB   - Path to beads database file or .beads directory")
-		fmt.Println("        BEADS_DIR  - Path to .beads directory (existing, lower priority)")
-		fmt.Println("")
-		fmt.Println("      Resolution priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery")
-		fmt.Println("")
-		fmt.Println("  Drift Detection Configuration (.bv/drift.yaml)")
-		fmt.Println("      Customize drift detection thresholds:")
-		fmt.Println("      - density_warning_pct: 50    # Warn if density +50%")
-		fmt.Println("      - blocked_increase_threshold: 5   # Warn if 5+ more blocked")
-		fmt.Println("      Run 'bv --baseline-info' to see current baseline state.")
-		os.Exit(0)
-	}
-
-	if *versionFlag {
-		fmt.Printf("bv %s\n", version.Version)
-		os.Exit(0)
-	}
-
-	// Handle --check-update (bv-182)
-	if *checkUpdateFlag {
-		available, newVersion, releaseURL, err := updater.CheckUpdateAvailable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
-			os.Exit(1)
-		}
-		if available {
-			fmt.Printf("New version available: %s (current: %s)\n", newVersion, version.Version)
-			fmt.Printf("Download: %s\n", releaseURL)
-			fmt.Println("\nRun 'bv --update' to update automatically")
-		} else {
-			fmt.Printf("bv is up to date (version %s)\n", version.Version)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --update (bv-182)
-	if *updateFlag {
-		release, err := updater.GetLatestRelease()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error fetching release info: %v\n", err)
+		if err := validateExclusivePrimaryCommands(flag.CommandLine, primaryRobotCommandGroups); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Check if update is needed
-		available, newVersion, _, _ := updater.CheckUpdateAvailable()
-		if !available {
-			fmt.Printf("bv is already up to date (version %s)\n", version.Version)
-			os.Exit(0)
-		}
-
-		// Confirm unless --yes is provided
-		if !*yesFlag {
-			fmt.Printf("Update bv from %s to %s? [Y/n]: ", version.Version, newVersion)
-			var response string
-			fmt.Scanln(&response)
-			response = strings.ToLower(strings.TrimSpace(response))
-			if response != "" && response != "y" && response != "yes" {
-				fmt.Println("Update cancelled")
-				os.Exit(0)
-			}
-		}
-
-		result, err := updater.PerformUpdate(release, *yesFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
-			if result != nil && result.BackupPath != "" {
-				fmt.Fprintf(os.Stderr, "Backup preserved at: %s\n", result.BackupPath)
-			}
-			os.Exit(1)
-		}
-
-		fmt.Println(result.Message)
-		if result.BackupPath != "" {
-			fmt.Printf("Backup saved to: %s\n", result.BackupPath)
-			fmt.Println("Run 'bv --rollback' to restore if needed")
-		}
-		os.Exit(0)
-	}
-
-	// Handle --rollback (bv-182)
-	if *rollbackFlag {
-		if err := updater.Rollback(); err != nil {
-			fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --agents-* commands (bv-105)
-	agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck
-	agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
-	if agentsAnyFlag {
-		workDir, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Default to check mode when no explicit action
-		isCheck := !*agentsAdd && !*agentsRemove && !*agentsUpdate
-
-		detection := agents.DetectAgentFileInParents(workDir, 3)
-
-		if robotMode {
-			// JSON output for AI agents
-			result := map[string]interface{}{
-				"found":            detection.Found(),
-				"file_path":        detection.FilePath,
-				"file_type":        detection.FileType,
-				"has_blurb":        detection.HasBlurb,
-				"has_legacy_blurb": detection.HasLegacyBlurb,
-				"blurb_version":    detection.BlurbVersion,
-				"current_version":  agents.BlurbVersion,
-				"needs_blurb":      detection.Found() && detection.NeedsBlurb(),
-				"needs_upgrade":    detection.NeedsUpgrade(),
-			}
-			data, _ := json.MarshalIndent(result, "", "  ")
-			fmt.Println(string(data))
-			os.Exit(0)
-		}
-
-		if isCheck || *agentsCheck {
-			// Check mode: report status
-			if !detection.Found() {
-				fmt.Printf("No agent file found (searched up to 3 parent directories from %s)\n", workDir)
-				fmt.Println("Run 'bv --agents-add' to create AGENTS.md with beads workflow instructions.")
-				os.Exit(0)
-			}
-			if detection.HasLegacyBlurb {
-				fmt.Printf("Found %s at %s (legacy blurb — needs upgrade)\n", detection.FileType, detection.FilePath)
-				fmt.Println("Run 'bv --agents-update' to upgrade to the current format.")
-				os.Exit(0)
-			}
-			if detection.HasBlurb && detection.BlurbVersion < agents.BlurbVersion {
-				fmt.Printf("Found %s at %s (blurb v%d, current v%d — needs update)\n",
-					detection.FileType, detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
-				fmt.Println("Run 'bv --agents-update' to update to the latest version.")
-				os.Exit(0)
-			}
-			if detection.HasBlurb {
-				fmt.Printf("Found %s at %s (blurb v%d — up to date)\n",
-					detection.FileType, detection.FilePath, detection.BlurbVersion)
-				os.Exit(0)
-			}
-			// File exists but no blurb
-			fmt.Printf("Found %s at %s (no beads workflow instructions)\n", detection.FileType, detection.FilePath)
-			fmt.Println("Run 'bv --agents-add' to add beads workflow instructions.")
-			os.Exit(0)
-		}
-
-		if *agentsAdd {
-			if detection.Found() && detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
-				fmt.Printf("%s already has current blurb (v%d) — no action needed.\n", detection.FilePath, detection.BlurbVersion)
-				os.Exit(0)
-			}
-			if detection.Found() && (detection.HasLegacyBlurb || (detection.HasBlurb && detection.BlurbVersion < agents.BlurbVersion)) {
-				fmt.Println("Existing blurb found but outdated. Use --agents-update instead.")
-				os.Exit(1)
-			}
-
-			targetPath := detection.FilePath
-			creating := false
-			if !detection.Found() {
-				targetPath = agents.GetPreferredAgentFilePath(workDir)
-				creating = true
-			}
-
-			if *agentsDryRun {
-				if creating {
-					fmt.Printf("[dry-run] Would create %s with beads workflow instructions.\n", targetPath)
-				} else {
-					fmt.Printf("[dry-run] Would append beads workflow instructions to %s.\n", targetPath)
-				}
-				os.Exit(0)
-			}
-
-			if !*agentsForce {
-				action := "Append blurb to"
-				if creating {
-					action = "Create"
-				}
-				fmt.Printf("%s %s? [Y/n]: ", action, targetPath)
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.ToLower(strings.TrimSpace(response))
-				if response != "" && response != "y" && response != "yes" {
-					fmt.Println("Cancelled.")
-					os.Exit(0)
-				}
-			}
-
-			if creating {
-				if err := agents.CreateAgentFile(targetPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating agent file: %v\n", err)
-					os.Exit(1)
-				}
-				fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
-			} else {
-				if err := agents.AppendBlurbToFile(targetPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error appending blurb: %v\n", err)
-					os.Exit(1)
-				}
-				fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
-			}
-
-			ok, _ := agents.VerifyBlurbPresent(targetPath)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
-
-		if *agentsUpdate {
-			if !detection.Found() {
-				fmt.Println("No agent file found. Use --agents-add to create one.")
-				os.Exit(1)
-			}
-			if !detection.HasBlurb && !detection.HasLegacyBlurb {
-				fmt.Printf("%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
-				os.Exit(1)
-			}
-			if detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
-				fmt.Printf("%s already has current blurb (v%d) — no update needed.\n", detection.FilePath, detection.BlurbVersion)
-				os.Exit(0)
-			}
-
-			if *agentsDryRun {
-				if detection.HasLegacyBlurb {
-					fmt.Printf("[dry-run] Would upgrade legacy blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
-				} else {
-					fmt.Printf("[dry-run] Would update blurb from v%d to v%d in %s.\n",
-						detection.BlurbVersion, agents.BlurbVersion, detection.FilePath)
-				}
-				os.Exit(0)
-			}
-
-			if !*agentsForce {
-				fmt.Printf("Update blurb in %s? [Y/n]: ", detection.FilePath)
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.ToLower(strings.TrimSpace(response))
-				if response != "" && response != "y" && response != "yes" {
-					fmt.Println("Cancelled.")
-					os.Exit(0)
-				}
-			}
-
-			if err := agents.UpdateBlurbInFile(detection.FilePath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error updating blurb: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
-
-			ok, _ := agents.VerifyBlurbPresent(detection.FilePath)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
-
-		if *agentsRemove {
-			if !detection.Found() {
-				fmt.Println("No agent file found — nothing to remove.")
-				os.Exit(0)
-			}
-			if !detection.HasBlurb && !detection.HasLegacyBlurb {
-				fmt.Printf("%s has no blurb — nothing to remove.\n", detection.FilePath)
-				os.Exit(0)
-			}
-
-			if *agentsDryRun {
-				fmt.Printf("[dry-run] Would remove blurb from %s.\n", detection.FilePath)
-				os.Exit(0)
-			}
-
-			if !*agentsForce {
-				fmt.Printf("Remove blurb from %s? [Y/n]: ", detection.FilePath)
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.ToLower(strings.TrimSpace(response))
-				if response != "" && response != "y" && response != "yes" {
-					fmt.Println("Cancelled.")
-					os.Exit(0)
-				}
-			}
-
-			if err := agents.RemoveBlurbFromFile(detection.FilePath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error removing blurb: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Removed blurb from %s.\n", detection.FilePath)
-			os.Exit(0)
-		}
-	}
-
-	// Handle feedback commands (bv-90)
-	if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		feedback, err := analysis.LoadFeedback(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
-			os.Exit(1)
-		}
-
-		if *feedbackReset {
-			feedback.Reset()
-			if err := feedback.Save(beadsDir); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("Feedback data reset to defaults.")
-			os.Exit(0)
-		}
-
-		if *feedbackShow {
-			feedbackJSON := feedback.ToJSON()
-			data, _ := json.MarshalIndent(feedbackJSON, "", "  ")
-			fmt.Println(string(data))
-			os.Exit(0)
-		}
-
-		// For accept/ignore, we need to get the issue's score breakdown
-		if *feedbackAccept != "" || *feedbackIgnore != "" {
-			issueID := *feedbackAccept
-			action := "accept"
-			if *feedbackIgnore != "" {
-				issueID = *feedbackIgnore
-				action = "ignore"
-			}
-
-			// Load issues to get score breakdown
-			issues, err := datasource.LoadIssues("")
+		// CPU profiling support
+		if *cpuProfile != "" {
+			f, err := os.Create(*cpuProfile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Could not create CPU profile: %v\n", err)
 				os.Exit(1)
 			}
-
-			// Find the issue
-			var foundIssue *model.Issue
-			for i := range issues {
-				if issues[i].ID == issueID {
-					foundIssue = &issues[i]
-					break
-				}
-			}
-
-			if foundIssue == nil {
-				fmt.Fprintf(os.Stderr, "Issue not found: %s\n", issueID)
+			defer f.Close()
+			if err := pprof.StartCPUProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "Could not start CPU profile: %v\n", err)
 				os.Exit(1)
 			}
+			defer pprof.StopCPUProfile()
+		}
 
-			// Compute impact score for the issue to get breakdown
-			an := analysis.NewAnalyzer(issues)
-			scores := an.ComputeImpactScores()
-
-			var score float64
-			var breakdown analysis.ScoreBreakdown
-			for _, s := range scores {
-				if s.IssueID == issueID {
-					score = s.Score
-					breakdown = s.Breakdown
-					break
-				}
-			}
-
-			if err := feedback.RecordFeedback(issueID, action, score, breakdown); err != nil {
-				fmt.Fprintf(os.Stderr, "Error recording feedback: %v\n", err)
+		// Apply --db flag: set BEADS_DB env var so all downstream code respects it.
+		// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
+		if *dbPath != "" {
+			absDB, err := filepath.Abs(*dbPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
 				os.Exit(1)
 			}
+			os.Setenv(loader.BeadsDBEnvVar, absDB)
+		}
 
-			if err := feedback.Save(beadsDir); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+		// Apply --no-cache flag: set BV_NO_CACHE=1 so disk cache is bypassed.
+		if *noCache {
+			os.Setenv("BV_NO_CACHE", "1")
+		}
+
+		// Ensure static export flags are retained even when build tags strip features in some environments.
+		_ = exportPages
+		_ = pagesTitle
+		_ = pagesIncludeClosed
+		_ = pagesIncludeHistory
+		_ = previewPages
+		_ = previewNoLiveReload
+		_ = pagesWizard
+		_ = watchExport
+		_ = debugRender
+		_ = debugWidth
+		_ = debugHeight
+		_ = robotForecast
+		_ = forecastLabel
+		_ = forecastSprint
+		_ = forecastAgents
+		_ = robotCapacity
+		_ = capacityAgents
+		_ = capacityLabel
+		_ = labelScope
+		_ = agentBrief
+
+		envRobot := os.Getenv("BV_ROBOT") == "1"
+		stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
+
+		robotMode := envRobot ||
+			*robotHelp ||
+			*robotInsights ||
+			*robotPlan ||
+			*robotPriority ||
+			*robotTriage ||
+			*robotTriageByTrack ||
+			*robotTriageByLabel ||
+			*robotNext ||
+			*robotDiff ||
+			*robotRecipes ||
+			*robotLabelHealth ||
+			*robotLabelFlow ||
+			*robotLabelAttention ||
+			*robotAlerts ||
+			*robotMetrics ||
+			*robotSchema ||
+			*robotSuggest ||
+			*robotGraph ||
+			*robotSearch ||
+			*robotDriftCheck ||
+			*robotHistory ||
+			*robotFileBeads != "" ||
+			*fileHotspots ||
+			*robotImpact != "" ||
+			*robotFileRelations != "" ||
+			*robotRelatedWork != "" ||
+			*robotBlockerChain != "" ||
+			*robotImpactNetwork != "" ||
+			*robotCausality != "" ||
+			*robotOrphans ||
+			*robotExplainCorrelation != "" ||
+			*robotConfirmCorrelation != "" ||
+			*robotRejectCorrelation != "" ||
+			*robotCorrelationStats ||
+			*robotSprintList ||
+			*robotSprintShow != "" ||
+			*robotForecast != "" ||
+			*robotBurndown != "" ||
+			*robotCapacity ||
+			*robotDocs != "" ||
+			// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
+			// as robot mode early so parsers keep stdout JSON clean.
+			(*diffSince != "" && !stdoutIsTTY)
+
+		// Mark robot mode for downstream packages (e.g., parsers) to keep stdout JSON clean.
+		if robotMode && !envRobot {
+			_ = os.Setenv("BV_ROBOT", "1")
+			envRobot = true
+		}
+
+		// Structured output format for --robot-* commands.
+		robotOutputFormat = resolveRobotOutputFormat(*outputFormat)
+		robotToonEncodeOptions = resolveToonEncodeOptionsFromEnv()
+		robotShowToonStats = *toonStats || strings.TrimSpace(os.Getenv("TOON_STATS")) == "1"
+		if robotOutputFormat != "json" && robotOutputFormat != "toon" {
+			fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
+			os.Exit(2)
+		}
+
+		robotDispatchContext := RobotContext{
+			Stdout:  os.Stdout,
+			Stderr:  os.Stderr,
+			Encoder: newRobotEncoder(os.Stdout),
+		}
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-help", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "version", robotDispatchContext)
+
+		// Handle --check-update (bv-182)
+		if *checkUpdateFlag {
+			available, newVersion, releaseURL, err := updater.CheckUpdateAvailable()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
 				os.Exit(1)
 			}
-
-			fmt.Printf("Recorded %s feedback for %s (score: %.3f)\n", action, issueID, score)
-			fmt.Println(feedback.Summary())
+			if available {
+				fmt.Printf("New version available: %s (current: %s)\n", newVersion, version.Version)
+				fmt.Printf("Download: %s\n", releaseURL)
+				fmt.Println("\nRun 'bv --update' to update automatically")
+			} else {
+				fmt.Printf("bv is up to date (version %s)\n", version.Version)
+			}
 			os.Exit(0)
 		}
-	}
 
-	// Load recipes (needed for both --robot-recipes and --recipe)
-	recipeLoader, err := recipe.LoadDefault()
-	if err != nil {
-		if !envRobot {
-			fmt.Fprintf(os.Stderr, "Warning: Error loading recipes: %v\n", err)
-		}
-		// Create empty loader to continue
-		recipeLoader = recipe.NewLoader()
-	}
+		// Handle --update (bv-182)
+		if *updateFlag {
+			release, err := updater.GetLatestRelease()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error fetching release info: %v\n", err)
+				os.Exit(1)
+			}
 
-	// Handle --robot-recipes (before loading issues)
-	if *robotRecipes {
-		summaries := recipeLoader.ListSummaries()
-		// Sort by name for consistent output
-		sort.Slice(summaries, func(i, j int) bool {
-			return summaries[i].Name < summaries[j].Name
-		})
+			// Check if update is needed
+			available, newVersion, _, _ := updater.CheckUpdateAvailable()
+			if !available {
+				fmt.Printf("bv is already up to date (version %s)\n", version.Version)
+				os.Exit(0)
+			}
 
-		output := struct {
-			Recipes []recipe.RecipeSummary `json:"recipes"`
-		}{
-			Recipes: summaries,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding recipes: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-schema (bd-2kxo)
-	if *robotSchema {
-		schemas := generateRobotSchemas()
-
-		// Filter to specific command if requested
-		if *schemaCommand != "" {
-			if schema, ok := schemas.Commands[*schemaCommand]; ok {
-				singleOutput := map[string]interface{}{
-					"schema_version": schemas.SchemaVersion,
-					"generated_at":   schemas.GeneratedAt,
-					"command":        *schemaCommand,
-					"schema":         schema,
+			// Confirm unless --yes is provided
+			if !*yesFlag {
+				fmt.Printf("Update bv from %s to %s? [Y/n]: ", version.Version, newVersion)
+				var response string
+				fmt.Scanln(&response)
+				response = strings.ToLower(strings.TrimSpace(response))
+				if response != "" && response != "y" && response != "yes" {
+					fmt.Println("Update cancelled")
+					os.Exit(0)
 				}
-				encoder := newRobotEncoder(os.Stdout)
-				if err := encoder.Encode(singleOutput); err != nil {
-					fmt.Fprintf(os.Stderr, "Error encoding schema: %v\n", err)
+			}
+
+			result, err := updater.PerformUpdate(release, *yesFlag)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
+				if result != nil && result.BackupPath != "" {
+					fmt.Fprintf(os.Stderr, "Backup preserved at: %s\n", result.BackupPath)
+				}
+				os.Exit(1)
+			}
+
+			fmt.Println(result.Message)
+			if result.BackupPath != "" {
+				fmt.Printf("Backup saved to: %s\n", result.BackupPath)
+				fmt.Println("Run 'bv --rollback' to restore if needed")
+			}
+			os.Exit(0)
+		}
+
+		// Handle --rollback (bv-182)
+		if *rollbackFlag {
+			if err := updater.Rollback(); err != nil {
+				fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		// Handle --agents-* commands (bv-105)
+		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck
+		agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
+		if agentsAnyFlag {
+			workDir, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Default to check mode when no explicit action
+			isCheck := !*agentsAdd && !*agentsRemove && !*agentsUpdate
+
+			detection := agents.DetectAgentFileInParents(workDir, 3)
+
+			if robotMode {
+				// JSON output for AI agents
+				result := map[string]interface{}{
+					"found":            detection.Found(),
+					"file_path":        detection.FilePath,
+					"file_type":        detection.FileType,
+					"has_blurb":        detection.HasBlurb,
+					"has_legacy_blurb": detection.HasLegacyBlurb,
+					"blurb_version":    detection.BlurbVersion,
+					"current_version":  agents.BlurbVersion,
+					"needs_blurb":      detection.Found() && detection.NeedsBlurb(),
+					"needs_upgrade":    detection.NeedsUpgrade(),
+				}
+				data, _ := json.MarshalIndent(result, "", "  ")
+				fmt.Println(string(data))
+				os.Exit(0)
+			}
+
+			if isCheck || *agentsCheck {
+				// Check mode: report status
+				if !detection.Found() {
+					fmt.Printf("No agent file found (searched up to 3 parent directories from %s)\n", workDir)
+					fmt.Println("Run 'bv --agents-add' to create AGENTS.md with beads workflow instructions.")
+					os.Exit(0)
+				}
+				if detection.HasLegacyBlurb {
+					fmt.Printf("Found %s at %s (legacy blurb — needs upgrade)\n", detection.FileType, detection.FilePath)
+					fmt.Println("Run 'bv --agents-update' to upgrade to the current format.")
+					os.Exit(0)
+				}
+				if detection.HasBlurb && detection.BlurbVersion < agents.BlurbVersion {
+					fmt.Printf("Found %s at %s (blurb v%d, current v%d — needs update)\n",
+						detection.FileType, detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
+					fmt.Println("Run 'bv --agents-update' to update to the latest version.")
+					os.Exit(0)
+				}
+				if detection.HasBlurb {
+					fmt.Printf("Found %s at %s (blurb v%d — up to date)\n",
+						detection.FileType, detection.FilePath, detection.BlurbVersion)
+					os.Exit(0)
+				}
+				// File exists but no blurb
+				fmt.Printf("Found %s at %s (no beads workflow instructions)\n", detection.FileType, detection.FilePath)
+				fmt.Println("Run 'bv --agents-add' to add beads workflow instructions.")
+				os.Exit(0)
+			}
+
+			if *agentsAdd {
+				if detection.Found() && detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
+					fmt.Printf("%s already has current blurb (v%d) — no action needed.\n", detection.FilePath, detection.BlurbVersion)
+					os.Exit(0)
+				}
+				if detection.Found() && (detection.HasLegacyBlurb || (detection.HasBlurb && detection.BlurbVersion < agents.BlurbVersion)) {
+					fmt.Println("Existing blurb found but outdated. Use --agents-update instead.")
+					os.Exit(1)
+				}
+
+				targetPath := detection.FilePath
+				creating := false
+				if !detection.Found() {
+					targetPath = agents.GetPreferredAgentFilePath(workDir)
+					creating = true
+				}
+
+				if *agentsDryRun {
+					if creating {
+						fmt.Printf("[dry-run] Would create %s with beads workflow instructions.\n", targetPath)
+					} else {
+						fmt.Printf("[dry-run] Would append beads workflow instructions to %s.\n", targetPath)
+					}
+					os.Exit(0)
+				}
+
+				if !*agentsForce {
+					action := "Append blurb to"
+					if creating {
+						action = "Create"
+					}
+					fmt.Printf("%s %s? [Y/n]: ", action, targetPath)
+					reader := bufio.NewReader(os.Stdin)
+					response, _ := reader.ReadString('\n')
+					response = strings.ToLower(strings.TrimSpace(response))
+					if response != "" && response != "y" && response != "yes" {
+						fmt.Println("Cancelled.")
+						os.Exit(0)
+					}
+				}
+
+				if creating {
+					if err := agents.CreateAgentFile(targetPath); err != nil {
+						fmt.Fprintf(os.Stderr, "Error creating agent file: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
+				} else {
+					if err := agents.AppendBlurbToFile(targetPath); err != nil {
+						fmt.Fprintf(os.Stderr, "Error appending blurb: %v\n", err)
+						os.Exit(1)
+					}
+					fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
+				}
+
+				ok, _ := agents.VerifyBlurbPresent(targetPath)
+				if !ok {
+					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
 					os.Exit(1)
 				}
 				os.Exit(0)
 			}
-			fmt.Fprintf(os.Stderr, "Unknown command: %s\n", *schemaCommand)
-			fmt.Fprintln(os.Stderr, "Available commands:")
-			for cmd := range schemas.Commands {
-				fmt.Fprintf(os.Stderr, "  %s\n", cmd)
+
+			if *agentsUpdate {
+				if !detection.Found() {
+					fmt.Println("No agent file found. Use --agents-add to create one.")
+					os.Exit(1)
+				}
+				if !detection.HasBlurb && !detection.HasLegacyBlurb {
+					fmt.Printf("%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
+					os.Exit(1)
+				}
+				if detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
+					fmt.Printf("%s already has current blurb (v%d) — no update needed.\n", detection.FilePath, detection.BlurbVersion)
+					os.Exit(0)
+				}
+
+				if *agentsDryRun {
+					if detection.HasLegacyBlurb {
+						fmt.Printf("[dry-run] Would upgrade legacy blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
+					} else {
+						fmt.Printf("[dry-run] Would update blurb from v%d to v%d in %s.\n",
+							detection.BlurbVersion, agents.BlurbVersion, detection.FilePath)
+					}
+					os.Exit(0)
+				}
+
+				if !*agentsForce {
+					fmt.Printf("Update blurb in %s? [Y/n]: ", detection.FilePath)
+					reader := bufio.NewReader(os.Stdin)
+					response, _ := reader.ReadString('\n')
+					response = strings.ToLower(strings.TrimSpace(response))
+					if response != "" && response != "y" && response != "yes" {
+						fmt.Println("Cancelled.")
+						os.Exit(0)
+					}
+				}
+
+				if err := agents.UpdateBlurbInFile(detection.FilePath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error updating blurb: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
+
+				ok, _ := agents.VerifyBlurbPresent(detection.FilePath)
+				if !ok {
+					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
+					os.Exit(1)
+				}
+				os.Exit(0)
 			}
-			os.Exit(1)
-		}
 
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(schemas); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding schemas: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
+			if *agentsRemove {
+				if !detection.Found() {
+					fmt.Println("No agent file found — nothing to remove.")
+					os.Exit(0)
+				}
+				if !detection.HasBlurb && !detection.HasLegacyBlurb {
+					fmt.Printf("%s has no blurb — nothing to remove.\n", detection.FilePath)
+					os.Exit(0)
+				}
 
-	// Machine-readable robot docs (bd-2v50)
-	if *robotDocs != "" {
-		docs := generateRobotDocs(*robotDocs)
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(docs); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding robot-docs: %v\n", err)
-			os.Exit(1)
-		}
-		if _, hasErr := docs["error"]; hasErr {
-			os.Exit(2) // Invalid arguments per documented exit codes
-		}
-		os.Exit(0)
-	}
+				if *agentsDryRun {
+					fmt.Printf("[dry-run] Would remove blurb from %s.\n", detection.FilePath)
+					os.Exit(0)
+				}
 
-	// Get project directory for baseline operations (moved up to allow info check without loading issues)
-	projectDir, _ := os.Getwd()
-	baselinePath := baseline.DefaultPath(projectDir)
+				if !*agentsForce {
+					fmt.Printf("Remove blurb from %s? [Y/n]: ", detection.FilePath)
+					reader := bufio.NewReader(os.Stdin)
+					response, _ := reader.ReadString('\n')
+					response = strings.ToLower(strings.TrimSpace(response))
+					if response != "" && response != "y" && response != "yes" {
+						fmt.Println("Cancelled.")
+						os.Exit(0)
+					}
+				}
 
-	// Handle --baseline-info
-	if *baselineInfo {
-		if !baseline.Exists(baselinePath) {
-			fmt.Println("No baseline found.")
-			fmt.Println("Create one with: bv --save-baseline \"description\"")
-			os.Exit(0)
-		}
-		bl, err := baseline.Load(baselinePath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading baseline: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Print(bl.Summary())
-		os.Exit(0)
-	}
-
-	// Validate recipe name if provided (before loading issues)
-	var activeRecipe *recipe.Recipe
-	if *recipeName != "" {
-		activeRecipe = recipeLoader.Get(*recipeName)
-		if activeRecipe == nil {
-			fmt.Fprintf(os.Stderr, "Error: Unknown recipe '%s'\n\n", *recipeName)
-			fmt.Fprintln(os.Stderr, "Available recipes:")
-			for _, name := range recipeLoader.Names() {
-				r := recipeLoader.Get(name)
-				fmt.Fprintf(os.Stderr, "  %-15s %s\n", name, r.Description)
+				if err := agents.RemoveBlurbFromFile(detection.FilePath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error removing blurb: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("Removed blurb from %s.\n", detection.FilePath)
+				os.Exit(0)
 			}
-			os.Exit(1)
 		}
-	}
 
-	// Load issues from current directory or workspace (with timing for profile)
-	loadStart := time.Now()
-	var issues []model.Issue
-	var beadsPath string
-	var workspaceInfo *workspace.LoadSummary
-	var asOfResolved string // Resolved commit SHA when using --as-of (for robot output metadata)
+		// Handle feedback commands (bv-90)
+		if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
 
-	if *asOf != "" {
-		// Time-travel mode: load historical issues from git
-		// Note: --as-of takes precedence over --workspace (can't combine historical + multi-repo)
-		if *workspaceConfig != "" {
-			fmt.Fprintf(os.Stderr, "Warning: --workspace is ignored when --as-of is specified\n")
+			feedback, err := analysis.LoadFeedback(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
+				os.Exit(1)
+			}
+
+			if *feedbackReset {
+				feedback.Reset()
+				if err := feedback.Save(beadsDir); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("Feedback data reset to defaults.")
+				os.Exit(0)
+			}
+
+			if *feedbackShow {
+				feedbackJSON := feedback.ToJSON()
+				data, _ := json.MarshalIndent(feedbackJSON, "", "  ")
+				fmt.Println(string(data))
+				os.Exit(0)
+			}
+
+			// For accept/ignore, we need to get the issue's score breakdown
+			if *feedbackAccept != "" || *feedbackIgnore != "" {
+				issueID := *feedbackAccept
+				action := "accept"
+				if *feedbackIgnore != "" {
+					issueID = *feedbackIgnore
+					action = "ignore"
+				}
+
+				// Load issues to get score breakdown
+				issues, err := datasource.LoadIssues("")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Find the issue
+				var foundIssue *model.Issue
+				for i := range issues {
+					if issues[i].ID == issueID {
+						foundIssue = &issues[i]
+						break
+					}
+				}
+
+				if foundIssue == nil {
+					fmt.Fprintf(os.Stderr, "Issue not found: %s\n", issueID)
+					os.Exit(1)
+				}
+
+				// Compute impact score for the issue to get breakdown
+				an := analysis.NewAnalyzer(issues)
+				scores := an.ComputeImpactScores()
+
+				var score float64
+				var breakdown analysis.ScoreBreakdown
+				for _, s := range scores {
+					if s.IssueID == issueID {
+						score = s.Score
+						breakdown = s.Breakdown
+						break
+					}
+				}
+
+				if err := feedback.RecordFeedback(issueID, action, score, breakdown); err != nil {
+					fmt.Fprintf(os.Stderr, "Error recording feedback: %v\n", err)
+					os.Exit(1)
+				}
+
+				if err := feedback.Save(beadsDir); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+					os.Exit(1)
+				}
+
+				fmt.Printf("Recorded %s feedback for %s (score: %.3f)\n", action, issueID, score)
+				fmt.Println(feedback.Summary())
+				os.Exit(0)
+			}
 		}
-		cwd, err := os.Getwd()
+
+		// Load recipes (needed for both --robot-recipes and --recipe)
+		var loadErr error
+		recipeLoader, loadErr = recipe.LoadDefault()
+		if loadErr != nil {
+			if !envRobot {
+				fmt.Fprintf(os.Stderr, "Warning: Error loading recipes: %v\n", loadErr)
+			}
+			// Create empty loader to continue
+			recipeLoader = recipe.NewLoader()
+		}
+
+		// Handle --robot-recipes (before loading issues)
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-recipes", robotDispatchContext)
+
+		// Handle --robot-schema (bd-2kxo)
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-schema", robotDispatchContext)
+
+		// Machine-readable robot docs (bd-2v50)
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-docs", robotDispatchContext)
+
+		// Get project directory for baseline operations (moved up to allow info check without loading issues)
+		projectDir, err := os.Getwd()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
 			os.Exit(1)
 		}
-		gitLoader := loader.NewGitLoader(cwd)
-		issues, err = gitLoader.LoadAt(*asOf)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *asOf, err)
-			os.Exit(1)
-		}
-		// Resolve to commit SHA for metadata
-		asOfResolved, _ = gitLoader.ResolveRevision(*asOf)
-		// No live reload for historical view
-		beadsPath = ""
-		if !envRobot {
-			if asOfResolved != "" {
-				fmt.Fprintf(os.Stderr, "Loaded %d issues from %s (%s)\n", len(issues), *asOf, asOfResolved[:min(7, len(asOfResolved))])
-			} else {
-				fmt.Fprintf(os.Stderr, "Loaded %d issues from %s\n", len(issues), *asOf)
-			}
-		}
-	} else if *workspaceConfig != "" {
-		// Load from workspace configuration
-		loadedIssues, results, err := workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading workspace: %v\n", err)
-			os.Exit(1)
-		}
-		issues = loadedIssues
-		summary := workspace.Summarize(results)
-		workspaceInfo = &summary
+		baselinePath := baseline.DefaultPath(projectDir)
+		robotDispatchContext.WorkDir = projectDir
+		robotDispatchContext.ProjectDir = projectDir
+		robotDispatchContext.BaselinePath = baselinePath
+		robotDispatchContext.EnvRobot = envRobot
 
-		// Print workspace loading summary
-		if summary.FailedRepos > 0 {
-			if !envRobot {
-				fmt.Fprintf(os.Stderr, "Warning: %d repos failed to load\n", summary.FailedRepos)
-				for _, name := range summary.FailedRepoNames {
-					fmt.Fprintf(os.Stderr, "  - %s\n", name)
+		// Handle --baseline-info
+		if *baselineInfo {
+			if !baseline.Exists(baselinePath) {
+				fmt.Println("No baseline found.")
+				fmt.Println("Create one with: bv --save-baseline \"description\"")
+				os.Exit(0)
+			}
+			bl, err := baseline.Load(baselinePath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading baseline: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Print(bl.Summary())
+			os.Exit(0)
+		}
+
+		// Validate recipe name if provided (before loading issues)
+		var activeRecipe *recipe.Recipe
+		if *recipeName != "" {
+			activeRecipe = recipeLoader.Get(*recipeName)
+			if activeRecipe == nil {
+				fmt.Fprintf(os.Stderr, "Error: Unknown recipe '%s'\n\n", *recipeName)
+				fmt.Fprintln(os.Stderr, "Available recipes:")
+				for _, name := range recipeLoader.Names() {
+					r := recipeLoader.Get(name)
+					fmt.Fprintf(os.Stderr, "  %-15s %s\n", name, r.Description)
 				}
-			}
-		}
-		// No live reload for workspace mode (multiple files)
-		beadsPath = ""
-
-		// Automatically ensure .bv/ is in .gitignore at workspace root
-		// Workspace config is typically at .bv/workspace.yaml, so project root is two levels up
-		workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
-		_ = loader.EnsureBVInGitignore(workspaceRoot)
-	} else {
-		// Load from single repo (original behavior)
-		var err error
-		issues, err = datasource.LoadIssues("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'br init'.")
-			os.Exit(1)
-		}
-		// Get beads file path for live reload (respects BEADS_DIR env var)
-		beadsDir, _ := loader.GetBeadsDir("")
-		beadsPath, _ = loader.FindJSONLPath(beadsDir)
-
-		// Automatically ensure .bv/ is in .gitignore to prevent polluting git
-		// with search indexes, baselines, and other bv-specific files.
-		// This is done silently and only in single-repo mode.
-		projectDir := filepath.Dir(beadsDir)
-		_ = loader.EnsureBVInGitignore(projectDir)
-	}
-	loadDuration := time.Since(loadStart)
-
-	// Apply --repo filter if specified
-	if *repoFilter != "" {
-		issues = filterByRepo(issues, *repoFilter)
-	}
-
-	issuesForSearch := issues
-
-	// Stable data hash for robot outputs (after repo filter but before recipes/TUI)
-	dataHash := analysis.ComputeDataHash(issues)
-
-	// Label subgraph scoping (bv-122)
-	// When --label is specified, extract the label's subgraph and use it for all robot analysis.
-	// This includes label health context in the output.
-	var labelScopeContext *analysis.LabelHealth
-	if *labelScope != "" {
-		sg := analysis.ComputeLabelSubgraph(issues, *labelScope)
-		if sg.IssueCount == 0 {
-			if !envRobot {
-				fmt.Fprintf(os.Stderr, "Warning: No issues found with label %q\n", *labelScope)
-			}
-		} else {
-			// Replace issues with the subgraph issues
-			subgraphIssues := make([]model.Issue, 0, len(sg.AllIssues))
-			for _, id := range sg.AllIssues {
-				if iss, ok := sg.IssueMap[id]; ok {
-					subgraphIssues = append(subgraphIssues, iss)
-				}
-			}
-			issues = subgraphIssues
-			// Compute label health for context
-			cfg := analysis.DefaultLabelHealthConfig()
-			allHealth := analysis.ComputeAllLabelHealth(issues, cfg, time.Now().UTC(), nil)
-			for i := range allHealth.Labels {
-				if allHealth.Labels[i].Label == *labelScope {
-					labelScopeContext = &allHealth.Labels[i]
-					break
-				}
-			}
-		}
-	}
-
-	// Apply recipe filtering early for robot modes (bv-93)
-	// This ensures --recipe filters are applied before robot modes exit.
-	// dataHash uses pre-filtered issues for stability.
-	if activeRecipe != nil && (*robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel || *robotPriority || *robotInsights || *robotPlan) {
-		issues = applyRecipeFilters(issues, activeRecipe)
-		issues = applyRecipeSort(issues, activeRecipe)
-	}
-
-	// Handle semantic search CLI (bv-9gf.3)
-	if *robotSearch && *semanticQuery == "" {
-		fmt.Fprintln(os.Stderr, "Error: --robot-search requires --search \"query\"")
-		os.Exit(1)
-	}
-	if *semanticQuery != "" {
-		embedCfg := search.EmbeddingConfigFromEnv()
-		searchCfg, err := search.SearchConfigFromEnv()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		searchCfg, err = applySearchConfigOverrides(searchCfg, *searchMode, *searchPreset, *searchWeights)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		embedder, err := search.NewEmbedderFromConfig(embedCfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		projectDir, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		indexPath := search.DefaultIndexPath(projectDir, embedCfg)
-		idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		docs := search.DocumentsFromIssues(issuesForSearch)
-		if !*robotSearch && !loaded {
-			fmt.Fprintf(os.Stderr, "Building semantic index (%d issues)...\n", len(docs))
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		syncStats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error building semantic index: %v\n", err)
-			os.Exit(1)
-		}
-		if !loaded || syncStats.Changed() {
-			if err := idx.Save(indexPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
 				os.Exit(1)
 			}
 		}
 
-		qvecs, err := embedder.Embed(ctx, []string{*semanticQuery})
-		if err != nil || len(qvecs) != 1 {
-			if err == nil {
-				err = fmt.Errorf("embedder returned %d vectors for query", len(qvecs))
+		// Load issues from current directory or workspace (with timing for profile)
+		loadStart := time.Now()
+		var issues []model.Issue
+		var beadsPath string
+		var workspaceInfo *workspace.LoadSummary
+		var asOfResolved string // Resolved commit SHA when using --as-of (for robot output metadata)
+
+		if *asOf != "" {
+			// Time-travel mode: load historical issues from git
+			// Note: --as-of takes precedence over --workspace (can't combine historical + multi-repo)
+			if *workspaceConfig != "" {
+				fmt.Fprintf(os.Stderr, "Warning: --workspace is ignored when --as-of is specified\n")
 			}
-			fmt.Fprintf(os.Stderr, "Error embedding query: %v\n", err)
-			os.Exit(1)
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+			gitLoader := loader.NewGitLoader(cwd)
+			issues, err = gitLoader.LoadAt(*asOf)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *asOf, err)
+				os.Exit(1)
+			}
+			// Resolve to commit SHA for metadata
+			asOfResolved, _ = gitLoader.ResolveRevision(*asOf)
+			// No live reload for historical view
+			beadsPath = ""
+			if !envRobot {
+				if asOfResolved != "" {
+					fmt.Fprintf(os.Stderr, "Loaded %d issues from %s (%s)\n", len(issues), *asOf, asOfResolved[:min(7, len(asOfResolved))])
+				} else {
+					fmt.Fprintf(os.Stderr, "Loaded %d issues from %s\n", len(issues), *asOf)
+				}
+			}
+		} else if *workspaceConfig != "" {
+			// Load from workspace configuration
+			loadedIssues, results, err := workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading workspace: %v\n", err)
+				os.Exit(1)
+			}
+			issues = loadedIssues
+			summary := workspace.Summarize(results)
+			workspaceInfo = &summary
+
+			// Print workspace loading summary
+			if summary.FailedRepos > 0 {
+				if !envRobot {
+					fmt.Fprintf(os.Stderr, "Warning: %d repos failed to load\n", summary.FailedRepos)
+					for _, name := range summary.FailedRepoNames {
+						fmt.Fprintf(os.Stderr, "  - %s\n", name)
+					}
+				}
+			}
+			// No live reload for workspace mode (multiple files)
+			beadsPath = ""
+
+			// Automatically ensure .bv/ is in .gitignore at workspace root
+			// Workspace config is typically at .bv/workspace.yaml, so project root is two levels up
+			workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
+			_ = loader.EnsureBVInGitignore(workspaceRoot)
+		} else {
+			// Load from single repo (original behavior)
+			var err error
+			issues, err = datasource.LoadIssues("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+				fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'br init'.")
+				os.Exit(1)
+			}
+			// Get beads file path for live reload (respects BEADS_DIR env var)
+			beadsDir, _ := loader.GetBeadsDir("")
+			beadsPath, _ = loader.FindJSONLPath(beadsDir)
+
+			// Automatically ensure .bv/ is in .gitignore to prevent polluting git
+			// with search indexes, baselines, and other bv-specific files.
+			// This is done silently and only in single-repo mode.
+			projectDir := filepath.Dir(beadsDir)
+			_ = loader.EnsureBVInGitignore(projectDir)
+		}
+		loadDuration := time.Since(loadStart)
+
+		// Apply --repo filter if specified
+		if *repoFilter != "" {
+			issues = filterByRepo(issues, *repoFilter)
 		}
 
-		limit := *searchLimit
-		if limit <= 0 {
-			limit = 10
-		}
-		fetchLimit := limit
-		if searchCfg.Mode == search.SearchModeHybrid {
-			fetchLimit = search.HybridCandidateLimit(limit, len(issuesForSearch), *semanticQuery)
-		}
-		results, err := idx.SearchTopK(qvecs[0], fetchLimit)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error searching index: %v\n", err)
-			os.Exit(1)
-		}
-		results = search.ApplyShortQueryLexicalBoost(results, *semanticQuery, docs)
-		if isLikelyIssueID(*semanticQuery) {
-			results = promoteExactSearchResult(*semanticQuery, results)
+		issuesForSearch := issues
+
+		// Stable data hash for robot outputs (after repo filter but before recipes/TUI)
+		dataHash := analysis.ComputeDataHash(issues)
+
+		// Label subgraph scoping (bv-122)
+		// When --label is specified, extract the label's subgraph and use it for all robot analysis.
+		// This includes label health context in the output.
+		var labelScopeContext *analysis.LabelHealth
+		if *labelScope != "" {
+			sg := analysis.ComputeLabelSubgraph(issues, *labelScope)
+			if sg.IssueCount == 0 {
+				if !envRobot {
+					fmt.Fprintf(os.Stderr, "Warning: No issues found with label %q\n", *labelScope)
+				}
+			} else {
+				// Replace issues with the subgraph issues
+				subgraphIssues := make([]model.Issue, 0, len(sg.AllIssues))
+				for _, id := range sg.AllIssues {
+					if iss, ok := sg.IssueMap[id]; ok {
+						subgraphIssues = append(subgraphIssues, iss)
+					}
+				}
+				issues = subgraphIssues
+				// Compute label health for context
+				cfg := analysis.DefaultLabelHealthConfig()
+				allHealth := analysis.ComputeAllLabelHealth(issues, cfg, time.Now().UTC(), nil)
+				for i := range allHealth.Labels {
+					if allHealth.Labels[i].Label == *labelScope {
+						labelScopeContext = &allHealth.Labels[i]
+						break
+					}
+				}
+			}
 		}
 
-		titleByID := make(map[string]string, len(issuesForSearch))
-		for _, iss := range issuesForSearch {
-			titleByID[iss.ID] = iss.Title
+		// Apply recipe filtering early for robot modes (bv-93)
+		// This ensures --recipe filters are applied before robot modes exit.
+		// dataHash uses pre-filtered issues for stability.
+		if activeRecipe != nil && (*robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel || *robotPriority || *robotInsights || *robotPlan) {
+			issues = applyRecipeFilters(issues, activeRecipe)
+			issues = applyRecipeSort(issues, activeRecipe)
 		}
+		robotDispatchContext.Issues = issues
+		robotDispatchContext.DataHash = dataHash
+		robotDispatchContext.AsOf = *asOf
+		robotDispatchContext.AsOfCommit = asOfResolved
+		robotDispatchContext.LabelScope = *labelScope
+		robotDispatchContext.LabelContext = labelScopeContext
 
-		var hybridResults []search.HybridScore
-		var resolvedPreset search.PresetName
-		var resolvedWeights *search.Weights
-		if searchCfg.Mode == search.SearchModeHybrid {
-			weights, presetName, err := resolveSearchWeights(searchCfg)
+		// Handle semantic search CLI (bv-9gf.3)
+		if *semanticQuery != "" {
+			embedCfg := search.EmbeddingConfigFromEnv()
+			searchCfg, err := search.SearchConfigFromEnv()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-			weights = weights.Normalize()
-			weights = search.AdjustWeightsForQuery(weights, *semanticQuery)
-			resolvedPreset = presetName
-			resolvedWeights = &weights
-
-			cache := search.NewMetricsCache(search.NewAnalyzerMetricsLoader(issuesForSearch))
-			if err := cache.Refresh(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error computing hybrid metrics: %v\n", err)
-				os.Exit(1)
-			}
-
-			scorer := search.NewHybridScorer(weights, cache)
-			hybridResults, err = buildHybridScores(results, scorer)
+			searchCfg, err = applySearchConfigOverrides(searchCfg, *searchMode, *searchPreset, *searchWeights)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error scoring hybrid results: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-			if isLikelyIssueID(*semanticQuery) {
-				hybridResults = promoteExactHybridResult(*semanticQuery, hybridResults)
-			}
-			if len(hybridResults) > limit {
-				hybridResults = hybridResults[:limit]
-			}
-		}
 
-		if *robotSearch {
-			out := robotSearchOutput{
-				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-				DataHash:    dataHash,
-				Query:       *semanticQuery,
-				Provider:    embedCfg.Provider,
-				Model:       embedCfg.Model,
-				Dim:         embedder.Dim(),
-				IndexPath:   indexPath,
-				Index:       syncStats,
-				Loaded:      loaded,
-				Limit:       limit,
-				Mode:        searchCfg.Mode,
+			embedder, err := search.NewEmbedderFromConfig(embedCfg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
 			}
+
+			projectDir, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			indexPath := search.DefaultIndexPath(projectDir, embedCfg)
+			idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			docs := search.DocumentsFromIssues(issuesForSearch)
+			if !*robotSearch && !loaded {
+				fmt.Fprintf(os.Stderr, "Building semantic index (%d issues)...\n", len(docs))
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			syncStats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error building semantic index: %v\n", err)
+				os.Exit(1)
+			}
+			if !loaded || syncStats.Changed() {
+				if err := idx.Save(indexPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
+					os.Exit(1)
+				}
+			}
+
+			qvecs, err := embedder.Embed(ctx, []string{*semanticQuery})
+			if err != nil || len(qvecs) != 1 {
+				if err == nil {
+					err = fmt.Errorf("embedder returned %d vectors for query", len(qvecs))
+				}
+				fmt.Fprintf(os.Stderr, "Error embedding query: %v\n", err)
+				os.Exit(1)
+			}
+
+			limit := *searchLimit
+			if limit <= 0 {
+				limit = 10
+			}
+			fetchLimit := limit
 			if searchCfg.Mode == search.SearchModeHybrid {
-				out.Preset = resolvedPreset
-				out.Weights = resolvedWeights
+				fetchLimit = search.HybridCandidateLimit(limit, len(issuesForSearch), *semanticQuery)
 			}
-			out.Results = make([]robotSearchResult, 0, max(len(results), len(hybridResults)))
+			results, err := idx.SearchTopK(qvecs[0], fetchLimit)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error searching index: %v\n", err)
+				os.Exit(1)
+			}
+			results = search.ApplyShortQueryLexicalBoost(results, *semanticQuery, docs)
+			if isLikelyIssueID(*semanticQuery) {
+				results = promoteExactSearchResult(*semanticQuery, results)
+			}
+
+			titleByID := make(map[string]string, len(issuesForSearch))
+			for _, iss := range issuesForSearch {
+				titleByID[iss.ID] = iss.Title
+			}
+
+			var hybridResults []search.HybridScore
+			var resolvedPreset search.PresetName
+			var resolvedWeights *search.Weights
+			if searchCfg.Mode == search.SearchModeHybrid {
+				weights, presetName, err := resolveSearchWeights(searchCfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+				weights = weights.Normalize()
+				weights = search.AdjustWeightsForQuery(weights, *semanticQuery)
+				resolvedPreset = presetName
+				resolvedWeights = &weights
+
+				cache := search.NewMetricsCache(search.NewAnalyzerMetricsLoader(issuesForSearch))
+				if err := cache.Refresh(); err != nil {
+					fmt.Fprintf(os.Stderr, "Error computing hybrid metrics: %v\n", err)
+					os.Exit(1)
+				}
+
+				scorer := search.NewHybridScorer(weights, cache)
+				hybridResults, err = buildHybridScores(results, scorer)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error scoring hybrid results: %v\n", err)
+					os.Exit(1)
+				}
+				if isLikelyIssueID(*semanticQuery) {
+					hybridResults = promoteExactHybridResult(*semanticQuery, hybridResults)
+				}
+				if len(hybridResults) > limit {
+					hybridResults = hybridResults[:limit]
+				}
+			}
+
+			if *robotSearch {
+				out := robotSearchOutput{
+					GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+					DataHash:    dataHash,
+					Query:       *semanticQuery,
+					Provider:    embedCfg.Provider,
+					Model:       embedCfg.Model,
+					Dim:         embedder.Dim(),
+					IndexPath:   indexPath,
+					Index:       syncStats,
+					Loaded:      loaded,
+					Limit:       limit,
+					Mode:        searchCfg.Mode,
+				}
+				if searchCfg.Mode == search.SearchModeHybrid {
+					out.Preset = resolvedPreset
+					out.Weights = resolvedWeights
+				}
+				out.Results = make([]robotSearchResult, 0, max(len(results), len(hybridResults)))
+				if searchCfg.Mode == search.SearchModeHybrid {
+					for _, r := range hybridResults {
+						out.Results = append(out.Results, robotSearchResult{
+							IssueID:         r.IssueID,
+							Score:           r.FinalScore,
+							TextScore:       r.TextScore,
+							Title:           titleByID[r.IssueID],
+							ComponentScores: r.ComponentScores,
+						})
+					}
+					out.UsageHints = []string{
+						"jq '.results[] | {id: .issue_id, score: .score, text: .text_score}' - Extract scores",
+						"jq '.results[] | {id: .issue_id, components: .component_scores}' - Hybrid breakdown",
+						"jq '.index' - Index update stats (added/updated/removed/embedded)",
+					}
+				} else {
+					for _, r := range results {
+						out.Results = append(out.Results, robotSearchResult{
+							IssueID: r.IssueID,
+							Score:   r.Score,
+							Title:   titleByID[r.IssueID],
+						})
+					}
+					out.UsageHints = []string{
+						"jq '.results[] | {id: .issue_id, score: .score, title: .title}' - Extract results",
+						"jq '.index' - Index update stats (added/updated/removed/embedded)",
+					}
+				}
+
+				searchDispatchContext := robotDispatchContext
+				searchDispatchContext.SearchOutput = &out
+				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-search", searchDispatchContext)
+			}
+
+			// Human-readable output
+			if !loaded || syncStats.Changed() {
+				fmt.Fprintf(os.Stderr, "Index: +%d ~%d -%d (%d total) → %s\n", syncStats.Added, syncStats.Updated, syncStats.Removed, idx.Size(), indexPath)
+			}
 			if searchCfg.Mode == search.SearchModeHybrid {
 				for _, r := range hybridResults {
-					out.Results = append(out.Results, robotSearchResult{
-						IssueID:         r.IssueID,
-						Score:           r.FinalScore,
-						TextScore:       r.TextScore,
-						Title:           titleByID[r.IssueID],
-						ComponentScores: r.ComponentScores,
-					})
-				}
-				out.UsageHints = []string{
-					"jq '.results[] | {id: .issue_id, score: .score, text: .text_score}' - Extract scores",
-					"jq '.results[] | {id: .issue_id, components: .component_scores}' - Hybrid breakdown",
-					"jq '.index' - Index update stats (added/updated/removed/embedded)",
+					fmt.Printf("%.4f\t%s\t%s\n", r.FinalScore, r.IssueID, titleByID[r.IssueID])
 				}
 			} else {
 				for _, r := range results {
-					out.Results = append(out.Results, robotSearchResult{
-						IssueID: r.IssueID,
-						Score:   r.Score,
-						Title:   titleByID[r.IssueID],
-					})
-				}
-				out.UsageHints = []string{
-					"jq '.results[] | {id: .issue_id, score: .score, title: .title}' - Extract results",
-					"jq '.index' - Index update stats (added/updated/removed/embedded)",
+					fmt.Printf("%.4f\t%s\t%s\n", r.Score, r.IssueID, titleByID[r.IssueID])
 				}
 			}
+			os.Exit(0)
+		}
 
-			if err := writeRobotSearchOutput(os.Stdout, out); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding robot-search: %v\n", err)
+		// Handle --pages wizard (bv-10g)
+		if *pagesWizard {
+			if err := runPagesWizard(beadsPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
 		}
 
-		// Human-readable output
-		if !loaded || syncStats.Changed() {
-			fmt.Fprintf(os.Stderr, "Index: +%d ~%d -%d (%d total) → %s\n", syncStats.Added, syncStats.Updated, syncStats.Removed, idx.Size(), indexPath)
-		}
-		if searchCfg.Mode == search.SearchModeHybrid {
-			for _, r := range hybridResults {
-				fmt.Printf("%.4f\t%s\t%s\n", r.FinalScore, r.IssueID, titleByID[r.IssueID])
+		// Handle --preview-pages (before export since it doesn't need analysis)
+		if *previewPages != "" {
+			if err := runPreviewServer(*previewPages, !*previewNoLiveReload); err != nil {
+				fmt.Fprintf(os.Stderr, "Error starting preview server: %v\n", err)
+				os.Exit(1)
 			}
-		} else {
-			for _, r := range results {
-				fmt.Printf("%.4f\t%s\t%s\n", r.Score, r.IssueID, titleByID[r.IssueID])
-			}
+			os.Exit(0)
 		}
-		os.Exit(0)
-	}
 
-	// Handle --pages wizard (bv-10g)
-	if *pagesWizard {
-		if err := runPagesWizard(beadsPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --preview-pages (before export since it doesn't need analysis)
-	if *previewPages != "" {
-		if err := runPreviewServer(*previewPages, !*previewNoLiveReload); err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting preview server: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --export-pages (bv-73f) with optional --watch-export (bv-55)
-	if *exportPages != "" {
-		// Define export function for reuse in watch mode
-		exportCount := 0
-		doExport := func(allIssues []model.Issue) error {
-			exportCount++
-			if exportCount > 1 {
-				fmt.Printf("\n[%s] Re-exporting (change #%d)...\n", time.Now().Format("15:04:05"), exportCount-1)
-			} else {
-				fmt.Println("Exporting static site...")
-			}
-			fmt.Printf("  → Loading %d issues\n", len(allIssues))
-
-			// Filter closed issues if not requested
-			exportIssues := allIssues
-			if !*pagesIncludeClosed {
-				var openIssues []model.Issue
-				for _, issue := range allIssues {
-					if issue.Status != model.StatusClosed {
-						openIssues = append(openIssues, issue)
-					}
+		// Handle --export-pages (bv-73f) with optional --watch-export (bv-55)
+		if *exportPages != "" {
+			// Define export function for reuse in watch mode
+			exportCount := 0
+			doExport := func(allIssues []model.Issue) error {
+				exportCount++
+				if exportCount > 1 {
+					fmt.Printf("\n[%s] Re-exporting (change #%d)...\n", time.Now().Format("15:04:05"), exportCount-1)
+				} else {
+					fmt.Println("Exporting static site...")
 				}
-				exportIssues = openIssues
-				fmt.Printf("  → Filtering to %d open issues\n", len(exportIssues))
-			}
+				fmt.Printf("  → Loading %d issues\n", len(allIssues))
 
-			// Load and run pre-export hooks (bv-qjc.3)
-			cwd, _ := os.Getwd()
-			var pagesExecutor *hooks.Executor
-			if !*noHooks {
-				hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
-				if err := hookLoader.Load(); err != nil {
-					fmt.Printf("  → Warning: failed to load hooks: %v\n", err)
-				} else if hookLoader.HasHooks() {
-					fmt.Println("  → Running pre-export hooks...")
-					ctx := hooks.ExportContext{
-						ExportPath:   *exportPages,
-						ExportFormat: "html",
-						IssueCount:   len(exportIssues),
-						Timestamp:    time.Now(),
-					}
-					pagesExecutor = hooks.NewExecutor(hookLoader.Config(), ctx)
-					pagesExecutor.SetLogger(func(msg string) {
-						fmt.Printf("  → %s\n", msg)
-					})
-
-					if err := pagesExecutor.RunPreExport(); err != nil {
-						return fmt.Errorf("pre-export hook failed: %w", err)
-					}
-				}
-			}
-
-			// Build graph and compute stats
-			fmt.Println("  → Running graph analysis...")
-			analyzer := analysis.NewAnalyzer(exportIssues)
-			stats := analyzer.AnalyzeAsync(context.Background())
-			stats.WaitForPhase2()
-
-			// Compute triage
-			fmt.Println("  → Generating triage data...")
-			triage := analysis.ComputeTriage(exportIssues)
-
-			// Extract dependencies
-			var deps []*model.Dependency
-			for i := range exportIssues {
-				issue := &exportIssues[i]
-				for _, dep := range issue.Dependencies {
-					if dep == nil || !dep.Type.IsBlocking() {
-						continue
-					}
-					deps = append(deps, &model.Dependency{
-						IssueID:     issue.ID,
-						DependsOnID: dep.DependsOnID,
-						Type:        dep.Type,
-					})
-				}
-			}
-
-			// Create exporter
-			issuePointers := make([]*model.Issue, len(exportIssues))
-			for i := range exportIssues {
-				issuePointers[i] = &exportIssues[i]
-			}
-			exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
-			if *pagesTitle != "" {
-				exporter.Config.Title = *pagesTitle
-			}
-
-			// Export SQLite database
-			fmt.Println("  → Writing database and JSON files...")
-			if err := exporter.Export(*exportPages); err != nil {
-				return fmt.Errorf("exporting: %w", err)
-			}
-
-			// Copy viewer assets
-			fmt.Println("  → Copying viewer assets...")
-			if err := copyViewerAssets(*exportPages, *pagesTitle); err != nil {
-				return fmt.Errorf("copying assets: %w", err)
-			}
-
-			// Generate README.md with project stats (useful for GitHub Pages deployment)
-			fmt.Println("  → Generating README.md...")
-			if err := generateREADME(*exportPages, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
-				fmt.Printf("  → Warning: failed to generate README: %v\n", err)
-			}
-
-			// Export history data for time-travel feature (bv-z38b)
-			if *pagesIncludeHistory {
-				fmt.Println("  → Generating time-travel history data...")
-				if historyReport, err := generateHistoryForExport(allIssues); err == nil && historyReport != nil {
-					historyPath := filepath.Join(*exportPages, "data", "history.json")
-					if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-						if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
-							fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
-						} else {
-							fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
+				// Filter closed issues if not requested
+				exportIssues := allIssues
+				if !*pagesIncludeClosed {
+					var openIssues []model.Issue
+					for _, issue := range allIssues {
+						if issue.Status != model.StatusClosed {
+							openIssues = append(openIssues, issue)
 						}
 					}
-				} else if err != nil {
-					fmt.Printf("  → Warning: failed to generate history: %v\n", err)
+					exportIssues = openIssues
+					fmt.Printf("  → Filtering to %d open issues\n", len(exportIssues))
 				}
+
+				// Load and run pre-export hooks (bv-qjc.3)
+				cwd, cwdErr := os.Getwd()
+				if cwdErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not get working directory for hooks: %v\n", cwdErr)
+				}
+				var pagesExecutor *hooks.Executor
+				if !*noHooks {
+					hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
+					if err := hookLoader.Load(); err != nil {
+						fmt.Printf("  → Warning: failed to load hooks: %v\n", err)
+					} else if hookLoader.HasHooks() {
+						fmt.Println("  → Running pre-export hooks...")
+						ctx := hooks.ExportContext{
+							ExportPath:   *exportPages,
+							ExportFormat: "html",
+							IssueCount:   len(exportIssues),
+							Timestamp:    time.Now(),
+						}
+						pagesExecutor = hooks.NewExecutor(hookLoader.Config(), ctx)
+						pagesExecutor.SetLogger(func(msg string) {
+							fmt.Printf("  → %s\n", msg)
+						})
+
+						if err := pagesExecutor.RunPreExport(); err != nil {
+							return fmt.Errorf("pre-export hook failed: %w", err)
+						}
+					}
+				}
+
+				// Build graph and compute stats
+				fmt.Println("  → Running graph analysis...")
+				analyzer := analysis.NewAnalyzer(exportIssues)
+				stats := analyzer.AnalyzeAsync(context.Background())
+				stats.WaitForPhase2()
+
+				// Compute triage
+				fmt.Println("  → Generating triage data...")
+				triage := analysis.ComputeTriage(exportIssues)
+
+				// Extract dependencies
+				var deps []*model.Dependency
+				for i := range exportIssues {
+					issue := &exportIssues[i]
+					for _, dep := range issue.Dependencies {
+						if dep == nil || !dep.Type.IsBlocking() {
+							continue
+						}
+						deps = append(deps, &model.Dependency{
+							IssueID:     issue.ID,
+							DependsOnID: dep.DependsOnID,
+							Type:        dep.Type,
+						})
+					}
+				}
+
+				// Create exporter
+				issuePointers := make([]*model.Issue, len(exportIssues))
+				for i := range exportIssues {
+					issuePointers[i] = &exportIssues[i]
+				}
+				exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
+				if *pagesTitle != "" {
+					exporter.Config.Title = *pagesTitle
+				}
+
+				// Export SQLite database
+				fmt.Println("  → Writing database and JSON files...")
+				if err := exporter.Export(*exportPages); err != nil {
+					return fmt.Errorf("exporting: %w", err)
+				}
+
+				// Copy viewer assets
+				fmt.Println("  → Copying viewer assets...")
+				if err := copyViewerAssets(*exportPages, *pagesTitle); err != nil {
+					return fmt.Errorf("copying assets: %w", err)
+				}
+
+				// Generate README.md with project stats (useful for GitHub Pages deployment)
+				fmt.Println("  → Generating README.md...")
+				if err := generateREADME(*exportPages, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
+					fmt.Printf("  → Warning: failed to generate README: %v\n", err)
+				}
+
+				// Export history data for time-travel feature (bv-z38b)
+				if *pagesIncludeHistory {
+					fmt.Println("  → Generating time-travel history data...")
+					if historyReport, err := generateHistoryForExport(allIssues); err == nil && historyReport != nil {
+						historyPath := filepath.Join(*exportPages, "data", "history.json")
+						if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
+							if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
+								fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
+							} else {
+								fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
+							}
+						}
+					} else if err != nil {
+						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
+					}
+				}
+
+				// Run post-export hooks (bv-qjc.3)
+				if pagesExecutor != nil {
+					fmt.Println("  → Running post-export hooks...")
+					if err := pagesExecutor.RunPostExport(); err != nil {
+						fmt.Printf("  → Warning: post-export hook failed: %v\n", err)
+					}
+
+					if len(pagesExecutor.Results()) > 0 {
+						fmt.Println("")
+						fmt.Println(pagesExecutor.Summary())
+					}
+				}
+
+				fmt.Printf("✓ Export complete [%s]\n", time.Now().Format("15:04:05"))
+				return nil
 			}
 
-			// Run post-export hooks (bv-qjc.3)
-			if pagesExecutor != nil {
-				fmt.Println("  → Running post-export hooks...")
-				if err := pagesExecutor.RunPostExport(); err != nil {
-					fmt.Printf("  → Warning: post-export hook failed: %v\n", err)
-				}
-
-				if len(pagesExecutor.Results()) > 0 {
-					fmt.Println("")
-					fmt.Println(pagesExecutor.Summary())
-				}
+			// Initial export
+			if err := doExport(issues); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
 			}
 
-			fmt.Printf("✓ Export complete [%s]\n", time.Now().Format("15:04:05"))
-			return nil
-		}
+			// Watch mode (bv-55): monitor .beads/ for changes and auto-regenerate
+			if *watchExport {
+				fmt.Println("")
+				fmt.Println("Watch mode enabled. Monitoring for changes...")
 
-		// Initial export
-		if err := doExport(issues); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+				// Collect all issues.jsonl files to watch
+				var watchFiles []string
+				var watchers []*watcher.Watcher
 
-		// Watch mode (bv-55): monitor .beads/ for changes and auto-regenerate
-		if *watchExport {
-			fmt.Println("")
-			fmt.Println("Watch mode enabled. Monitoring for changes...")
-
-			// Collect all issues.jsonl files to watch
-			var watchFiles []string
-			var watchers []*watcher.Watcher
-
-			if *workspaceConfig != "" {
-				// Workspace mode: watch all repos' issues.jsonl files (bv-79)
-				wsConfig, err := workspace.LoadConfig(*workspaceConfig)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error loading workspace config: %v\n", err)
-					os.Exit(1)
-				}
-				workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
-
-				for _, repo := range wsConfig.Repos {
-					if !repo.IsEnabled() {
-						continue
-					}
-					repoPath := repo.Path
-					if !filepath.IsAbs(repoPath) {
-						repoPath = filepath.Join(workspaceRoot, repoPath)
-					}
-					beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
-					issuesFile, err := loader.FindJSONLPath(beadsDir)
+				if *workspaceConfig != "" {
+					// Workspace mode: watch all repos' issues.jsonl files (bv-79)
+					wsConfig, err := workspace.LoadConfig(*workspaceConfig)
 					if err != nil {
-						fmt.Printf("  → Warning: could not find issues.jsonl for repo %s: %v\n", repo.GetName(), err)
-						continue
+						fmt.Fprintf(os.Stderr, "Error loading workspace config: %v\n", err)
+						os.Exit(1)
 					}
+					workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
+
+					for _, repo := range wsConfig.Repos {
+						if !repo.IsEnabled() {
+							continue
+						}
+						repoPath := repo.Path
+						if !filepath.IsAbs(repoPath) {
+							repoPath = filepath.Join(workspaceRoot, repoPath)
+						}
+						beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
+						issuesFile, err := loader.FindJSONLPath(beadsDir)
+						if err != nil {
+							fmt.Printf("  → Warning: could not find issues.jsonl for repo %s: %v\n", repo.GetName(), err)
+							continue
+						}
+						watchFiles = append(watchFiles, issuesFile)
+					}
+
+					if len(watchFiles) == 0 {
+						fmt.Fprintf(os.Stderr, "Error: no valid issues.jsonl files found in workspace\n")
+						os.Exit(1)
+					}
+				} else {
+					// Single-repo mode: watch current directory's issues.jsonl
+					cwd, cwdErr := os.Getwd()
+					if cwdErr != nil {
+						fmt.Fprintf(os.Stderr, "Warning: could not get working directory for watcher: %v\n", cwdErr)
+					}
+					issuesFile := filepath.Join(cwd, ".beads", "issues.jsonl")
 					watchFiles = append(watchFiles, issuesFile)
 				}
 
-				if len(watchFiles) == 0 {
-					fmt.Fprintf(os.Stderr, "Error: no valid issues.jsonl files found in workspace\n")
-					os.Exit(1)
+				// Print watched files
+				for _, f := range watchFiles {
+					fmt.Printf("  → Watching: %s\n", f)
 				}
-			} else {
-				// Single-repo mode: watch current directory's issues.jsonl
-				cwd, _ := os.Getwd()
-				issuesFile := filepath.Join(cwd, ".beads", "issues.jsonl")
-				watchFiles = append(watchFiles, issuesFile)
-			}
+				fmt.Println("  → Press Ctrl+C to stop")
+				fmt.Println("")
+				fmt.Println("To preview with auto-refresh, run in another terminal:")
+				fmt.Printf("  bv --preview-pages %s\n", *exportPages)
 
-			// Print watched files
-			for _, f := range watchFiles {
-				fmt.Printf("  → Watching: %s\n", f)
-			}
-			fmt.Println("  → Press Ctrl+C to stop")
-			fmt.Println("")
-			fmt.Println("To preview with auto-refresh, run in another terminal:")
-			fmt.Printf("  bv --preview-pages %s\n", *exportPages)
+				// Create a merged change channel for all watchers
+				mergedChangeCh := make(chan struct{}, 1)
 
-			// Create a merged change channel for all watchers
-			mergedChangeCh := make(chan struct{}, 1)
-
-			// Create file watchers with 500ms debounce for each file
-			for _, watchFile := range watchFiles {
-				w, err := watcher.NewWatcher(watchFile,
-					watcher.WithDebounceDuration(500*time.Millisecond),
-					watcher.WithOnError(func(err error) {
-						fmt.Printf("  → Watch error: %v\n", err)
-					}),
-				)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating watcher for %s: %v\n", watchFile, err)
-					os.Exit(1)
-				}
-
-				if err := w.Start(); err != nil {
-					fmt.Fprintf(os.Stderr, "Error starting watcher for %s: %v\n", watchFile, err)
-					os.Exit(1)
-				}
-				watchers = append(watchers, w)
-
-				// Forward changes to merged channel
-				go func(ch <-chan struct{}) {
-					for range ch {
-						select {
-						case mergedChangeCh <- struct{}{}:
-						default:
-							// Already a change pending, skip
-						}
-					}
-				}(w.Changed())
-			}
-
-			// Cleanup all watchers on exit
-			defer func() {
-				for _, w := range watchers {
-					w.Stop()
-				}
-			}()
-
-			// Set up signal handling for graceful shutdown
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-			defer signal.Stop(sigCh)
-
-			// Watch loop
-			for {
-				select {
-				case <-mergedChangeCh:
-					// Reload issues from disk using appropriate method
-					var freshIssues []model.Issue
-					var err error
-					if *workspaceConfig != "" {
-						freshIssues, _, err = workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
-					} else {
-						freshIssues, err = datasource.LoadIssues("")
-					}
+				// Create file watchers with 500ms debounce for each file
+				for _, watchFile := range watchFiles {
+					w, err := watcher.NewWatcher(watchFile,
+						watcher.WithDebounceDuration(500*time.Millisecond),
+						watcher.WithOnError(func(err error) {
+							fmt.Printf("  → Watch error: %v\n", err)
+						}),
+					)
 					if err != nil {
-						fmt.Printf("  → Error reloading issues: %v\n", err)
-						continue
+						fmt.Fprintf(os.Stderr, "Error creating watcher for %s: %v\n", watchFile, err)
+						os.Exit(1)
 					}
-					if err := doExport(freshIssues); err != nil {
-						fmt.Printf("  → Export error: %v\n", err)
+
+					if err := w.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "Error starting watcher for %s: %v\n", watchFile, err)
+						os.Exit(1)
 					}
-				case <-sigCh:
-					fmt.Println("\nStopping watch mode...")
-					os.Exit(0)
+					watchers = append(watchers, w)
+
+					// Forward changes to merged channel
+					go func(ch <-chan struct{}) {
+						for range ch {
+							select {
+							case mergedChangeCh <- struct{}{}:
+							default:
+								// Already a change pending, skip
+							}
+						}
+					}(w.Changed())
 				}
-			}
-		}
 
-		fmt.Println("")
-		fmt.Printf("✓ Static site exported to: %s\n", *exportPages)
-		fmt.Println("")
-		fmt.Println("To preview locally:")
-		fmt.Printf("  bv --preview-pages %s\n", *exportPages)
-		fmt.Println("")
-		fmt.Println("Or open in browser:")
-		fmt.Printf("  open %s/index.html\n", *exportPages)
-		os.Exit(0)
-	}
+				// Cleanup all watchers on exit
+				defer func() {
+					for _, w := range watchers {
+						w.Stop()
+					}
+				}()
 
-	// Handle --robot-label-health
-	if *robotLabelHealth {
-		cfg := analysis.DefaultLabelHealthConfig()
-		results := analysis.ComputeAllLabelHealth(issues, cfg, time.Now().UTC(), nil)
+				// Set up signal handling for graceful shutdown
+				sigCh := make(chan os.Signal, 1)
+				signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+				defer signal.Stop(sigCh)
 
-		output := struct {
-			GeneratedAt    string                       `json:"generated_at"`
-			DataHash       string                       `json:"data_hash"`
-			AnalysisConfig analysis.LabelHealthConfig   `json:"analysis_config"`
-			Results        analysis.LabelAnalysisResult `json:"results"`
-			UsageHints     []string                     `json:"usage_hints"`
-		}{
-			GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
-			DataHash:       dataHash,
-			AnalysisConfig: cfg,
-			Results:        results,
-			UsageHints: []string{
-				"jq '.results.summaries | sort_by(.health) | .[:3]' - Critical labels",
-				"jq '.results.labels[] | select(.health_level == \"critical\")' - Critical details",
-				"jq '.results.cross_label_flow.bottleneck_labels' - Bottleneck labels",
-				"jq '.results.attention_needed' - Labels needing attention",
-			},
-		}
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding label health: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-label-flow (can be used stand-alone to avoid full health computation)
-	if *robotLabelFlow {
-		cfg := analysis.DefaultLabelHealthConfig()
-		flow := analysis.ComputeCrossLabelFlow(issues, cfg)
-		output := struct {
-			GeneratedAt string                     `json:"generated_at"`
-			DataHash    string                     `json:"data_hash"`
-			Flow        analysis.CrossLabelFlow    `json:"flow"`
-			Config      analysis.LabelHealthConfig `json:"analysis_config"`
-			UsageHints  []string                   `json:"usage_hints"`
-		}{
-			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-			DataHash:    dataHash,
-			Flow:        flow,
-			Config:      cfg,
-			UsageHints: []string{
-				"jq '.flow.bottleneck_labels' - labels blocking the most others",
-				"jq '.flow.dependencies[] | select(.issue_count > 0) | {from:.from_label,to:.to_label,count:.issue_count}'",
-				"jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
-			},
-		}
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding label flow: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-label-attention (bv-121)
-	if *robotLabelAttention {
-		cfg := analysis.DefaultLabelHealthConfig()
-		result := analysis.ComputeLabelAttentionScores(issues, cfg, time.Now().UTC())
-
-		// Apply limit
-		limit := *attentionLimit
-		if limit <= 0 {
-			limit = 5
-		}
-		if limit > len(result.Labels) {
-			limit = len(result.Labels)
-		}
-
-		// Build limited output
-		type AttentionOutput struct {
-			GeneratedAt string `json:"generated_at"`
-			DataHash    string `json:"data_hash"`
-			Limit       int    `json:"limit"`
-			TotalLabels int    `json:"total_labels"`
-			Labels      []struct {
-				Rank            int     `json:"rank"`
-				Label           string  `json:"label"`
-				AttentionScore  float64 `json:"attention_score"`
-				NormalizedScore float64 `json:"normalized_score"`
-				Reason          string  `json:"reason"`
-				OpenCount       int     `json:"open_count"`
-				BlockedCount    int     `json:"blocked_count"`
-				StaleCount      int     `json:"stale_count"`
-				PageRankSum     float64 `json:"pagerank_sum"`
-				VelocityFactor  float64 `json:"velocity_factor"`
-			} `json:"labels"`
-			UsageHints []string `json:"usage_hints"`
-		}
-
-		output := AttentionOutput{
-			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-			DataHash:    dataHash,
-			Limit:       limit,
-			TotalLabels: result.TotalLabels,
-			UsageHints: []string{
-				"jq '.labels[0]' - top attention label details",
-				"jq '.labels[] | select(.blocked_count > 0)' - labels with blocked issues",
-				"jq '.labels[] | {label:.label,score:.attention_score,reason:.reason}'",
-			},
-		}
-
-		for i := 0; i < limit; i++ {
-			score := result.Labels[i]
-			// Build human-readable reason
-			reason := buildAttentionReason(score)
-			output.Labels = append(output.Labels, struct {
-				Rank            int     `json:"rank"`
-				Label           string  `json:"label"`
-				AttentionScore  float64 `json:"attention_score"`
-				NormalizedScore float64 `json:"normalized_score"`
-				Reason          string  `json:"reason"`
-				OpenCount       int     `json:"open_count"`
-				BlockedCount    int     `json:"blocked_count"`
-				StaleCount      int     `json:"stale_count"`
-				PageRankSum     float64 `json:"pagerank_sum"`
-				VelocityFactor  float64 `json:"velocity_factor"`
-			}{
-				Rank:            score.Rank,
-				Label:           score.Label,
-				AttentionScore:  score.AttentionScore,
-				NormalizedScore: score.NormalizedScore,
-				Reason:          reason,
-				OpenCount:       score.OpenCount,
-				BlockedCount:    score.BlockedCount,
-				StaleCount:      score.StaleCount,
-				PageRankSum:     score.PageRankSum,
-				VelocityFactor:  score.VelocityFactor,
-			})
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding label attention: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-graph (bv-136)
-	if *robotGraph {
-		analyzer := analysis.NewAnalyzer(issues)
-		stats := analyzer.Analyze()
-
-		// Determine format
-		var format export.GraphExportFormat
-		switch strings.ToLower(*graphFormat) {
-		case "dot":
-			format = export.GraphFormatDOT
-		case "mermaid":
-			format = export.GraphFormatMermaid
-		default:
-			format = export.GraphFormatJSON
-		}
-
-		config := export.GraphExportConfig{
-			Format:   format,
-			Label:    *labelScope,
-			Root:     *graphRoot,
-			Depth:    *graphDepth,
-			DataHash: dataHash,
-		}
-
-		result, err := export.ExportGraph(issues, &stats, config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error exporting graph: %v\n", err)
-			os.Exit(1)
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(result); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding graph: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --export-graph (bv-94) - PNG/SVG/HTML export
-	if *exportGraph != "" {
-		analyzer := analysis.NewAnalyzer(issues)
-		stats := analyzer.Analyze()
-
-		// Apply label filter if specified
-		exportIssues := issues
-		if *labelScope != "" {
-			var filtered []model.Issue
-			for _, iss := range issues {
-				for _, lbl := range iss.Labels {
-					if strings.EqualFold(lbl, *labelScope) {
-						filtered = append(filtered, iss)
-						break
+				// Watch loop
+				for {
+					select {
+					case <-mergedChangeCh:
+						// Reload issues from disk using appropriate method
+						var freshIssues []model.Issue
+						var err error
+						if *workspaceConfig != "" {
+							freshIssues, _, err = workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
+						} else {
+							freshIssues, err = datasource.LoadIssues("")
+						}
+						if err != nil {
+							fmt.Printf("  → Error reloading issues: %v\n", err)
+							continue
+						}
+						if err := doExport(freshIssues); err != nil {
+							fmt.Printf("  → Export error: %v\n", err)
+						}
+					case <-sigCh:
+						fmt.Println("\nStopping watch mode...")
+						os.Exit(0)
 					}
 				}
 			}
-			exportIssues = filtered
-		}
 
-		if len(exportIssues) == 0 {
-			fmt.Fprintf(os.Stderr, "No issues to export (check filters)\n")
-			os.Exit(1)
-		}
-
-		// Get project name from current directory
-		cwd, _ := os.Getwd()
-		projectName := filepath.Base(cwd)
-
-		// Check if HTML export requested (interactive graph)
-		if strings.HasSuffix(strings.ToLower(*exportGraph), ".html") || *exportGraph == "html" || *exportGraph == "interactive" {
-			title := *graphTitle
-			if title == "" {
-				title = projectName
-			}
-
-			// Compute triage for the graph export
-			triageOpts := analysis.TriageOptions{WaitForPhase2: true}
-			triage := analysis.ComputeTriageWithOptions(exportIssues, triageOpts)
-
-			opts := export.InteractiveGraphOptions{
-				Issues:      exportIssues,
-				Stats:       &stats,
-				Triage:      &triage,
-				Title:       title,
-				DataHash:    dataHash,
-				Path:        *exportGraph,
-				ProjectName: projectName,
-			}
-			// Auto-generate filename if just "html" or "interactive"
-			if *exportGraph == "html" || *exportGraph == "interactive" {
-				opts.Path = ""
-			}
-			outputPath, err := export.GenerateInteractiveGraphHTML(opts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error exporting interactive graph: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("✓ Interactive graph exported to %s (%d nodes, %d edges)\n", outputPath, len(exportIssues), stats.EdgeCount)
+			fmt.Println("")
+			fmt.Printf("✓ Static site exported to: %s\n", *exportPages)
+			fmt.Println("")
+			fmt.Println("To preview locally:")
+			fmt.Printf("  bv --preview-pages %s\n", *exportPages)
+			fmt.Println("")
+			fmt.Println("Or open in browser:")
+			fmt.Printf("  open %s/index.html\n", *exportPages)
 			os.Exit(0)
 		}
 
-		// Static PNG/SVG export (use .html for better interactive graphs)
-		opts := export.GraphSnapshotOptions{
-			Path:     *exportGraph,
-			Title:    *graphTitle,
-			Preset:   *graphPreset,
-			Issues:   exportIssues,
-			Stats:    &stats,
-			DataHash: dataHash,
-		}
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-label-health", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-label-flow", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-label-attention", robotDispatchContext)
 
-		err := export.SaveGraphSnapshot(opts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error exporting graph snapshot: %v\n", err)
-			os.Exit(1)
-		}
+		// Handle --robot-label-health
+		if *robotLabelHealth {
+			cfg := analysis.DefaultLabelHealthConfig()
+			results := analysis.ComputeAllLabelHealth(issues, cfg, time.Now().UTC(), nil)
 
-		fmt.Printf("✓ Graph exported to %s (%d nodes) - tip: use .html for interactive graphs\n", *exportGraph, len(exportIssues))
-		os.Exit(0)
-	}
-
-	// Handle --robot-alerts (drift + proactive)
-	if *robotAlerts {
-		driftConfig, err := drift.LoadConfig(projectDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading drift config: %v\n", err)
-			os.Exit(1)
-		}
-
-		analyzer := analysis.NewAnalyzer(issues)
-		stats := analyzer.Analyze()
-
-		openCount, closedCount, blockedCount := 0, 0, 0
-		for _, issue := range issues {
-			switch issue.Status {
-			case model.StatusClosed:
-				closedCount++
-			case model.StatusBlocked:
-				blockedCount++
-			case model.StatusOpen, model.StatusInProgress:
-				openCount++
-			default:
-				// Ignore tombstones and any unknown statuses for summary counts.
-			}
-		}
-		actionableCount := len(analyzer.GetActionableIssues())
-		cycles := stats.Cycles()
-		curStats := baseline.GraphStats{
-			NodeCount:       stats.NodeCount,
-			EdgeCount:       stats.EdgeCount,
-			Density:         stats.Density,
-			OpenCount:       openCount,
-			ClosedCount:     closedCount,
-			BlockedCount:    blockedCount,
-			CycleCount:      len(cycles),
-			ActionableCount: actionableCount,
-		}
-
-		// Default behavior (no baseline): drift comparisons are suppressed by using
-		// baseline=current for stats, while still allowing cycle/staleness/cascade alerts.
-		bl := &baseline.Baseline{Stats: curStats}
-		cur := &baseline.Baseline{Stats: curStats, Cycles: cycles}
-
-		// If a baseline exists, compare against it for real drift deltas.
-		if baseline.Exists(baselinePath) {
-			loaded, err := baseline.Load(baselinePath)
-			if err != nil {
-				if !envRobot {
-					fmt.Fprintf(os.Stderr, "Warning: Error loading baseline: %v\n", err)
-				}
-			} else {
-				bl = loaded
-				topMetrics := baseline.TopMetrics{
-					PageRank:     buildMetricItems(stats.PageRank(), 10),
-					Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-					CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-					Hubs:         buildMetricItems(stats.Hubs(), 10),
-					Authorities:  buildMetricItems(stats.Authorities(), 10),
-				}
-				cur = &baseline.Baseline{Stats: curStats, TopMetrics: topMetrics, Cycles: cycles}
-			}
-		}
-
-		calc := drift.NewCalculator(bl, cur, driftConfig)
-		calc.SetIssues(issues)
-		driftResult := calc.Calculate()
-
-		// Apply optional filters
-		filtered := driftResult.Alerts[:0]
-		for _, a := range driftResult.Alerts {
-			if *alertSeverity != "" && string(a.Severity) != *alertSeverity {
-				continue
-			}
-			if *alertType != "" && string(a.Type) != *alertType {
-				continue
-			}
-			if *alertLabel != "" {
-				found := false
-				for _, d := range a.Details {
-					if strings.Contains(strings.ToLower(d), strings.ToLower(*alertLabel)) {
-						found = true
-						break
-					}
-				}
-				if !found && a.Label != "" && !strings.Contains(strings.ToLower(a.Label), strings.ToLower(*alertLabel)) {
-					continue
-				}
-			}
-			filtered = append(filtered, a)
-		}
-		driftResult.Alerts = filtered
-
-		output := struct {
-			RobotEnvelope
-			Alerts  []drift.Alert `json:"alerts"`
-			Summary struct {
-				Total    int `json:"total"`
-				Critical int `json:"critical"`
-				Warning  int `json:"warning"`
-				Info     int `json:"info"`
-			} `json:"summary"`
-			UsageHints []string `json:"usage_hints"`
-		}{
-			RobotEnvelope: NewRobotEnvelope(dataHash),
-			Alerts:        driftResult.Alerts,
-			UsageHints: []string{
-				"--severity=warning --alert-type=stale_issue   # stale warnings only",
-				"--alert-type=blocking_cascade                 # high-unblock opportunities",
-				"jq '.alerts | map(.issue_id)'                # list impacted issues",
-			},
-		}
-		for _, a := range driftResult.Alerts {
-			switch a.Severity {
-			case drift.SeverityCritical:
-				output.Summary.Critical++
-			case drift.SeverityWarning:
-				output.Summary.Warning++
-			case drift.SeverityInfo:
-				output.Summary.Info++
-			}
-			output.Summary.Total++
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding alerts: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-suggest (bv-180)
-	if *robotSuggest {
-		config := analysis.DefaultSuggestAllConfig()
-		config.MinConfidence = *suggestConfidence
-		config.FilterBead = *suggestBead
-
-		// Parse filter type
-		switch *suggestType {
-		case "duplicate", "duplicates":
-			config.FilterType = analysis.SuggestionPotentialDuplicate
-		case "dependency", "dependencies":
-			config.FilterType = analysis.SuggestionMissingDependency
-		case "label", "labels":
-			config.FilterType = analysis.SuggestionLabelSuggestion
-		case "cycle", "cycles":
-			config.FilterType = analysis.SuggestionCycleWarning
-		case "":
-			// All types
-		default:
-			fmt.Fprintf(os.Stderr, "Invalid suggest-type: %s (use: duplicate, dependency, label, cycle)\n", *suggestType)
-			os.Exit(1)
-		}
-
-		output := analysis.GenerateRobotSuggestOutput(issues, config, dataHash)
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding suggestions: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --profile-startup
-	if *profileStartup {
-		runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis)
-		os.Exit(0)
-	}
-
-	// Handle --save-baseline
-	if *saveBaseline != "" {
-		analyzer := analysis.NewAnalyzer(issues)
-		if *forceFullAnalysis {
-			cfg := analysis.FullAnalysisConfig()
-			analyzer.SetConfig(&cfg)
-		}
-		stats := analyzer.Analyze()
-
-		// Compute status counts from issues
-		openCount, closedCount, blockedCount := 0, 0, 0
-		for _, issue := range issues {
-			switch issue.Status {
-			case model.StatusOpen, model.StatusInProgress:
-				openCount++
-			case model.StatusClosed:
-				closedCount++
-			case model.StatusBlocked:
-				blockedCount++
-			}
-		}
-
-		// Get actionable count from analyzer
-		actionableCount := len(analyzer.GetActionableIssues())
-
-		// Get cycles (method returns a copy)
-		cycles := stats.Cycles()
-
-		// Build GraphStats from analysis
-		graphStats := baseline.GraphStats{
-			NodeCount:       stats.NodeCount,
-			EdgeCount:       stats.EdgeCount,
-			Density:         stats.Density,
-			OpenCount:       openCount,
-			ClosedCount:     closedCount,
-			BlockedCount:    blockedCount,
-			CycleCount:      len(cycles),
-			ActionableCount: actionableCount,
-		}
-
-		// Build TopMetrics from analysis (top 10 for each)
-		// Methods return copies of the maps
-		topMetrics := baseline.TopMetrics{
-			PageRank:     buildMetricItems(stats.PageRank(), 10),
-			Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-			CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-			Hubs:         buildMetricItems(stats.Hubs(), 10),
-			Authorities:  buildMetricItems(stats.Authorities(), 10),
-		}
-
-		bl := baseline.New(graphStats, topMetrics, cycles, *saveBaseline)
-
-		if err := bl.Save(baselinePath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving baseline: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Baseline saved to %s\n", baselinePath)
-		fmt.Print(bl.Summary())
-		os.Exit(0)
-	}
-
-	// Handle --check-drift
-	if *checkDrift {
-		if !baseline.Exists(baselinePath) {
-			fmt.Fprintln(os.Stderr, "Error: No baseline found.")
-			fmt.Fprintln(os.Stderr, "Create one with: bv --save-baseline \"description\"")
-			os.Exit(1)
-		}
-
-		bl, err := baseline.Load(baselinePath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading baseline: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Run analysis on current issues
-		analyzer := analysis.NewAnalyzer(issues)
-		if *forceFullAnalysis {
-			cfg := analysis.FullAnalysisConfig()
-			analyzer.SetConfig(&cfg)
-		}
-		stats := analyzer.Analyze()
-
-		// Compute status counts from issues
-		openCount, closedCount, blockedCount := 0, 0, 0
-		for _, issue := range issues {
-			switch issue.Status {
-			case model.StatusOpen, model.StatusInProgress:
-				openCount++
-			case model.StatusClosed:
-				closedCount++
-			case model.StatusBlocked:
-				blockedCount++
-			}
-		}
-		actionableCount := len(analyzer.GetActionableIssues())
-		cycles := stats.Cycles()
-
-		// Build current snapshot as baseline for comparison
-		currentStats := baseline.GraphStats{
-			NodeCount:       stats.NodeCount,
-			EdgeCount:       stats.EdgeCount,
-			Density:         stats.Density,
-			OpenCount:       openCount,
-			ClosedCount:     closedCount,
-			BlockedCount:    blockedCount,
-			CycleCount:      len(cycles),
-			ActionableCount: actionableCount,
-		}
-		currentMetrics := baseline.TopMetrics{
-			PageRank:     buildMetricItems(stats.PageRank(), 10),
-			Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-			CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-			Hubs:         buildMetricItems(stats.Hubs(), 10),
-			Authorities:  buildMetricItems(stats.Authorities(), 10),
-		}
-		current := baseline.New(currentStats, currentMetrics, cycles, "current")
-
-		// Load drift config and run calculator
-		driftConfig, err := drift.LoadConfig(projectDir)
-		if err != nil {
-			if !envRobot {
-				fmt.Fprintf(os.Stderr, "Warning: Error loading drift config: %v\n", err)
-			}
-			driftConfig = drift.DefaultConfig()
-		}
-
-		calc := drift.NewCalculator(bl, current, driftConfig)
-		result := calc.Calculate()
-
-		if *robotDriftCheck {
-			// JSON output
 			output := struct {
-				GeneratedAt string `json:"generated_at"`
-				HasDrift    bool   `json:"has_drift"`
-				ExitCode    int    `json:"exit_code"`
-				Summary     struct {
-					Critical int `json:"critical"`
-					Warning  int `json:"warning"`
-					Info     int `json:"info"`
-				} `json:"summary"`
-				Alerts   []drift.Alert `json:"alerts"`
-				Baseline struct {
-					CreatedAt string `json:"created_at"`
-					CommitSHA string `json:"commit_sha,omitempty"`
-				} `json:"baseline"`
+				GeneratedAt    string                       `json:"generated_at"`
+				DataHash       string                       `json:"data_hash"`
+				AnalysisConfig analysis.LabelHealthConfig   `json:"analysis_config"`
+				Results        analysis.LabelAnalysisResult `json:"results"`
+				UsageHints     []string                     `json:"usage_hints"`
+			}{
+				GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+				DataHash:       dataHash,
+				AnalysisConfig: cfg,
+				Results:        results,
+				UsageHints: []string{
+					"jq '.results.summaries | sort_by(.health) | .[:3]' - Critical labels",
+					"jq '.results.labels[] | select(.health_level == \"critical\")' - Critical details",
+					"jq '.results.cross_label_flow.bottleneck_labels' - Bottleneck labels",
+					"jq '.results.attention_needed' - Labels needing attention",
+				},
+			}
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding label health: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		// Handle --robot-label-flow (can be used stand-alone to avoid full health computation)
+		if *robotLabelFlow {
+			cfg := analysis.DefaultLabelHealthConfig()
+			flow := analysis.ComputeCrossLabelFlow(issues, cfg)
+			output := struct {
+				GeneratedAt string                     `json:"generated_at"`
+				DataHash    string                     `json:"data_hash"`
+				Flow        analysis.CrossLabelFlow    `json:"flow"`
+				Config      analysis.LabelHealthConfig `json:"analysis_config"`
+				UsageHints  []string                   `json:"usage_hints"`
 			}{
 				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-				HasDrift:    result.HasDrift,
-				ExitCode:    result.ExitCode(),
-				Alerts:      result.Alerts,
+				DataHash:    dataHash,
+				Flow:        flow,
+				Config:      cfg,
+				UsageHints: []string{
+					"jq '.flow.bottleneck_labels' - labels blocking the most others",
+					"jq '.flow.dependencies[] | select(.issue_count > 0) | {from:.from_label,to:.to_label,count:.issue_count}'",
+					"jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
+				},
 			}
-			output.Summary.Critical = result.CriticalCount
-			output.Summary.Warning = result.WarningCount
-			output.Summary.Info = result.InfoCount
-			output.Baseline.CreatedAt = bl.CreatedAt.Format(time.RFC3339)
-			output.Baseline.CommitSHA = bl.CommitSHA
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding label flow: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		// Handle --robot-label-attention (bv-121)
+		if *robotLabelAttention {
+			cfg := analysis.DefaultLabelHealthConfig()
+			result := analysis.ComputeLabelAttentionScores(issues, cfg, time.Now().UTC())
+
+			// Apply limit
+			limit := *attentionLimit
+			if limit <= 0 {
+				limit = 5
+			}
+			if limit > len(result.Labels) {
+				limit = len(result.Labels)
+			}
+
+			// Build limited output
+			type AttentionOutput struct {
+				GeneratedAt string `json:"generated_at"`
+				DataHash    string `json:"data_hash"`
+				Limit       int    `json:"limit"`
+				TotalLabels int    `json:"total_labels"`
+				Labels      []struct {
+					Rank            int     `json:"rank"`
+					Label           string  `json:"label"`
+					AttentionScore  float64 `json:"attention_score"`
+					NormalizedScore float64 `json:"normalized_score"`
+					Reason          string  `json:"reason"`
+					OpenCount       int     `json:"open_count"`
+					BlockedCount    int     `json:"blocked_count"`
+					StaleCount      int     `json:"stale_count"`
+					PageRankSum     float64 `json:"pagerank_sum"`
+					VelocityFactor  float64 `json:"velocity_factor"`
+				} `json:"labels"`
+				UsageHints []string `json:"usage_hints"`
+			}
+
+			output := AttentionOutput{
+				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+				DataHash:    dataHash,
+				Limit:       limit,
+				TotalLabels: result.TotalLabels,
+				UsageHints: []string{
+					"jq '.labels[0]' - top attention label details",
+					"jq '.labels[] | select(.blocked_count > 0)' - labels with blocked issues",
+					"jq '.labels[] | {label:.label,score:.attention_score,reason:.reason}'",
+				},
+			}
+
+			for i := 0; i < limit; i++ {
+				score := result.Labels[i]
+				// Build human-readable reason
+				reason := buildAttentionReason(score)
+				output.Labels = append(output.Labels, struct {
+					Rank            int     `json:"rank"`
+					Label           string  `json:"label"`
+					AttentionScore  float64 `json:"attention_score"`
+					NormalizedScore float64 `json:"normalized_score"`
+					Reason          string  `json:"reason"`
+					OpenCount       int     `json:"open_count"`
+					BlockedCount    int     `json:"blocked_count"`
+					StaleCount      int     `json:"stale_count"`
+					PageRankSum     float64 `json:"pagerank_sum"`
+					VelocityFactor  float64 `json:"velocity_factor"`
+				}{
+					Rank:            score.Rank,
+					Label:           score.Label,
+					AttentionScore:  score.AttentionScore,
+					NormalizedScore: score.NormalizedScore,
+					Reason:          reason,
+					OpenCount:       score.OpenCount,
+					BlockedCount:    score.BlockedCount,
+					StaleCount:      score.StaleCount,
+					PageRankSum:     score.PageRankSum,
+					VelocityFactor:  score.VelocityFactor,
+				})
+			}
 
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding drift result: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error encoding label attention: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// Human-readable output
-			fmt.Print(result.Summary())
+			os.Exit(0)
 		}
 
-		os.Exit(result.ExitCode())
-	}
+		// Handle --robot-graph (bv-136)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-graph", robotDispatchContext)
 
-	if *robotInsights {
-		analyzer := analysis.NewAnalyzer(issues)
-		if *forceFullAnalysis {
-			cfg := analysis.FullAnalysisConfig()
-			analyzer.SetConfig(&cfg)
-		}
-		stats := analyzer.Analyze()
-		// Generate top 50 lists for summary, but full stats are included in the struct
-		insights := stats.GenerateInsights(50)
+		// Handle --export-graph (bv-94) - PNG/SVG/HTML export
+		if *exportGraph != "" {
+			analyzer := analysis.NewAnalyzer(issues)
+			stats := analyzer.Analyze()
 
-		// Add project-level velocity snapshot (using dedicated helper for efficiency)
-		if v := analysis.ComputeProjectVelocity(issues, time.Now(), 8); v != nil {
-			snap := &analysis.VelocitySnapshot{
-				Closed7:   v.ClosedLast7Days,
-				Closed30:  v.ClosedLast30Days,
-				AvgDays:   v.AvgDaysToClose,
-				Estimated: v.Estimated,
-			}
-			if len(v.Weekly) > 0 {
-				snap.Weekly = make([]int, len(v.Weekly))
-				for i := range v.Weekly {
-					snap.Weekly[i] = v.Weekly[i].Closed
-				}
-			}
-			insights.Velocity = snap
-		}
-
-		// Optional cap for metric maps to avoid overload
-		limitMaps := func(m map[string]float64, limit int) map[string]float64 {
-			if limit <= 0 || limit >= len(m) {
-				return m
-			}
-			type kv struct {
-				k string
-				v float64
-			}
-			var items []kv
-			for k, v := range m {
-				items = append(items, kv{k, v})
-			}
-			sort.Slice(items, func(i, j int) bool {
-				if items[i].v == items[j].v {
-					return items[i].k < items[j].k
-				}
-				return items[i].v > items[j].v
-			})
-			trim := make(map[string]float64, limit)
-			for i := 0; i < limit; i++ {
-				trim[items[i].k] = items[i].v
-			}
-			return trim
-		}
-
-		limitMapInt := func(m map[string]int, limit int) map[string]int {
-			if limit <= 0 || len(m) <= limit {
-				return m
-			}
-			trim := make(map[string]int, limit)
-			count := 0
-			for k, v := range m {
-				trim[k] = v
-				count++
-				if count >= limit {
-					break
-				}
-			}
-			return trim
-		}
-
-		limitSlice := func(s []string, limit int) []string {
-			if limit <= 0 || len(s) <= limit {
-				return s
-			}
-			return s[:limit]
-		}
-
-		// Default cap to keep payload small; allow override via env
-		mapLimit := 200
-		if v := os.Getenv("BV_INSIGHTS_MAP_LIMIT"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				mapLimit = n
-			}
-		}
-
-		fullStats := struct {
-			PageRank          map[string]float64 `json:"pagerank"`
-			Betweenness       map[string]float64 `json:"betweenness"`
-			Eigenvector       map[string]float64 `json:"eigenvector"`
-			Hubs              map[string]float64 `json:"hubs"`
-			Authorities       map[string]float64 `json:"authorities"`
-			CriticalPathScore map[string]float64 `json:"critical_path_score"`
-			CoreNumber        map[string]int     `json:"core_number"`
-			Slack             map[string]float64 `json:"slack"`
-			Articulation      []string           `json:"articulation_points"`
-		}{
-			PageRank:          limitMaps(stats.PageRank(), mapLimit),
-			Betweenness:       limitMaps(stats.Betweenness(), mapLimit),
-			Eigenvector:       limitMaps(stats.Eigenvector(), mapLimit),
-			Hubs:              limitMaps(stats.Hubs(), mapLimit),
-			Authorities:       limitMaps(stats.Authorities(), mapLimit),
-			CriticalPathScore: limitMaps(stats.CriticalPathScore(), mapLimit),
-			CoreNumber:        limitMapInt(stats.CoreNumber(), mapLimit),
-			Slack:             limitMaps(stats.Slack(), mapLimit),
-			Articulation:      limitSlice(stats.ArticulationPoints(), mapLimit),
-		}
-
-		// Get top what-if deltas for issues with highest downstream impact (bv-83)
-		topWhatIfs := analyzer.TopWhatIfDeltas(10)
-
-		// Generate advanced insights with canonical structure (bv-181)
-		advancedInsights := analyzer.GenerateAdvancedInsights(analysis.DefaultAdvancedInsightsConfig())
-
-		output := struct {
-			GeneratedAt    string                  `json:"generated_at"`
-			DataHash       string                  `json:"data_hash"`
-			AsOf           string                  `json:"as_of,omitempty"`        // Historical snapshot ref
-			AsOfCommit     string                  `json:"as_of_commit,omitempty"` // Resolved commit SHA
-			AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
-			Status         analysis.MetricStatus   `json:"status"`
-			LabelScope     string                  `json:"label_scope,omitempty"`   // bv-122: Label filter applied
-			LabelContext   *analysis.LabelHealth   `json:"label_context,omitempty"` // bv-122: Health context for scoped label
-			analysis.Insights
-			FullStats        interface{}                `json:"full_stats"`
-			TopWhatIfs       []analysis.WhatIfEntry     `json:"top_what_ifs,omitempty"`      // Issues with highest downstream impact (bv-83)
-			AdvancedInsights *analysis.AdvancedInsights `json:"advanced_insights,omitempty"` // bv-181: Canonical advanced features
-			UsageHints       []string                   `json:"usage_hints"`                 // bv-84: Agent-friendly hints
-		}{
-			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-			DataHash:         dataHash,
-			AsOf:             *asOf,
-			AsOfCommit:       asOfResolved,
-			AnalysisConfig:   stats.Config,
-			Status:           stats.Status(),
-			LabelScope:       *labelScope,
-			LabelContext:     labelScopeContext,
-			Insights:         insights,
-			FullStats:        fullStats,
-			TopWhatIfs:       topWhatIfs,
-			AdvancedInsights: advancedInsights,
-			UsageHints: []string{
-				"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
-				"jq '.CriticalPath[:3]' - Top 3 critical path items",
-				"jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
-				"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
-				"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
-				"jq '.full_stats.articulation_points' - Structural cut points",
-				"jq '.Slack[:5]' - Nodes with slack (good parallel work candidates)",
-				"jq '.Cycles | length' - Count of detected cycles",
-				"jq '.advanced_insights.cycle_break' - Cycle break suggestions (bv-181)",
-				"BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes",
-			},
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding insights: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	if *robotPlan {
-		analyzer := analysis.NewAnalyzer(issues)
-		// For --robot-plan we primarily need Phase 1 metrics (degree/topo/density).
-		// However, we still emit a stable status contract for agents. If the user
-		// explicitly asks for full analysis, honor it; otherwise, skip expensive
-		// centrality metrics and record the skip reasons deterministically.
-		cfg := analysis.ConfigForSize(len(issues), countEdges(issues))
-		if *forceFullAnalysis {
-			cfg = analysis.FullAnalysisConfig()
-		} else {
-			const skipReason = "not computed for --robot-plan"
-			cfg.ComputePageRank = false
-			cfg.PageRankSkipReason = skipReason
-			cfg.ComputeBetweenness = false
-			cfg.BetweennessMode = analysis.BetweennessSkip
-			cfg.BetweennessSkipReason = skipReason
-			cfg.ComputeHITS = false
-			cfg.HITSSkipReason = skipReason
-			cfg.ComputeEigenvector = false
-			cfg.ComputeCriticalPath = false
-			cfg.ComputeCycles = false
-			cfg.CyclesSkipReason = skipReason
-		}
-
-		plan := analyzer.GetExecutionPlan()
-
-		stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), cfg)
-		stats.WaitForPhase2()
-		status := stats.Status()
-
-		// Wrap with metadata
-		output := struct {
-			GeneratedAt    string                  `json:"generated_at"`
-			DataHash       string                  `json:"data_hash"`
-			AsOf           string                  `json:"as_of,omitempty"`        // Historical snapshot ref
-			AsOfCommit     string                  `json:"as_of_commit,omitempty"` // Resolved commit SHA
-			AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
-			Status         analysis.MetricStatus   `json:"status"`
-			LabelScope     string                  `json:"label_scope,omitempty"`   // bv-122: Label filter applied
-			LabelContext   *analysis.LabelHealth   `json:"label_context,omitempty"` // bv-122: Health context for scoped label
-			Plan           analysis.ExecutionPlan  `json:"plan"`
-			UsageHints     []string                `json:"usage_hints"` // bv-84: Agent-friendly hints
-		}{
-			GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
-			DataHash:       dataHash,
-			AsOf:           *asOf,
-			AsOfCommit:     asOfResolved,
-			AnalysisConfig: cfg,
-			Status:         status,
-			LabelScope:     *labelScope,
-			LabelContext:   labelScopeContext,
-			Plan:           plan,
-			UsageHints: []string{
-				"jq '.plan.tracks | length' - Number of parallel execution tracks",
-				"jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
-				"jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
-				"jq '.plan.summary' - High-level execution summary",
-				"jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
-			},
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding execution plan: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	if *robotPriority {
-		analyzer := analysis.NewAnalyzer(issues)
-		cfg := analysis.ConfigForSize(len(issues), countEdges(issues))
-		if *forceFullAnalysis {
-			cfg = analysis.FullAnalysisConfig()
-		}
-		analyzer.SetConfig(&cfg)
-		stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), cfg)
-		stats.WaitForPhase2()
-		status := stats.Status()
-
-		// Use enhanced recommendations with what-if deltas and top reasons (bv-83)
-		recommendations := analyzer.GenerateEnhancedRecommendations()
-
-		// Apply robot filters (bv-84)
-		filtered := make([]analysis.EnhancedPriorityRecommendation, 0, len(recommendations))
-		issueMap := make(map[string]model.Issue, len(issues))
-		for _, iss := range issues {
-			issueMap[iss.ID] = iss
-		}
-		for _, rec := range recommendations {
-			// Filter by minimum confidence
-			if *robotMinConf > 0 && rec.Confidence < *robotMinConf {
-				continue
-			}
-			// Filter by label
-			if *robotByLabel != "" {
-				if iss, ok := issueMap[rec.IssueID]; ok {
-					hasLabel := false
+			// Apply label filter if specified
+			exportIssues := issues
+			if *labelScope != "" {
+				var filtered []model.Issue
+				for _, iss := range issues {
 					for _, lbl := range iss.Labels {
-						if lbl == *robotByLabel {
-							hasLabel = true
+						if strings.EqualFold(lbl, *labelScope) {
+							filtered = append(filtered, iss)
 							break
 						}
 					}
-					if !hasLabel {
-						continue
-					}
-				} else {
-					continue
+				}
+				exportIssues = filtered
+			}
+
+			if len(exportIssues) == 0 {
+				fmt.Fprintf(os.Stderr, "No issues to export (check filters)\n")
+				os.Exit(1)
+			}
+
+			// Get project name from current directory
+			cwd, cwdErr := os.Getwd()
+			projectName := "project"
+			if cwdErr == nil {
+				projectName = filepath.Base(cwd)
+			}
+
+			// Check if HTML export requested (interactive graph)
+			if strings.HasSuffix(strings.ToLower(*exportGraph), ".html") || *exportGraph == "html" || *exportGraph == "interactive" {
+				title := *graphTitle
+				if title == "" {
+					title = projectName
+				}
+
+				// Compute triage for the graph export
+				triageOpts := analysis.TriageOptions{WaitForPhase2: true}
+				triage := analysis.ComputeTriageWithOptions(exportIssues, triageOpts)
+
+				opts := export.InteractiveGraphOptions{
+					Issues:      exportIssues,
+					Stats:       &stats,
+					Triage:      &triage,
+					Title:       title,
+					DataHash:    dataHash,
+					Path:        *exportGraph,
+					ProjectName: projectName,
+				}
+				// Auto-generate filename if just "html" or "interactive"
+				if *exportGraph == "html" || *exportGraph == "interactive" {
+					opts.Path = ""
+				}
+				outputPath, err := export.GenerateInteractiveGraphHTML(opts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error exporting interactive graph: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("✓ Interactive graph exported to %s (%d nodes, %d edges)\n", outputPath, len(exportIssues), stats.EdgeCount)
+				os.Exit(0)
+			}
+
+			// Static PNG/SVG export (use .html for better interactive graphs)
+			opts := export.GraphSnapshotOptions{
+				Path:     *exportGraph,
+				Title:    *graphTitle,
+				Preset:   *graphPreset,
+				Issues:   exportIssues,
+				Stats:    &stats,
+				DataHash: dataHash,
+			}
+
+			err := export.SaveGraphSnapshot(opts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error exporting graph snapshot: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("✓ Graph exported to %s (%d nodes) - tip: use .html for interactive graphs\n", *exportGraph, len(exportIssues))
+			os.Exit(0)
+		}
+
+		// Handle --robot-alerts (drift + proactive)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-alerts", robotDispatchContext)
+
+		// Handle --robot-suggest (bv-180)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-suggest", robotDispatchContext)
+
+		// Handle --profile-startup
+		if *profileStartup {
+			runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis)
+			os.Exit(0)
+		}
+
+		// Handle --save-baseline
+		if *saveBaseline != "" {
+			analyzer := analysis.NewAnalyzer(issues)
+			if *forceFullAnalysis {
+				cfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&cfg)
+			}
+			stats := analyzer.Analyze()
+
+			// Compute status counts from issues
+			openCount, closedCount, blockedCount := 0, 0, 0
+			for _, issue := range issues {
+				switch issue.Status {
+				case model.StatusOpen, model.StatusInProgress:
+					openCount++
+				case model.StatusClosed:
+					closedCount++
+				case model.StatusBlocked:
+					blockedCount++
 				}
 			}
-			// Filter by assignee
-			if *robotByAssignee != "" {
-				if iss, ok := issueMap[rec.IssueID]; ok {
-					if iss.Assignee != *robotByAssignee {
-						continue
-					}
-				} else {
-					continue
+
+			// Get actionable count from analyzer
+			actionableCount := len(analyzer.GetActionableIssues())
+
+			// Get cycles (method returns a copy)
+			cycles := stats.Cycles()
+
+			// Build GraphStats from analysis
+			graphStats := baseline.GraphStats{
+				NodeCount:       stats.NodeCount,
+				EdgeCount:       stats.EdgeCount,
+				Density:         stats.Density,
+				OpenCount:       openCount,
+				ClosedCount:     closedCount,
+				BlockedCount:    blockedCount,
+				CycleCount:      len(cycles),
+				ActionableCount: actionableCount,
+			}
+
+			// Build TopMetrics from analysis (top 10 for each)
+			// Methods return copies of the maps
+			topMetrics := baseline.TopMetrics{
+				PageRank:     buildMetricItems(stats.PageRank(), 10),
+				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
+				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
+				Hubs:         buildMetricItems(stats.Hubs(), 10),
+				Authorities:  buildMetricItems(stats.Authorities(), 10),
+			}
+
+			bl := baseline.New(graphStats, topMetrics, cycles, *saveBaseline)
+
+			if err := bl.Save(baselinePath); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving baseline: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Baseline saved to %s\n", baselinePath)
+			fmt.Print(bl.Summary())
+			os.Exit(0)
+		}
+
+		// Handle --check-drift
+		if *checkDrift {
+			if !baseline.Exists(baselinePath) {
+				fmt.Fprintln(os.Stderr, "Error: No baseline found.")
+				fmt.Fprintln(os.Stderr, "Create one with: bv --save-baseline \"description\"")
+				os.Exit(1)
+			}
+
+			bl, err := baseline.Load(baselinePath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading baseline: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Run analysis on current issues
+			analyzer := analysis.NewAnalyzer(issues)
+			if *forceFullAnalysis {
+				cfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&cfg)
+			}
+			stats := analyzer.Analyze()
+
+			// Compute status counts from issues
+			openCount, closedCount, blockedCount := 0, 0, 0
+			for _, issue := range issues {
+				switch issue.Status {
+				case model.StatusOpen, model.StatusInProgress:
+					openCount++
+				case model.StatusClosed:
+					closedCount++
+				case model.StatusBlocked:
+					blockedCount++
 				}
 			}
-			filtered = append(filtered, rec)
-		}
-		recommendations = filtered
+			actionableCount := len(analyzer.GetActionableIssues())
+			cycles := stats.Cycles()
 
-		// Apply max results limit
-		maxResults := 10 // Default cap
-		if *robotMaxResults > 0 {
-			maxResults = *robotMaxResults
-		}
-		if len(recommendations) > maxResults {
-			recommendations = recommendations[:maxResults]
-		}
-
-		// Count high confidence recommendations
-		highConfidence := 0
-		for _, rec := range recommendations {
-			if rec.Confidence >= 0.7 {
-				highConfidence++
+			// Build current snapshot as baseline for comparison
+			currentStats := baseline.GraphStats{
+				NodeCount:       stats.NodeCount,
+				EdgeCount:       stats.EdgeCount,
+				Density:         stats.Density,
+				OpenCount:       openCount,
+				ClosedCount:     closedCount,
+				BlockedCount:    blockedCount,
+				CycleCount:      len(cycles),
+				ActionableCount: actionableCount,
 			}
-		}
-
-		// Build output with summary
-		output := struct {
-			GeneratedAt       string                                    `json:"generated_at"`
-			DataHash          string                                    `json:"data_hash"`
-			AsOf              string                                    `json:"as_of,omitempty"`        // Historical snapshot ref
-			AsOfCommit        string                                    `json:"as_of_commit,omitempty"` // Resolved commit SHA
-			AnalysisConfig    analysis.AnalysisConfig                   `json:"analysis_config"`
-			Status            analysis.MetricStatus                     `json:"status"`
-			LabelScope        string                                    `json:"label_scope,omitempty"`   // bv-122: Label filter applied
-			LabelContext      *analysis.LabelHealth                     `json:"label_context,omitempty"` // bv-122: Health context for scoped label
-			Recommendations   []analysis.EnhancedPriorityRecommendation `json:"recommendations"`
-			FieldDescriptions map[string]string                         `json:"field_descriptions"`
-			Filters           struct {
-				MinConfidence float64 `json:"min_confidence,omitempty"`
-				MaxResults    int     `json:"max_results"`
-				ByLabel       string  `json:"by_label,omitempty"`
-				ByAssignee    string  `json:"by_assignee,omitempty"`
-			} `json:"filters"`
-			Summary struct {
-				TotalIssues     int `json:"total_issues"`
-				Recommendations int `json:"recommendations"`
-				HighConfidence  int `json:"high_confidence"`
-			} `json:"summary"`
-			Usage []string `json:"usage_hints"` // bv-84: Agent-friendly hints
-		}{
-			GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
-			DataHash:          dataHash,
-			AsOf:              *asOf,
-			AsOfCommit:        asOfResolved,
-			AnalysisConfig:    cfg,
-			Status:            status,
-			LabelScope:        *labelScope,
-			LabelContext:      labelScopeContext,
-			Recommendations:   recommendations,
-			FieldDescriptions: analysis.DefaultFieldDescriptions(),
-			Usage: []string{
-				"jq '.recommendations[] | select(.confidence > 0.7)' - Filter high confidence",
-				"jq '.recommendations[0].explanation.what_if' - Get top item's impact",
-				"jq '.recommendations | map({id: .issue_id, score: .impact_score})' - Extract IDs and scores",
-				"jq '.recommendations[] | select(.explanation.what_if.parallelization_gain > 0)' - Find items that increase parallel work capacity",
-				"--robot-min-confidence 0.6 - Pre-filter by confidence",
-				"--robot-max-results 5 - Limit to top N results",
-				"--robot-by-label bug - Filter by specific label",
-			},
-		}
-		output.Filters.MinConfidence = *robotMinConf
-		output.Filters.MaxResults = maxResults
-		output.Filters.ByLabel = *robotByLabel
-		output.Filters.ByAssignee = *robotByAssignee
-		output.Summary.TotalIssues = len(issues)
-		output.Summary.Recommendations = len(recommendations)
-		output.Summary.HighConfidence = highConfidence
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding priority recommendations: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	if *robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel {
-		// Attempt to load history for staleness analysis
-		// We use a best-effort approach here - if history isn't available or fails,
-		// we just proceed without staleness data.
-		var historyReport *correlation.HistoryReport
-
-		// bv-perf: Skip history loading if no open issues exist
-		// ComputeStaleness only processes open issues, so loading git history
-		// is wasted work when all issues are closed.
-		hasOpenIssues := false
-		for _, issue := range issues {
-			if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone {
-				hasOpenIssues = true
-				break
+			currentMetrics := baseline.TopMetrics{
+				PageRank:     buildMetricItems(stats.PageRank(), 10),
+				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
+				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
+				Hubs:         buildMetricItems(stats.Hubs(), 10),
+				Authorities:  buildMetricItems(stats.Authorities(), 10),
 			}
+			current := baseline.New(currentStats, currentMetrics, cycles, "current")
+
+			// Load drift config and run calculator
+			driftConfig, err := drift.LoadConfig(projectDir)
+			if err != nil {
+				if !envRobot {
+					fmt.Fprintf(os.Stderr, "Warning: Error loading drift config: %v\n", err)
+				}
+				driftConfig = drift.DefaultConfig()
+			}
+
+			calc := drift.NewCalculator(bl, current, driftConfig)
+			result := calc.Calculate()
+
+			if *robotDriftCheck {
+				// JSON output
+				output := struct {
+					GeneratedAt string `json:"generated_at"`
+					HasDrift    bool   `json:"has_drift"`
+					ExitCode    int    `json:"exit_code"`
+					Summary     struct {
+						Critical int `json:"critical"`
+						Warning  int `json:"warning"`
+						Info     int `json:"info"`
+					} `json:"summary"`
+					Alerts   []drift.Alert `json:"alerts"`
+					Baseline struct {
+						CreatedAt string `json:"created_at"`
+						CommitSHA string `json:"commit_sha,omitempty"`
+					} `json:"baseline"`
+				}{
+					GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+					HasDrift:    result.HasDrift,
+					ExitCode:    result.ExitCode(),
+					Alerts:      result.Alerts,
+				}
+				output.Summary.Critical = result.CriticalCount
+				output.Summary.Warning = result.WarningCount
+				output.Summary.Info = result.InfoCount
+				output.Baseline.CreatedAt = bl.CreatedAt.Format(time.RFC3339)
+				output.Baseline.CommitSHA = bl.CommitSHA
+
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding drift result: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// Human-readable output
+				fmt.Print(result.Summary())
+			}
+
+			os.Exit(result.ExitCode())
 		}
 
-		if hasOpenIssues {
-			if cwd, err := os.Getwd(); err == nil {
-				if beadsDir, err := loader.GetBeadsDir(""); err == nil {
-					if beadsPath, err := loader.FindJSONLPath(beadsDir); err == nil {
-						// Use a smaller limit for triage to keep it fast, unless overridden
-						limit := *historyLimit
-						if limit == 500 { // If default
-							limit = 200 // Use smaller default for triage
-						}
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-insights", robotDispatchContext)
 
-						// Validate repo first
-						if correlation.ValidateRepository(cwd) == nil {
-							beadInfos := make([]correlation.BeadInfo, len(issues))
-							for i, issue := range issues {
-								beadInfos[i] = correlation.BeadInfo{
-									ID:     issue.ID,
-									Title:  issue.Title,
-									Status: string(issue.Status),
+		if *robotInsights {
+			analyzer := analysis.NewAnalyzer(issues)
+			if *forceFullAnalysis {
+				cfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&cfg)
+			}
+			stats := analyzer.Analyze()
+			// Generate top 50 lists for summary, but full stats are included in the struct
+			insights := stats.GenerateInsights(50)
+
+			// Add project-level velocity snapshot (using dedicated helper for efficiency)
+			if v := analysis.ComputeProjectVelocity(issues, time.Now(), 8); v != nil {
+				snap := &analysis.VelocitySnapshot{
+					Closed7:   v.ClosedLast7Days,
+					Closed30:  v.ClosedLast30Days,
+					AvgDays:   v.AvgDaysToClose,
+					Estimated: v.Estimated,
+				}
+				if len(v.Weekly) > 0 {
+					snap.Weekly = make([]int, len(v.Weekly))
+					for i := range v.Weekly {
+						snap.Weekly[i] = v.Weekly[i].Closed
+					}
+				}
+				insights.Velocity = snap
+			}
+
+			// Optional cap for metric maps to avoid overload
+			limitMaps := func(m map[string]float64, limit int) map[string]float64 {
+				if limit <= 0 || limit >= len(m) {
+					return m
+				}
+				type kv struct {
+					k string
+					v float64
+				}
+				var items []kv
+				for k, v := range m {
+					items = append(items, kv{k, v})
+				}
+				sort.Slice(items, func(i, j int) bool {
+					if items[i].v == items[j].v {
+						return items[i].k < items[j].k
+					}
+					return items[i].v > items[j].v
+				})
+				trim := make(map[string]float64, limit)
+				for i := 0; i < limit; i++ {
+					trim[items[i].k] = items[i].v
+				}
+				return trim
+			}
+
+			limitMapInt := func(m map[string]int, limit int) map[string]int {
+				if limit <= 0 || len(m) <= limit {
+					return m
+				}
+				type kv struct {
+					k string
+					v int
+				}
+				var items []kv
+				for k, v := range m {
+					items = append(items, kv{k, v})
+				}
+				sort.Slice(items, func(i, j int) bool {
+					if items[i].v == items[j].v {
+						return items[i].k < items[j].k
+					}
+					return items[i].v > items[j].v
+				})
+				trim := make(map[string]int, limit)
+				for i := 0; i < limit; i++ {
+					trim[items[i].k] = items[i].v
+				}
+				return trim
+			}
+
+			limitSlice := func(s []string, limit int) []string {
+				if limit <= 0 || len(s) <= limit {
+					return s
+				}
+				return s[:limit]
+			}
+
+			// Default cap to keep payload small; allow override via env
+			mapLimit := 200
+			if v := os.Getenv("BV_INSIGHTS_MAP_LIMIT"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					mapLimit = n
+				}
+			}
+
+			fullStats := struct {
+				PageRank          map[string]float64 `json:"pagerank"`
+				Betweenness       map[string]float64 `json:"betweenness"`
+				Eigenvector       map[string]float64 `json:"eigenvector"`
+				Hubs              map[string]float64 `json:"hubs"`
+				Authorities       map[string]float64 `json:"authorities"`
+				CriticalPathScore map[string]float64 `json:"critical_path_score"`
+				CoreNumber        map[string]int     `json:"core_number"`
+				Slack             map[string]float64 `json:"slack"`
+				Articulation      []string           `json:"articulation_points"`
+			}{
+				PageRank:          limitMaps(stats.PageRank(), mapLimit),
+				Betweenness:       limitMaps(stats.Betweenness(), mapLimit),
+				Eigenvector:       limitMaps(stats.Eigenvector(), mapLimit),
+				Hubs:              limitMaps(stats.Hubs(), mapLimit),
+				Authorities:       limitMaps(stats.Authorities(), mapLimit),
+				CriticalPathScore: limitMaps(stats.CriticalPathScore(), mapLimit),
+				CoreNumber:        limitMapInt(stats.CoreNumber(), mapLimit),
+				Slack:             limitMaps(stats.Slack(), mapLimit),
+				Articulation:      limitSlice(stats.ArticulationPoints(), mapLimit),
+			}
+
+			// Get top what-if deltas for issues with highest downstream impact (bv-83)
+			topWhatIfs := analyzer.TopWhatIfDeltas(10)
+
+			// Generate advanced insights with canonical structure (bv-181)
+			advancedInsights := analyzer.GenerateAdvancedInsights(analysis.DefaultAdvancedInsightsConfig())
+
+			output := struct {
+				GeneratedAt    string                  `json:"generated_at"`
+				DataHash       string                  `json:"data_hash"`
+				AsOf           string                  `json:"as_of,omitempty"`        // Historical snapshot ref
+				AsOfCommit     string                  `json:"as_of_commit,omitempty"` // Resolved commit SHA
+				AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
+				Status         analysis.MetricStatus   `json:"status"`
+				LabelScope     string                  `json:"label_scope,omitempty"`   // bv-122: Label filter applied
+				LabelContext   *analysis.LabelHealth   `json:"label_context,omitempty"` // bv-122: Health context for scoped label
+				analysis.Insights
+				FullStats        interface{}                `json:"full_stats"`
+				TopWhatIfs       []analysis.WhatIfEntry     `json:"top_what_ifs,omitempty"`      // Issues with highest downstream impact (bv-83)
+				AdvancedInsights *analysis.AdvancedInsights `json:"advanced_insights,omitempty"` // bv-181: Canonical advanced features
+				UsageHints       []string                   `json:"usage_hints"`                 // bv-84: Agent-friendly hints
+			}{
+				GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+				DataHash:         dataHash,
+				AsOf:             *asOf,
+				AsOfCommit:       asOfResolved,
+				AnalysisConfig:   stats.Config,
+				Status:           stats.Status(),
+				LabelScope:       *labelScope,
+				LabelContext:     labelScopeContext,
+				Insights:         insights,
+				FullStats:        fullStats,
+				TopWhatIfs:       topWhatIfs,
+				AdvancedInsights: advancedInsights,
+				UsageHints: []string{
+					"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
+					"jq '.CriticalPath[:3]' - Top 3 critical path items",
+					"jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
+					"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
+					"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
+					"jq '.full_stats.articulation_points' - Structural cut points",
+					"jq '.Slack[:5]' - Nodes with slack (good parallel work candidates)",
+					"jq '.Cycles | length' - Count of detected cycles",
+					"jq '.advanced_insights.cycle_break' - Cycle break suggestions (bv-181)",
+					"BV_INSIGHTS_MAP_LIMIT=50 bv --robot-insights - Reduce map sizes",
+				},
+			}
+
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding insights: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-plan", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-priority", robotDispatchContext)
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-next", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-track", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-label", robotDispatchContext)
+
+		if *robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel {
+			// Attempt to load history for staleness analysis
+			// We use a best-effort approach here - if history isn't available or fails,
+			// we just proceed without staleness data.
+			var historyReport *correlation.HistoryReport
+
+			// bv-perf: Skip history loading if no open issues exist
+			// ComputeStaleness only processes open issues, so loading git history
+			// is wasted work when all issues are closed.
+			hasOpenIssues := false
+			for _, issue := range issues {
+				if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone {
+					hasOpenIssues = true
+					break
+				}
+			}
+
+			if hasOpenIssues {
+				if cwd, err := os.Getwd(); err == nil {
+					if beadsDir, err := loader.GetBeadsDir(""); err == nil {
+						if beadsPath, err := loader.FindJSONLPath(beadsDir); err == nil {
+							// Use a smaller limit for triage to keep it fast, unless overridden
+							limit := *historyLimit
+							if limit == 500 { // If default
+								limit = 200 // Use smaller default for triage
+							}
+
+							// Validate repo first
+							if correlation.ValidateRepository(cwd) == nil {
+								beadInfos := make([]correlation.BeadInfo, len(issues))
+								for i, issue := range issues {
+									beadInfos[i] = correlation.BeadInfo{
+										ID:     issue.ID,
+										Title:  issue.Title,
+										Status: string(issue.Status),
+									}
+								}
+
+								correlator := correlation.NewCorrelator(cwd, beadsPath)
+								opts := correlation.CorrelatorOptions{Limit: limit}
+
+								// Swallow errors for triage flow - staleness is optional
+								if report, err := correlator.GenerateReport(beadInfos, opts); err == nil {
+									historyReport = report
 								}
 							}
-
-							correlator := correlation.NewCorrelator(cwd, beadsPath)
-							opts := correlation.CorrelatorOptions{Limit: limit}
-
-							// Swallow errors for triage flow - staleness is optional
-							if report, err := correlator.GenerateReport(beadInfos, opts); err == nil {
-								historyReport = report
-							}
 						}
 					}
 				}
 			}
-		}
 
-		// bv-87: Support track/label-aware grouping for multi-agent coordination
-		opts := analysis.TriageOptions{
-			GroupByTrack:  *robotTriageByTrack,
-			GroupByLabel:  *robotTriageByLabel,
-			WaitForPhase2: true, // Triage needs full graph metrics
-			UseFastConfig: true, // Use minimal Phase 2 config for robot mode (bv-t1js)
-			History:       historyReport,
-		}
-		triage := analysis.ComputeTriageWithOptions(issues, opts)
-
-		// bv-90: Load feedback data for output
-		var feedbackInfo *analysis.FeedbackJSON
-		if robotTriageBeadsDir, err := loader.GetBeadsDir(""); err == nil {
-			if feedbackData, err := analysis.LoadFeedback(robotTriageBeadsDir); err == nil && len(feedbackData.Events) > 0 {
-				info := feedbackData.ToJSON()
-				feedbackInfo = &info
+			// bv-87: Support track/label-aware grouping for multi-agent coordination
+			opts := analysis.TriageOptions{
+				GroupByTrack:  *robotTriageByTrack,
+				GroupByLabel:  *robotTriageByLabel,
+				WaitForPhase2: true, // Triage needs full graph metrics
+				UseFastConfig: true, // Use minimal Phase 2 config for robot mode (bv-t1js)
+				History:       historyReport,
 			}
-		}
+			triage := analysis.ComputeTriageWithOptions(issues, opts)
 
-		if *robotNext {
-			// Minimal output: just the top pick
-			envelope := NewRobotEnvelope(dataHash)
-			if len(triage.QuickRef.TopPicks) == 0 {
+			// bv-90: Load feedback data for output
+			var feedbackInfo *analysis.FeedbackJSON
+			if robotTriageBeadsDir, err := loader.GetBeadsDir(""); err == nil {
+				if feedbackData, err := analysis.LoadFeedback(robotTriageBeadsDir); err == nil && len(feedbackData.Events) > 0 {
+					info := feedbackData.ToJSON()
+					feedbackInfo = &info
+				}
+			}
+
+			if *robotNext {
+				// Minimal output: just the top pick
+				envelope := NewRobotEnvelope(dataHash)
+				if len(triage.QuickRef.TopPicks) == 0 {
+					output := struct {
+						RobotEnvelope
+						AsOf       string `json:"as_of,omitempty"`
+						AsOfCommit string `json:"as_of_commit,omitempty"`
+						Message    string `json:"message"`
+					}{
+						RobotEnvelope: envelope,
+						AsOf:          *asOf,
+						AsOfCommit:    asOfResolved,
+						Message:       "No actionable items available",
+					}
+					encoder := newRobotEncoder(os.Stdout)
+					if err := encoder.Encode(output); err != nil {
+						fmt.Fprintf(os.Stderr, "Error encoding robot-next: %v\n", err)
+						os.Exit(1)
+					}
+					os.Exit(0)
+				}
+
+				top := triage.QuickRef.TopPicks[0]
 				output := struct {
 					RobotEnvelope
-					AsOf       string `json:"as_of,omitempty"`
-					AsOfCommit string `json:"as_of_commit,omitempty"`
-					Message    string `json:"message"`
+					AsOf       string   `json:"as_of,omitempty"`
+					AsOfCommit string   `json:"as_of_commit,omitempty"`
+					ID         string   `json:"id"`
+					Title      string   `json:"title"`
+					Score      float64  `json:"score"`
+					Reasons    []string `json:"reasons"`
+					Unblocks   int      `json:"unblocks"`
+					ClaimCmd   string   `json:"claim_command"`
+					ShowCmd    string   `json:"show_command"`
 				}{
 					RobotEnvelope: envelope,
 					AsOf:          *asOf,
 					AsOfCommit:    asOfResolved,
-					Message:       "No actionable items available",
+					ID:            top.ID,
+					Title:         top.Title,
+					Score:         top.Score,
+					Reasons:       top.Reasons,
+					Unblocks:      top.Unblocks,
+					ClaimCmd:      fmt.Sprintf("br update %s --status=in_progress", top.ID),
+					ShowCmd:       fmt.Sprintf("br show %s", top.ID),
 				}
+
 				encoder := newRobotEncoder(os.Stdout)
 				if err := encoder.Encode(output); err != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding robot-next: %v\n", err)
@@ -3004,407 +2716,256 @@ func main() {
 				os.Exit(0)
 			}
 
-			top := triage.QuickRef.TopPicks[0]
+			// Full triage output with usage hints
 			output := struct {
-				RobotEnvelope
-				AsOf       string   `json:"as_of,omitempty"`
-				AsOfCommit string   `json:"as_of_commit,omitempty"`
-				ID         string   `json:"id"`
-				Title      string   `json:"title"`
-				Score      float64  `json:"score"`
-				Reasons    []string `json:"reasons"`
-				Unblocks   int      `json:"unblocks"`
-				ClaimCmd   string   `json:"claim_command"`
-				ShowCmd    string   `json:"show_command"`
+				GeneratedAt string                 `json:"generated_at"`
+				DataHash    string                 `json:"data_hash"`
+				AsOf        string                 `json:"as_of,omitempty"`        // Historical snapshot ref (e.g., HEAD~30)
+				AsOfCommit  string                 `json:"as_of_commit,omitempty"` // Resolved commit SHA
+				Triage      analysis.TriageResult  `json:"triage"`
+				Feedback    *analysis.FeedbackJSON `json:"feedback,omitempty"` // bv-90: Feedback loop state
+				UsageHints  []string               `json:"usage_hints"`        // bv-84: Agent-friendly hints
 			}{
-				RobotEnvelope: envelope,
-				AsOf:          *asOf,
-				AsOfCommit:    asOfResolved,
-				ID:            top.ID,
-				Title:         top.Title,
-				Score:         top.Score,
-				Reasons:       top.Reasons,
-				Unblocks:      top.Unblocks,
-				ClaimCmd:      fmt.Sprintf("br update %s --status=in_progress", top.ID),
-				ShowCmd:       fmt.Sprintf("br show %s", top.ID),
+				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+				DataHash:    dataHash,
+				AsOf:        *asOf,
+				AsOfCommit:  asOfResolved,
+				Triage:      triage,
+				Feedback:    feedbackInfo,
+				UsageHints: []string{
+					"jq '.triage.quick_ref.top_picks[:3]' - Top 3 picks for immediate work",
+					"jq '.triage.recommendations[3:10] | map({id,title,score})' - Next candidates after top picks",
+					"jq '.triage.blockers_to_clear | map(.id)' - High-impact blockers to clear",
+					"jq '.triage.recommendations[] | select(.type == \"bug\")' - Bug-focused recommendations",
+					"jq '.triage.quick_ref.top_picks[] | select(.unblocks > 2)' - High-impact picks",
+					"jq '.triage.quick_wins' - Low-effort, high-impact items",
+					"--robot-next - Get only the single top recommendation",
+					"--robot-triage-by-track - Group by execution track for multi-agent coordination",
+					"--robot-triage-by-label - Group by label for area-focused agents",
+					"jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",
+					"jq '.triage.recommendations_by_label[].claim_command' - Claim commands per label",
+					"jq '.feedback.weight_adjustments' - View feedback-adjusted weights (bv-90)",
+				},
 			}
-
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding robot-next: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error encoding robot-triage: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
 		}
 
-		// Full triage output with usage hints
-		output := struct {
-			GeneratedAt string                 `json:"generated_at"`
-			DataHash    string                 `json:"data_hash"`
-			AsOf        string                 `json:"as_of,omitempty"`        // Historical snapshot ref (e.g., HEAD~30)
-			AsOfCommit  string                 `json:"as_of_commit,omitempty"` // Resolved commit SHA
-			Triage      analysis.TriageResult  `json:"triage"`
-			Feedback    *analysis.FeedbackJSON `json:"feedback,omitempty"` // bv-90: Feedback loop state
-			UsageHints  []string               `json:"usage_hints"`        // bv-84: Agent-friendly hints
-		}{
-			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-			DataHash:    dataHash,
-			AsOf:        *asOf,
-			AsOfCommit:  asOfResolved,
-			Triage:      triage,
-			Feedback:    feedbackInfo,
-			UsageHints: []string{
-				"jq '.triage.quick_ref.top_picks[:3]' - Top 3 picks for immediate work",
-				"jq '.triage.recommendations[3:10] | map({id,title,score})' - Next candidates after top picks",
-				"jq '.triage.blockers_to_clear | map(.id)' - High-impact blockers to clear",
-				"jq '.triage.recommendations[] | select(.type == \"bug\")' - Bug-focused recommendations",
-				"jq '.triage.quick_ref.top_picks[] | select(.unblocks > 2)' - High-impact picks",
-				"jq '.triage.quick_wins' - Low-effort, high-impact items",
-				"--robot-next - Get only the single top recommendation",
-				"--robot-triage-by-track - Group by execution track for multi-agent coordination",
-				"--robot-triage-by-label - Group by label for area-focused agents",
-				"jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",
-				"jq '.triage.recommendations_by_label[].claim_command' - Claim commands per label",
-				"jq '.feedback.weight_adjustments' - View feedback-adjusted weights (bv-90)",
-			},
-		}
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding robot-triage: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
+		// Handle --priority-brief flag (bv-96)
+		if *priorityBrief != "" {
+			fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
+			triage := analysis.ComputeTriage(issues)
 
-	// Handle --priority-brief flag (bv-96)
-	if *priorityBrief != "" {
-		fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
-		triage := analysis.ComputeTriage(issues)
-
-		// Marshal triage to JSON for the export function
-		triageJSON, err := json.Marshal(triage)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling triage data: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Generate the brief
-		config := export.DefaultPriorityBriefConfig()
-		config.DataHash = dataHash
-		brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Write to file
-		if err := os.WriteFile(*priorityBrief, []byte(brief), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
-		os.Exit(0)
-	}
-
-	// Handle --agent-brief flag (bv-131)
-	if *agentBrief != "" {
-		fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
-
-		// Create output directory
-		if err := os.MkdirAll(*agentBrief, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Generate triage data
-		triage := analysis.ComputeTriage(issues)
-		triageJSON, err := json.MarshalIndent(triage, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling triage: %v\n", err)
-			os.Exit(1)
-		}
-		if err := os.WriteFile(filepath.Join(*agentBrief, "triage.json"), triageJSON, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing triage.json: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("  → triage.json")
-
-		// Generate insights
-		analyzer := analysis.NewAnalyzer(issues)
-		stats := analyzer.Analyze()
-		insights := stats.GenerateInsights(50)
-		insightsJSON, err := json.MarshalIndent(insights, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling insights: %v\n", err)
-			os.Exit(1)
-		}
-		if err := os.WriteFile(filepath.Join(*agentBrief, "insights.json"), insightsJSON, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing insights.json: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("  → insights.json")
-
-		// Generate priority brief
-		config := export.DefaultPriorityBriefConfig()
-		config.DataHash = dataHash
-		brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
-			os.Exit(1)
-		}
-		if err := os.WriteFile(filepath.Join(*agentBrief, "brief.md"), []byte(brief), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing brief.md: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("  → brief.md")
-
-		// Generate jq helpers
-		helpers := generateJQHelpers()
-		if err := os.WriteFile(filepath.Join(*agentBrief, "helpers.md"), []byte(helpers), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing helpers.md: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("  → helpers.md")
-
-		// Generate meta.json with hash and config
-		meta := struct {
-			GeneratedAt string   `json:"generated_at"`
-			DataHash    string   `json:"data_hash"`
-			IssueCount  int      `json:"issue_count"`
-			Version     string   `json:"version"`
-			Files       []string `json:"files"`
-		}{
-			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-			DataHash:    dataHash,
-			IssueCount:  len(issues),
-			Version:     version.Version,
-			Files:       []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
-		}
-		metaJSON, _ := json.MarshalIndent(meta, "", "  ")
-		if err := os.WriteFile(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing meta.json: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("  → meta.json")
-
-		fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
-		os.Exit(0)
-	}
-
-	// Handle --emit-script flag (bv-89)
-	if *emitScript {
-		triage := analysis.ComputeTriage(issues)
-
-		// Determine script limit
-		limit := *scriptLimit
-		if limit <= 0 {
-			limit = 5
-		}
-
-		// Collect top recommendations
-		recs := triage.Recommendations
-		if len(recs) > limit {
-			recs = recs[:limit]
-		}
-
-		// Build script header with hash/config
-		var sb strings.Builder
-		switch *scriptFormat {
-		case "fish":
-			sb.WriteString("#!/usr/bin/env fish\n")
-		case "zsh":
-			sb.WriteString("#!/usr/bin/env zsh\n")
-		default:
-			sb.WriteString("#!/usr/bin/env bash\n")
-			sb.WriteString("set -euo pipefail\n")
-		}
-
-		sb.WriteString(fmt.Sprintf("# Generated by bv --emit-script at %s\n", time.Now().UTC().Format(time.RFC3339)))
-		sb.WriteString(fmt.Sprintf("# Data hash: %s\n", dataHash))
-		sb.WriteString(fmt.Sprintf("# Top %d recommendations from %d actionable items\n", len(recs), len(triage.Recommendations)))
-		sb.WriteString("#\n")
-		sb.WriteString("# Usage: source this script or run it directly\n")
-		sb.WriteString("# Each command will claim and show the recommended issue\n")
-		sb.WriteString("#\n\n")
-
-		if len(recs) == 0 {
-			sb.WriteString("echo 'No actionable recommendations available'\n")
-			sb.WriteString("exit 0\n")
-		} else {
-			// Generate commands for each recommendation
-			for i, rec := range recs {
-				sb.WriteString(fmt.Sprintf("# %d. %s (score: %.3f)\n", i+1, rec.Title, rec.Score))
-				if len(rec.Reasons) > 0 {
-					sb.WriteString(fmt.Sprintf("#    Reason: %s\n", rec.Reasons[0]))
-				}
-				if len(rec.UnblocksIDs) > 0 {
-					sb.WriteString(fmt.Sprintf("#    Unblocks: %d downstream items\n", len(rec.UnblocksIDs)))
-				}
-
-				// Claim command
-				sb.WriteString(fmt.Sprintf("# To claim: br update %s --status=in_progress\n", rec.ID))
-				// Show command
-				sb.WriteString(fmt.Sprintf("br show %s\n", rec.ID))
-				sb.WriteString("\n")
+			// Marshal triage to JSON for the export function
+			triageJSON, err := json.Marshal(triage)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling triage data: %v\n", err)
+				os.Exit(1)
 			}
 
-			// Add summary section
-			sb.WriteString("# === Quick Actions ===\n")
-			sb.WriteString("# To claim the top pick:\n")
-			if len(recs) > 0 {
-				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", recs[0].ID))
+			// Generate the brief
+			config := export.DefaultPriorityBriefConfig()
+			config.DataHash = dataHash
+			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
+				os.Exit(1)
 			}
+
+			// Write to file
+			if err := os.WriteFile(*priorityBrief, []byte(brief), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
+			os.Exit(0)
+		}
+
+		// Handle --agent-brief flag (bv-131)
+		if *agentBrief != "" {
+			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
+
+			// Create output directory
+			if err := os.MkdirAll(*agentBrief, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Generate triage data
+			triage := analysis.ComputeTriage(issues)
+			triageJSON, err := json.MarshalIndent(triage, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling triage: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(filepath.Join(*agentBrief, "triage.json"), triageJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing triage.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → triage.json")
+
+			// Generate insights
+			analyzer := analysis.NewAnalyzer(issues)
+			stats := analyzer.Analyze()
+			insights := stats.GenerateInsights(50)
+			insightsJSON, err := json.MarshalIndent(insights, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling insights: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(filepath.Join(*agentBrief, "insights.json"), insightsJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing insights.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → insights.json")
+
+			// Generate priority brief
+			config := export.DefaultPriorityBriefConfig()
+			config.DataHash = dataHash
+			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(filepath.Join(*agentBrief, "brief.md"), []byte(brief), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing brief.md: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → brief.md")
+
+			// Generate jq helpers
+			helpers := generateJQHelpers()
+			if err := os.WriteFile(filepath.Join(*agentBrief, "helpers.md"), []byte(helpers), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing helpers.md: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → helpers.md")
+
+			// Generate meta.json with hash and config
+			meta := struct {
+				GeneratedAt string   `json:"generated_at"`
+				DataHash    string   `json:"data_hash"`
+				IssueCount  int      `json:"issue_count"`
+				Version     string   `json:"version"`
+				Files       []string `json:"files"`
+			}{
+				GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+				DataHash:    dataHash,
+				IssueCount:  len(issues),
+				Version:     version.Version,
+				Files:       []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
+			}
+			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
+			if err := os.WriteFile(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing meta.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → meta.json")
+
+			fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
+			os.Exit(0)
+		}
+
+		// Handle --emit-script flag (bv-89)
+		if *emitScript {
+			triage := analysis.ComputeTriage(issues)
+
+			// Determine script limit
+			limit := *scriptLimit
+			if limit <= 0 {
+				limit = 5
+			}
+
+			// Collect top recommendations
+			recs := triage.Recommendations
+			if len(recs) > limit {
+				recs = recs[:limit]
+			}
+
+			// Build script header with hash/config
+			var sb strings.Builder
+			switch *scriptFormat {
+			case "fish":
+				sb.WriteString("#!/usr/bin/env fish\n")
+			case "zsh":
+				sb.WriteString("#!/usr/bin/env zsh\n")
+			default:
+				sb.WriteString("#!/usr/bin/env bash\n")
+				sb.WriteString("set -euo pipefail\n")
+			}
+
+			sb.WriteString(fmt.Sprintf("# Generated by bv --emit-script at %s\n", time.Now().UTC().Format(time.RFC3339)))
+			sb.WriteString(fmt.Sprintf("# Data hash: %s\n", dataHash))
+			sb.WriteString(fmt.Sprintf("# Top %d recommendations from %d actionable items\n", len(recs), len(triage.Recommendations)))
 			sb.WriteString("#\n")
-			sb.WriteString("# To claim all listed items (uncomment to enable):\n")
-			for _, rec := range recs {
-				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", rec.ID))
-			}
-		}
+			sb.WriteString("# Usage: source this script or run it directly\n")
+			sb.WriteString("# Each command will claim and show the recommended issue\n")
+			sb.WriteString("#\n\n")
 
-		fmt.Print(sb.String())
-		os.Exit(0)
-	}
+			if len(recs) == 0 {
+				sb.WriteString("echo 'No actionable recommendations available'\n")
+				sb.WriteString("exit 0\n")
+			} else {
+				// Generate commands for each recommendation
+				for i, rec := range recs {
+					sb.WriteString(fmt.Sprintf("# %d. %s (score: %.3f)\n", i+1, rec.Title, rec.Score))
+					if len(rec.Reasons) > 0 {
+						sb.WriteString(fmt.Sprintf("#    Reason: %s\n", rec.Reasons[0]))
+					}
+					if len(rec.UnblocksIDs) > 0 {
+						sb.WriteString(fmt.Sprintf("#    Unblocks: %d downstream items\n", len(rec.UnblocksIDs)))
+					}
 
-	// Handle --robot-history flag
-	if *robotHistory || *beadHistory != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
+					// Claim command
+					sb.WriteString(fmt.Sprintf("# To claim: br update %s --status=in_progress\n", rec.ID))
+					// Show command
+					sb.WriteString(fmt.Sprintf("br show %s\n", rec.ID))
+					sb.WriteString("\n")
+				}
 
-		// Validate repository
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Resolve beads file path (bv-history fix, respects BEADS_DIR)
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build correlator options
-		opts := correlation.CorrelatorOptions{
-			BeadID: *beadHistory,
-			Limit:  *historyLimit,
-		}
-
-		// Parse --history-since if provided
-		if *historySince != "" {
-			since, err := recipe.ParseRelativeTime(*historySince, time.Now())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --history-since: %v\n", err)
-				os.Exit(1)
-			}
-			if !since.IsZero() {
-				opts.Since = &since
-			}
-		}
-
-		// Convert issues to BeadInfo for correlator
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		// Generate report with explicit beads path
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlator.GenerateReport(beadInfos, opts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Apply confidence filter if specified
-		if *minConfidence > 0 {
-			scorer := correlation.NewScorer()
-			report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, *minConfidence)
-
-			// Rebuild commit index after filtering
-			report.CommitIndex = make(correlation.CommitIndex)
-			for beadID, history := range report.Histories {
-				for _, commit := range history.Commits {
-					report.CommitIndex[commit.SHA] = append(report.CommitIndex[commit.SHA], beadID)
+				// Add summary section
+				sb.WriteString("# === Quick Actions ===\n")
+				sb.WriteString("# To claim the top pick:\n")
+				if len(recs) > 0 {
+					sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", recs[0].ID))
+				}
+				sb.WriteString("#\n")
+				sb.WriteString("# To claim all listed items (uncomment to enable):\n")
+				for _, rec := range recs {
+					sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", rec.ID))
 				}
 			}
 
-			// Update stats
-			report.Stats.BeadsWithCommits = 0
-			for _, history := range report.Histories {
-				if len(history.Commits) > 0 {
-					report.Stats.BeadsWithCommits++
-				}
-			}
-		}
-
-		// Output JSON
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(report); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding history report: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle correlation audit commands (bv-e1u6)
-	if *robotExplainCorrelation != "" || *robotConfirmCorrelation != "" || *robotRejectCorrelation != "" || *robotCorrelationStats {
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		feedbackStore := correlation.NewFeedbackStore(beadsDir)
-		if err := feedbackStore.Load(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Handle --robot-correlation-stats
-		if *robotCorrelationStats {
-			stats := feedbackStore.GetStats()
-			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(stats); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding stats: %v\n", err)
-				os.Exit(1)
-			}
+			fmt.Print(sb.String())
 			os.Exit(0)
 		}
 
-		// Parse SHA:beadID format
-		parseCorrelationArg := func(arg string) (string, string, error) {
-			parts := strings.SplitN(arg, ":", 2)
-			if len(parts) != 2 {
-				return "", "", fmt.Errorf("expected format: SHA:beadID, got: %s", arg)
-			}
-			return parts[0], parts[1], nil
-		}
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-history", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "bead-history", robotDispatchContext)
 
-		// Handle --robot-explain-correlation
-		if *robotExplainCorrelation != "" {
-			commitSHA, beadID, err := parseCorrelationArg(*robotExplainCorrelation)
+		// Handle --robot-history flag
+		if *robotHistory || *beadHistory != "" {
+			cwd, err := os.Getwd()
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Validate repository
+			if err := correlation.ValidateRepository(cwd); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 
-			// Generate history report to find the correlation
-			cwd, err := os.Getwd()
+			// Resolve beads file path (bv-history fix, respects BEADS_DIR)
+			beadsDir, err := loader.GetBeadsDir("")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
 				os.Exit(1)
 			}
 			beadsPath, err := loader.FindJSONLPath(beadsDir)
@@ -3412,7 +2973,560 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
 				os.Exit(1)
 			}
+
+			// Build correlator options
+			opts := correlation.CorrelatorOptions{
+				BeadID: *beadHistory,
+				Limit:  *historyLimit,
+			}
+
+			// Parse --history-since if provided
+			if *historySince != "" {
+				since, err := recipe.ParseRelativeTime(*historySince, time.Now())
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error parsing --history-since: %v\n", err)
+					os.Exit(1)
+				}
+				if !since.IsZero() {
+					opts.Since = &since
+				}
+			}
+
+			// Convert issues to BeadInfo for correlator
+			beadInfos := make([]correlation.BeadInfo, len(issues))
+			for i, issue := range issues {
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				}
+			}
+
+			// Generate report with explicit beads path
 			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlator.GenerateReport(beadInfos, opts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Apply confidence filter if specified
+			if *minConfidence > 0 {
+				scorer := correlation.NewScorer()
+				report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, *minConfidence)
+
+				// Rebuild commit index after filtering
+				report.CommitIndex = make(correlation.CommitIndex)
+				for beadID, history := range report.Histories {
+					for _, commit := range history.Commits {
+						report.CommitIndex[commit.SHA] = append(report.CommitIndex[commit.SHA], beadID)
+					}
+				}
+
+				// Update stats
+				report.Stats.BeadsWithCommits = 0
+				for _, history := range report.Histories {
+					if len(history.Commits) > 0 {
+						report.Stats.BeadsWithCommits++
+					}
+				}
+			}
+
+			// Output JSON
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(report); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding history report: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-correlation-stats", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-explain-correlation", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-confirm-correlation", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-reject-correlation", robotDispatchContext)
+
+		// Handle correlation audit commands (bv-e1u6)
+		if *robotExplainCorrelation != "" || *robotConfirmCorrelation != "" || *robotRejectCorrelation != "" || *robotCorrelationStats {
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			feedbackStore := correlation.NewFeedbackStore(beadsDir)
+			if err := feedbackStore.Load(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Handle --robot-correlation-stats
+			if *robotCorrelationStats {
+				stats := feedbackStore.GetStats()
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(stats); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding stats: %v\n", err)
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+
+			// Parse SHA:beadID format
+			parseCorrelationArg := func(arg string) (string, string, error) {
+				parts := strings.SplitN(arg, ":", 2)
+				if len(parts) != 2 {
+					return "", "", fmt.Errorf("expected format: SHA:beadID, got: %s", arg)
+				}
+				return parts[0], parts[1], nil
+			}
+
+			// Handle --robot-explain-correlation
+			if *robotExplainCorrelation != "" {
+				commitSHA, beadID, err := parseCorrelationArg(*robotExplainCorrelation)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Generate history report to find the correlation
+				cwd, err := os.Getwd()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+					os.Exit(1)
+				}
+				beadsPath, err := loader.FindJSONLPath(beadsDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+					os.Exit(1)
+				}
+				correlator := correlation.NewCorrelator(cwd, beadsPath)
+
+				beadInfos := make([]correlation.BeadInfo, len(issues))
+				for i, issue := range issues {
+					beadInfos[i] = correlation.BeadInfo{
+						ID:     issue.ID,
+						Title:  issue.Title,
+						Status: string(issue.Status),
+					}
+				}
+
+				opts := correlation.CorrelatorOptions{BeadID: beadID}
+				report, err := correlator.GenerateReport(beadInfos, opts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Find the specific commit
+				history, ok := report.Histories[beadID]
+				if !ok {
+					fmt.Fprintf(os.Stderr, "Bead not found: %s\n", beadID)
+					os.Exit(1)
+				}
+
+				var targetCommit *correlation.CorrelatedCommit
+				for i := range history.Commits {
+					if strings.HasPrefix(history.Commits[i].SHA, commitSHA) || history.Commits[i].ShortSHA == commitSHA {
+						targetCommit = &history.Commits[i]
+						break
+					}
+				}
+
+				if targetCommit == nil {
+					fmt.Fprintf(os.Stderr, "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
+					os.Exit(1)
+				}
+
+				// Generate explanation
+				scorer := correlation.NewScorer()
+				explanation := scorer.BuildExplanation(*targetCommit, beadID)
+
+				// Check for existing feedback
+				if fb, ok := feedbackStore.Get(targetCommit.SHA, beadID); ok {
+					explanation.Recommendation = fmt.Sprintf("Already has feedback: %s", fb.Type)
+				}
+
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(explanation); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding explanation: %v\n", err)
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+
+			// Handle --robot-confirm-correlation
+			if *robotConfirmCorrelation != "" {
+				commitSHA, beadID, err := parseCorrelationArg(*robotConfirmCorrelation)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+
+				feedbackBy := *correlationFeedbackBy
+				if feedbackBy == "" {
+					feedbackBy = "cli"
+				}
+
+				// Get original confidence from history
+				cwd, err := os.Getwd()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+					os.Exit(1)
+				}
+				beadsPath, err := loader.FindJSONLPath(beadsDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+					os.Exit(1)
+				}
+				correlator := correlation.NewCorrelator(cwd, beadsPath)
+
+				beadInfos := make([]correlation.BeadInfo, len(issues))
+				for i, issue := range issues {
+					beadInfos[i] = correlation.BeadInfo{ID: issue.ID, Title: issue.Title, Status: string(issue.Status)}
+				}
+
+				opts := correlation.CorrelatorOptions{BeadID: beadID}
+				report, err := correlator.GenerateReport(beadInfos, opts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
+					os.Exit(1)
+				}
+
+				var originalConf float64
+				if history, ok := report.Histories[beadID]; ok {
+					for _, c := range history.Commits {
+						if strings.HasPrefix(c.SHA, commitSHA) || c.ShortSHA == commitSHA {
+							originalConf = c.Confidence
+							commitSHA = c.SHA // Use full SHA
+							break
+						}
+					}
+				}
+
+				if err := feedbackStore.Confirm(commitSHA, beadID, feedbackBy, originalConf, *correlationFeedbackReason); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+					os.Exit(1)
+				}
+
+				result := map[string]interface{}{
+					"status":    "confirmed",
+					"commit":    commitSHA,
+					"bead":      beadID,
+					"by":        feedbackBy,
+					"reason":    *correlationFeedbackReason,
+					"orig_conf": originalConf,
+				}
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(result); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding result: %v\n", err)
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+
+			// Handle --robot-reject-correlation
+			if *robotRejectCorrelation != "" {
+				commitSHA, beadID, err := parseCorrelationArg(*robotRejectCorrelation)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+
+				feedbackBy := *correlationFeedbackBy
+				if feedbackBy == "" {
+					feedbackBy = "cli"
+				}
+
+				// Get original confidence from history
+				cwd, err := os.Getwd()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+					os.Exit(1)
+				}
+				beadsPath, err := loader.FindJSONLPath(beadsDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+					os.Exit(1)
+				}
+				correlator := correlation.NewCorrelator(cwd, beadsPath)
+
+				beadInfos := make([]correlation.BeadInfo, len(issues))
+				for i, issue := range issues {
+					beadInfos[i] = correlation.BeadInfo{ID: issue.ID, Title: issue.Title, Status: string(issue.Status)}
+				}
+
+				opts := correlation.CorrelatorOptions{BeadID: beadID}
+				report, err := correlator.GenerateReport(beadInfos, opts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
+					os.Exit(1)
+				}
+
+				var originalConf float64
+				if history, ok := report.Histories[beadID]; ok {
+					for _, c := range history.Commits {
+						if strings.HasPrefix(c.SHA, commitSHA) || c.ShortSHA == commitSHA {
+							originalConf = c.Confidence
+							commitSHA = c.SHA // Use full SHA
+							break
+						}
+					}
+				}
+
+				if err := feedbackStore.Reject(commitSHA, beadID, feedbackBy, originalConf, *correlationFeedbackReason); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+					os.Exit(1)
+				}
+
+				result := map[string]interface{}{
+					"status":    "rejected",
+					"commit":    commitSHA,
+					"bead":      beadID,
+					"by":        feedbackBy,
+					"reason":    *correlationFeedbackReason,
+					"orig_conf": originalConf,
+				}
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(result); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding result: %v\n", err)
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+		}
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-orphans", robotDispatchContext)
+
+		// Handle --robot-orphans flag (bv-jdop)
+		if *robotOrphans {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Validate repository
+			if err := correlation.ValidateRepository(cwd); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Get beads path
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+			beadsPath, err := loader.FindJSONLPath(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Convert issues to BeadInfo
+			beadInfos := make([]correlation.BeadInfo, len(issues))
+			for i, issue := range issues {
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				}
+			}
+
+			// Generate history report first (to get existing correlations)
+			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			correlatorOpts := correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			}
+
+			report, err := correlator.GenerateReport(beadInfos, correlatorOpts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Detect orphans using OrphanDetector
+			detector := correlation.NewOrphanDetector(report, cwd)
+			extractOpts := correlation.ExtractOptions{
+				Limit: *historyLimit,
+			}
+			orphanReport, err := detector.DetectOrphans(extractOpts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error detecting orphans: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Filter by minimum score
+			var filteredCandidates []correlation.OrphanCandidate
+			for _, candidate := range orphanReport.Candidates {
+				if candidate.SuspicionScore >= *orphansMinScore {
+					filteredCandidates = append(filteredCandidates, candidate)
+				}
+			}
+			orphanReport.Candidates = filteredCandidates
+
+			// Update stats for filtered results
+			orphanReport.Stats.CandidateCount = len(filteredCandidates)
+			if len(filteredCandidates) > 0 {
+				totalSuspicion := 0
+				for _, c := range filteredCandidates {
+					totalSuspicion += c.SuspicionScore
+				}
+				orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filteredCandidates))
+			}
+
+			// Wrap orphan report with standard envelope fields
+			type OrphanOutputEnvelope struct {
+				*correlation.OrphanReport
+				OutputFormat string `json:"output_format,omitempty"`
+				Version      string `json:"version,omitempty"`
+			}
+			output := OrphanOutputEnvelope{
+				OrphanReport: orphanReport,
+				OutputFormat: robotOutputFormat,
+				Version:      version.Version,
+			}
+
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding orphan report: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+
+		if !*fileHotspots {
+			dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-file-beads", robotDispatchContext)
+		}
+
+		// Handle --robot-file-beads and --robot-file-hotspots flags (bv-hmib)
+		if *robotFileBeads != "" || *fileHotspots {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Validate repository
+			if err := correlation.ValidateRepository(cwd); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Resolve beads file path
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+			beadsPath, err := loader.FindJSONLPath(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Convert issues to BeadInfo for correlator
+			beadInfos := make([]correlation.BeadInfo, len(issues))
+			for i, issue := range issues {
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				}
+			}
+
+			// Generate history report first
+			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Create file lookup
+			fileLookup := correlation.NewFileLookup(report)
+
+			encoder := newRobotEncoder(os.Stdout)
+
+			if *fileHotspots {
+				// Output hotspots
+				type HotspotsOutput struct {
+					RobotEnvelope
+					Hotspots []correlation.FileHotspot  `json:"hotspots"`
+					Stats    correlation.FileIndexStats `json:"stats"`
+				}
+
+				hotspots := fileLookup.GetHotspots(*hotspotsLimit)
+				output := HotspotsOutput{
+					RobotEnvelope: NewRobotEnvelope(report.DataHash),
+					Hotspots:      hotspots,
+					Stats:         fileLookup.GetStats(),
+				}
+
+				if err := encoder.Encode(output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding hotspots: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// Output file-beads lookup
+				result := fileLookup.LookupByFile(*robotFileBeads)
+
+				// Limit closed beads if specified
+				if len(result.ClosedBeads) > *fileBeadsLimit {
+					result.ClosedBeads = result.ClosedBeads[:*fileBeadsLimit]
+				}
+
+				type FileBeadsOutput struct {
+					RobotEnvelope
+					FilePath    string                      `json:"file_path"`
+					TotalBeads  int                         `json:"total_beads"`
+					OpenBeads   []correlation.BeadReference `json:"open_beads"`
+					ClosedBeads []correlation.BeadReference `json:"closed_beads"`
+				}
+
+				output := FileBeadsOutput{
+					RobotEnvelope: NewRobotEnvelope(report.DataHash),
+					FilePath:      *robotFileBeads,
+					TotalBeads:    result.TotalBeads,
+					OpenBeads:     result.OpenBeads,
+					ClosedBeads:   result.ClosedBeads,
+				}
+
+				if err := encoder.Encode(output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding file beads: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			os.Exit(0)
+		}
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-impact", robotDispatchContext)
+
+		// Handle --robot-impact flag (bv-19pq)
+		if *robotImpact != "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := correlation.ValidateRepository(cwd); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+			beadsPath, err := loader.FindJSONLPath(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+				os.Exit(1)
+			}
 
 			beadInfos := make([]correlation.BeadInfo, len(issues))
 			for i, issue := range issues {
@@ -3423,67 +3537,75 @@ func main() {
 				}
 			}
 
-			opts := correlation.CorrelatorOptions{BeadID: beadID}
-			report, err := correlator.GenerateReport(beadInfos, opts)
+			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
 				os.Exit(1)
 			}
 
-			// Find the specific commit
-			history, ok := report.Histories[beadID]
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Bead not found: %s\n", beadID)
-				os.Exit(1)
+			fileLookup := correlation.NewFileLookup(report)
+			files := strings.Split(*robotImpact, ",")
+			for i := range files {
+				files[i] = strings.TrimSpace(files[i])
 			}
 
-			var targetCommit *correlation.CorrelatedCommit
-			for i := range history.Commits {
-				if strings.HasPrefix(history.Commits[i].SHA, commitSHA) || history.Commits[i].ShortSHA == commitSHA {
-					targetCommit = &history.Commits[i]
-					break
-				}
+			impactResult := fileLookup.ImpactAnalysis(files)
+
+			type ImpactOutput struct {
+				RobotEnvelope
+				Files         []string                   `json:"files"`
+				RiskLevel     string                     `json:"risk_level"`
+				RiskScore     float64                    `json:"risk_score"`
+				Summary       string                     `json:"summary"`
+				Warnings      []string                   `json:"warnings"`
+				AffectedBeads []correlation.AffectedBead `json:"affected_beads"`
 			}
 
-			if targetCommit == nil {
-				fmt.Fprintf(os.Stderr, "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
-				os.Exit(1)
-			}
-
-			// Generate explanation
-			scorer := correlation.NewScorer()
-			explanation := scorer.BuildExplanation(*targetCommit, beadID)
-
-			// Check for existing feedback
-			if fb, ok := feedbackStore.Get(targetCommit.SHA, beadID); ok {
-				explanation.Recommendation = fmt.Sprintf("Already has feedback: %s", fb.Type)
+			output := ImpactOutput{
+				RobotEnvelope: NewRobotEnvelope(report.DataHash),
+				Files:         impactResult.Files,
+				RiskLevel:     impactResult.RiskLevel,
+				RiskScore:     impactResult.RiskScore,
+				Summary:       impactResult.Summary,
+				Warnings:      impactResult.Warnings,
+				AffectedBeads: impactResult.AffectedBeads,
 			}
 
 			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(explanation); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding explanation: %v\n", err)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding impact analysis: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
 		}
 
-		// Handle --robot-confirm-correlation
-		if *robotConfirmCorrelation != "" {
-			commitSHA, beadID, err := parseCorrelationArg(*robotConfirmCorrelation)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-file-relations", robotDispatchContext)
+
+		// Handle --robot-file-relations flag (bv-7a2f)
+		if *robotFileRelations != "" {
+			cwd, err := os.Getwd()
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := correlation.ValidateRepository(cwd); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 
-			feedbackBy := *correlationFeedbackBy
-			if feedbackBy == "" {
-				feedbackBy = "cli"
+			issues, err := datasource.LoadIssues(cwd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+				os.Exit(1)
 			}
 
-			// Get original confidence from history
-			cwd, err := os.Getwd()
+			beadsDir, err := loader.GetBeadsDir("")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
 				os.Exit(1)
 			}
 			beadsPath, err := loader.FindJSONLPath(beadsDir)
@@ -3491,69 +3613,76 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
 				os.Exit(1)
 			}
-			correlator := correlation.NewCorrelator(cwd, beadsPath)
 
 			beadInfos := make([]correlation.BeadInfo, len(issues))
 			for i, issue := range issues {
-				beadInfos[i] = correlation.BeadInfo{ID: issue.ID, Title: issue.Title, Status: string(issue.Status)}
-			}
-
-			opts := correlation.CorrelatorOptions{BeadID: beadID}
-			report, err := correlator.GenerateReport(beadInfos, opts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
-				os.Exit(1)
-			}
-
-			var originalConf float64
-			if history, ok := report.Histories[beadID]; ok {
-				for _, c := range history.Commits {
-					if strings.HasPrefix(c.SHA, commitSHA) || c.ShortSHA == commitSHA {
-						originalConf = c.Confidence
-						commitSHA = c.SHA // Use full SHA
-						break
-					}
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
 				}
 			}
 
-			if err := feedbackStore.Confirm(commitSHA, beadID, feedbackBy, originalConf, *correlationFeedbackReason); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
 				os.Exit(1)
 			}
 
-			result := map[string]interface{}{
-				"status":    "confirmed",
-				"commit":    commitSHA,
-				"bead":      beadID,
-				"by":        feedbackBy,
-				"reason":    *correlationFeedbackReason,
-				"orig_conf": originalConf,
+			fileLookup := correlation.NewFileLookup(report)
+			result := fileLookup.GetRelatedFiles(*robotFileRelations, *relationsThreshold, *relationsLimit)
+
+			type RelationsOutput struct {
+				RobotEnvelope
+				FilePath     string                      `json:"file_path"`
+				TotalCommits int                         `json:"total_commits"`
+				Threshold    float64                     `json:"threshold"`
+				RelatedFiles []correlation.CoChangeEntry `json:"related_files"`
 			}
+
+			output := RelationsOutput{
+				RobotEnvelope: NewRobotEnvelope(report.DataHash),
+				FilePath:      result.FilePath,
+				TotalCommits:  result.TotalCommits,
+				Threshold:     result.Threshold,
+				RelatedFiles:  result.RelatedFiles,
+			}
+
 			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(result); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding result: %v\n", err)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding file relations: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
 		}
 
-		// Handle --robot-reject-correlation
-		if *robotRejectCorrelation != "" {
-			commitSHA, beadID, err := parseCorrelationArg(*robotRejectCorrelation)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-related", robotDispatchContext)
+
+		// Handle --robot-related flag (bv-jtdl)
+		if *robotRelatedWork != "" {
+			cwd, err := os.Getwd()
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := correlation.ValidateRepository(cwd); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 
-			feedbackBy := *correlationFeedbackBy
-			if feedbackBy == "" {
-				feedbackBy = "cli"
+			issues, err := datasource.LoadIssues(cwd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+				os.Exit(1)
 			}
 
-			// Get original confidence from history
-			cwd, err := os.Getwd()
+			beadsDir, err := loader.GetBeadsDir("")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
 				os.Exit(1)
 			}
 			beadsPath, err := loader.FindJSONLPath(beadsDir)
@@ -3561,1406 +3690,772 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
 				os.Exit(1)
 			}
-			correlator := correlation.NewCorrelator(cwd, beadsPath)
 
 			beadInfos := make([]correlation.BeadInfo, len(issues))
 			for i, issue := range issues {
-				beadInfos[i] = correlation.BeadInfo{ID: issue.ID, Title: issue.Title, Status: string(issue.Status)}
-			}
-
-			opts := correlation.CorrelatorOptions{BeadID: beadID}
-			report, err := correlator.GenerateReport(beadInfos, opts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating report: %v\n", err)
-				os.Exit(1)
-			}
-
-			var originalConf float64
-			if history, ok := report.Histories[beadID]; ok {
-				for _, c := range history.Commits {
-					if strings.HasPrefix(c.SHA, commitSHA) || c.ShortSHA == commitSHA {
-						originalConf = c.Confidence
-						commitSHA = c.SHA // Use full SHA
-						break
-					}
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
 				}
 			}
 
-			if err := feedbackStore.Reject(commitSHA, beadID, feedbackBy, originalConf, *correlationFeedbackReason); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
+			correlatorObj := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlatorObj.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
 				os.Exit(1)
 			}
 
-			result := map[string]interface{}{
-				"status":    "rejected",
-				"commit":    commitSHA,
-				"bead":      beadID,
-				"by":        feedbackBy,
-				"reason":    *correlationFeedbackReason,
-				"orig_conf": originalConf,
+			// Build dependency graph from issues
+			depGraph := make(map[string][]string)
+			for _, issue := range issues {
+				for _, dep := range issue.Dependencies {
+					if dep == nil {
+						continue
+					}
+					depGraph[issue.ID] = append(depGraph[issue.ID], dep.DependsOnID)
+				}
 			}
+
+			// Configure options
+			opts := correlation.RelatedWorkOptions{
+				MinRelevance:      *relatedMinRelevance,
+				MaxResults:        *relatedMaxResults,
+				ConcurrencyWindow: 7 * 24 * time.Hour,
+				IncludeClosed:     *relatedIncludeClosed,
+				DependencyGraph:   depGraph,
+			}
+
+			result := report.FindRelatedWork(*robotRelatedWork, opts)
+			if result == nil {
+				fmt.Fprintf(os.Stderr, "Bead not found in history: %s\n", *robotRelatedWork)
+				os.Exit(1)
+			}
+
+			// Add envelope fields to output
+			type RelatedWorkOutput struct {
+				*correlation.RelatedWorkResult
+				DataHash     string `json:"data_hash"`
+				OutputFormat string `json:"output_format,omitempty"`
+				Version      string `json:"version,omitempty"`
+			}
+
+			output := RelatedWorkOutput{
+				RelatedWorkResult: result,
+				DataHash:          report.DataHash,
+				OutputFormat:      robotOutputFormat,
+				Version:           version.Version,
+			}
+
 			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(result); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding result: %v\n", err)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding related work: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
 		}
-	}
 
-	// Handle --robot-orphans flag (bv-jdop)
-	if *robotOrphans {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-blocker-chain", robotDispatchContext)
 
-		// Validate repository
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Get beads path
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Convert issues to BeadInfo
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		// Generate history report first (to get existing correlations)
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		correlatorOpts := correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		}
-
-		report, err := correlator.GenerateReport(beadInfos, correlatorOpts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Detect orphans using OrphanDetector
-		detector := correlation.NewOrphanDetector(report, cwd)
-		extractOpts := correlation.ExtractOptions{
-			Limit: *historyLimit,
-		}
-		orphanReport, err := detector.DetectOrphans(extractOpts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error detecting orphans: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Filter by minimum score
-		var filteredCandidates []correlation.OrphanCandidate
-		for _, candidate := range orphanReport.Candidates {
-			if candidate.SuspicionScore >= *orphansMinScore {
-				filteredCandidates = append(filteredCandidates, candidate)
-			}
-		}
-		orphanReport.Candidates = filteredCandidates
-
-		// Update stats for filtered results
-		orphanReport.Stats.CandidateCount = len(filteredCandidates)
-		if len(filteredCandidates) > 0 {
-			totalSuspicion := 0
-			for _, c := range filteredCandidates {
-				totalSuspicion += c.SuspicionScore
-			}
-			orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filteredCandidates))
-		}
-
-		// Wrap orphan report with standard envelope fields
-		type OrphanOutputEnvelope struct {
-			*correlation.OrphanReport
-			OutputFormat string `json:"output_format,omitempty"`
-			Version      string `json:"version,omitempty"`
-		}
-		output := OrphanOutputEnvelope{
-			OrphanReport: orphanReport,
-			OutputFormat: robotOutputFormat,
-			Version:      version.Version,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding orphan report: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-file-beads and --robot-file-hotspots flags (bv-hmib)
-	if *robotFileBeads != "" || *fileHotspots {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Validate repository
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Resolve beads file path
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Convert issues to BeadInfo for correlator
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		// Generate history report first
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Create file lookup
-		fileLookup := correlation.NewFileLookup(report)
-
-		encoder := newRobotEncoder(os.Stdout)
-
-		if *fileHotspots {
-			// Output hotspots
-			type HotspotsOutput struct {
-				RobotEnvelope
-				Hotspots []correlation.FileHotspot  `json:"hotspots"`
-				Stats    correlation.FileIndexStats `json:"stats"`
-			}
-
-			hotspots := fileLookup.GetHotspots(*hotspotsLimit)
-			output := HotspotsOutput{
-				RobotEnvelope: NewRobotEnvelope(report.DataHash),
-				Hotspots:      hotspots,
-				Stats:         fileLookup.GetStats(),
-			}
-
-			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding hotspots: %v\n", err)
+		// Handle --robot-blocker-chain flag (bv-nlo0)
+		if *robotBlockerChain != "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// Output file-beads lookup
-			result := fileLookup.LookupByFile(*robotFileBeads)
 
-			// Limit closed beads if specified
-			if len(result.ClosedBeads) > *fileBeadsLimit {
-				result.ClosedBeads = result.ClosedBeads[:*fileBeadsLimit]
-			}
-
-			type FileBeadsOutput struct {
-				RobotEnvelope
-				FilePath    string                      `json:"file_path"`
-				TotalBeads  int                         `json:"total_beads"`
-				OpenBeads   []correlation.BeadReference `json:"open_beads"`
-				ClosedBeads []correlation.BeadReference `json:"closed_beads"`
-			}
-
-			output := FileBeadsOutput{
-				RobotEnvelope: NewRobotEnvelope(report.DataHash),
-				FilePath:      *robotFileBeads,
-				TotalBeads:    result.TotalBeads,
-				OpenBeads:     result.OpenBeads,
-				ClosedBeads:   result.ClosedBeads,
-			}
-
-			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding file beads: %v\n", err)
+			issues, err := datasource.LoadIssues(cwd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
 				os.Exit(1)
 			}
-		}
-		os.Exit(0)
-	}
 
-	// Handle --robot-impact flag (bv-19pq)
-	if *robotImpact != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
+			an := analysis.NewAnalyzer(issues)
+			result := an.GetBlockerChain(*robotBlockerChain)
 
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		fileLookup := correlation.NewFileLookup(report)
-		files := strings.Split(*robotImpact, ",")
-		for i := range files {
-			files[i] = strings.TrimSpace(files[i])
-		}
-
-		impactResult := fileLookup.ImpactAnalysis(files)
-
-		type ImpactOutput struct {
-			RobotEnvelope
-			Files         []string                   `json:"files"`
-			RiskLevel     string                     `json:"risk_level"`
-			RiskScore     float64                    `json:"risk_score"`
-			Summary       string                     `json:"summary"`
-			Warnings      []string                   `json:"warnings"`
-			AffectedBeads []correlation.AffectedBead `json:"affected_beads"`
-		}
-
-		output := ImpactOutput{
-			RobotEnvelope: NewRobotEnvelope(report.DataHash),
-			Files:         impactResult.Files,
-			RiskLevel:     impactResult.RiskLevel,
-			RiskScore:     impactResult.RiskScore,
-			Summary:       impactResult.Summary,
-			Warnings:      impactResult.Warnings,
-			AffectedBeads: impactResult.AffectedBeads,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding impact analysis: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-file-relations flag (bv-7a2f)
-	if *robotFileRelations != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		issues, err := datasource.LoadIssues(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		fileLookup := correlation.NewFileLookup(report)
-		result := fileLookup.GetRelatedFiles(*robotFileRelations, *relationsThreshold, *relationsLimit)
-
-		type RelationsOutput struct {
-			RobotEnvelope
-			FilePath     string                      `json:"file_path"`
-			TotalCommits int                         `json:"total_commits"`
-			Threshold    float64                     `json:"threshold"`
-			RelatedFiles []correlation.CoChangeEntry `json:"related_files"`
-		}
-
-		output := RelationsOutput{
-			RobotEnvelope: NewRobotEnvelope(report.DataHash),
-			FilePath:      result.FilePath,
-			TotalCommits:  result.TotalCommits,
-			Threshold:     result.Threshold,
-			RelatedFiles:  result.RelatedFiles,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding file relations: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-related flag (bv-jtdl)
-	if *robotRelatedWork != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		issues, err := datasource.LoadIssues(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		correlatorObj := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlatorObj.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build dependency graph from issues
-		depGraph := make(map[string][]string)
-		for _, issue := range issues {
-			for _, dep := range issue.Dependencies {
-				depGraph[issue.ID] = append(depGraph[issue.ID], dep.DependsOnID)
-			}
-		}
-
-		// Configure options
-		opts := correlation.RelatedWorkOptions{
-			MinRelevance:      *relatedMinRelevance,
-			MaxResults:        *relatedMaxResults,
-			ConcurrencyWindow: 7 * 24 * time.Hour,
-			IncludeClosed:     *relatedIncludeClosed,
-			DependencyGraph:   depGraph,
-		}
-
-		result := report.FindRelatedWork(*robotRelatedWork, opts)
-		if result == nil {
-			fmt.Fprintf(os.Stderr, "Bead not found in history: %s\n", *robotRelatedWork)
-			os.Exit(1)
-		}
-
-		// Add envelope fields to output
-		type RelatedWorkOutput struct {
-			*correlation.RelatedWorkResult
-			DataHash     string `json:"data_hash"`
-			OutputFormat string `json:"output_format,omitempty"`
-			Version      string `json:"version,omitempty"`
-		}
-
-		output := RelatedWorkOutput{
-			RelatedWorkResult: result,
-			DataHash:          report.DataHash,
-			OutputFormat:      robotOutputFormat,
-			Version:           version.Version,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding related work: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-blocker-chain flag (bv-nlo0)
-	if *robotBlockerChain != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		issues, err := datasource.LoadIssues(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			os.Exit(1)
-		}
-
-		an := analysis.NewAnalyzer(issues)
-		result := an.GetBlockerChain(*robotBlockerChain)
-
-		if result == nil {
-			fmt.Fprintf(os.Stderr, "Issue not found: %s\n", *robotBlockerChain)
-			os.Exit(1)
-		}
-
-		type BlockerChainOutput struct {
-			RobotEnvelope
-			Result *analysis.BlockerChainResult `json:"result"`
-		}
-
-		// Compute data hash for consistency
-		dataHash := analysis.ComputeDataHash(issues)
-
-		output := BlockerChainOutput{
-			RobotEnvelope: NewRobotEnvelope(dataHash),
-			Result:        result,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding blocker chain: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-impact-network flag (bv-48kr)
-	// Use "all" for full network or a bead ID for subnetwork
-	if *robotImpactNetwork != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Find beads path
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Load issues
-		issues, err := datasource.LoadIssues(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Convert to BeadInfo slice
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		// Generate history report
-		correlator := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build impact network
-		builder := correlation.NewNetworkBuilderWithIssues(report, issues)
-		network := builder.Build()
-
-		// Determine if specific bead or full network
-		beadID := ""
-		if *robotImpactNetwork != "all" {
-			beadID = *robotImpactNetwork
-		}
-
-		// Cap depth to reasonable range
-		depth := *networkDepth
-		if depth < 1 {
-			depth = 1
-		}
-		if depth > 3 {
-			depth = 3
-		}
-
-		// Generate result and wrap with envelope fields
-		result := network.ToResult(beadID, depth)
-
-		type ImpactNetworkEnvelope struct {
-			*correlation.ImpactNetworkResult
-			OutputFormat string `json:"output_format,omitempty"`
-			Version      string `json:"version,omitempty"`
-		}
-		output := ImpactNetworkEnvelope{
-			ImpactNetworkResult: result,
-			OutputFormat:        robotOutputFormat,
-			Version:             version.Version,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding impact network: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-causality flag (bv-j74w)
-	if *robotCausality != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := correlation.ValidateRepository(cwd); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		issues, err := datasource.LoadIssues(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadsDir, err := loader.GetBeadsDir("")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-			os.Exit(1)
-		}
-		beadsPath, err := loader.FindJSONLPath(beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-			os.Exit(1)
-		}
-
-		beadInfos := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beadInfos[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
-
-		correlatorObj := correlation.NewCorrelator(cwd, beadsPath)
-		report, err := correlatorObj.GenerateReport(beadInfos, correlation.CorrelatorOptions{
-			Limit: *historyLimit,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build blocker titles map for better descriptions
-		blockerTitles := make(map[string]string)
-		for _, issue := range issues {
-			blockerTitles[issue.ID] = issue.Title
-		}
-
-		opts := correlation.CausalityOptions{
-			IncludeCommits: true,
-			BlockerTitles:  blockerTitles,
-		}
-
-		result := report.BuildCausalityChain(*robotCausality, opts)
-		if result == nil {
-			fmt.Fprintf(os.Stderr, "Bead not found: %s\n", *robotCausality)
-			os.Exit(1)
-		}
-
-		// Wrap with envelope fields
-		type CausalityEnvelope struct {
-			*correlation.CausalityResult
-			OutputFormat string `json:"output_format,omitempty"`
-			Version      string `json:"version,omitempty"`
-		}
-		output := CausalityEnvelope{
-			CausalityResult: result,
-			OutputFormat:     robotOutputFormat,
-			Version:          version.Version,
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding causality result: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-sprint-list and --robot-sprint-show flags (bv-156)
-	if *robotSprintList || *robotSprintShow != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		sprints, err := loader.LoadSprints(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading sprints: %v\n", err)
-			os.Exit(1)
-		}
-
-		dataHash := analysis.ComputeDataHash(issues)
-
-		if *robotSprintShow != "" {
-			// Find specific sprint
-			var found *model.Sprint
-			for i := range sprints {
-				if sprints[i].ID == *robotSprintShow {
-					found = &sprints[i]
-					break
-				}
-			}
-			if found == nil {
-				fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotSprintShow)
+			if result == nil {
+				fmt.Fprintf(os.Stderr, "Issue not found: %s\n", *robotBlockerChain)
 				os.Exit(1)
 			}
-			// Wrap sprint with standard envelope
-			type SprintShowOutput struct {
+
+			type BlockerChainOutput struct {
 				RobotEnvelope
-				Sprint *model.Sprint `json:"sprint"`
+				Result *analysis.BlockerChainResult `json:"result"`
 			}
-			output := SprintShowOutput{
+
+			// Compute data hash for consistency
+			dataHash := analysis.ComputeDataHash(issues)
+
+			output := BlockerChainOutput{
 				RobotEnvelope: NewRobotEnvelope(dataHash),
-				Sprint:        found,
+				Result:        result,
 			}
+
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding sprint: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error encoding blocker chain: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// Output all sprints as JSON
-			output := struct {
-				RobotEnvelope
-				SprintCount int            `json:"sprint_count"`
-				Sprints     []model.Sprint `json:"sprints"`
-			}{
-				RobotEnvelope: NewRobotEnvelope(dataHash),
-				SprintCount:   len(sprints),
-				Sprints:       sprints,
+			os.Exit(0)
+		}
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-impact-network", robotDispatchContext)
+
+		// Handle --robot-impact-network flag (bv-48kr)
+		// Use "all" for full network or a bead ID for subnetwork
+		if *robotImpactNetwork != "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
 			}
+
+			if err := correlation.ValidateRepository(cwd); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Find beads path
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+			beadsPath, err := loader.FindJSONLPath(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Load issues
+			issues, err := datasource.LoadIssues(cwd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Convert to BeadInfo slice
+			beadInfos := make([]correlation.BeadInfo, len(issues))
+			for i, issue := range issues {
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				}
+			}
+
+			// Generate history report
+			correlator := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Build impact network
+			builder := correlation.NewNetworkBuilderWithIssues(report, issues)
+			network := builder.Build()
+
+			// Determine if specific bead or full network
+			beadID := ""
+			if *robotImpactNetwork != "all" {
+				beadID = *robotImpactNetwork
+			}
+
+			// Cap depth to reasonable range
+			depth := *networkDepth
+			if depth < 1 {
+				depth = 1
+			}
+			if depth > 3 {
+				depth = 3
+			}
+
+			// Generate result and wrap with envelope fields
+			result := network.ToResult(beadID, depth)
+
+			type ImpactNetworkEnvelope struct {
+				*correlation.ImpactNetworkResult
+				OutputFormat string `json:"output_format,omitempty"`
+				Version      string `json:"version,omitempty"`
+			}
+			output := ImpactNetworkEnvelope{
+				ImpactNetworkResult: result,
+				OutputFormat:        robotOutputFormat,
+				Version:             version.Version,
+			}
+
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding sprints: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error encoding impact network: %v\n", err)
 				os.Exit(1)
 			}
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-burndown flag (bv-159)
-	if *robotBurndown != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
+			os.Exit(0)
 		}
 
-		sprints, err := loader.LoadSprints(cwd)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading sprints: %v\n", err)
-			os.Exit(1)
-		}
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-causality", robotDispatchContext)
 
-		// Find the target sprint
-		var targetSprint *model.Sprint
-		if *robotBurndown == "current" {
-			// Find active sprint
-			for i := range sprints {
-				if sprints[i].IsActive() {
-					targetSprint = &sprints[i]
-					break
+		// Handle --robot-causality flag (bv-j74w)
+		if *robotCausality != "" {
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := correlation.ValidateRepository(cwd); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			issues, err := datasource.LoadIssues(cwd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
+				os.Exit(1)
+			}
+
+			beadsDir, err := loader.GetBeadsDir("")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+				os.Exit(1)
+			}
+			beadsPath, err := loader.FindJSONLPath(beadsDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
+				os.Exit(1)
+			}
+
+			beadInfos := make([]correlation.BeadInfo, len(issues))
+			for i, issue := range issues {
+				beadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
 				}
 			}
-			if targetSprint == nil {
-				fmt.Fprintf(os.Stderr, "No active sprint found\n")
+
+			correlatorObj := correlation.NewCorrelator(cwd, beadsPath)
+			report, err := correlatorObj.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+				Limit: *historyLimit,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// Find sprint by ID
-			for i := range sprints {
-				if sprints[i].ID == *robotBurndown {
-					targetSprint = &sprints[i]
-					break
-				}
+
+			// Build blocker titles map for better descriptions
+			blockerTitles := make(map[string]string)
+			for _, issue := range issues {
+				blockerTitles[issue.ID] = issue.Title
 			}
-			if targetSprint == nil {
-				fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotBurndown)
+
+			opts := correlation.CausalityOptions{
+				IncludeCommits: true,
+				BlockerTitles:  blockerTitles,
+			}
+
+			result := report.BuildCausalityChain(*robotCausality, opts)
+			if result == nil {
+				fmt.Fprintf(os.Stderr, "Bead not found: %s\n", *robotCausality)
 				os.Exit(1)
 			}
+
+			// Wrap with envelope fields
+			type CausalityEnvelope struct {
+				*correlation.CausalityResult
+				OutputFormat string `json:"output_format,omitempty"`
+				Version      string `json:"version,omitempty"`
+			}
+			output := CausalityEnvelope{
+				CausalityResult: result,
+				OutputFormat:    robotOutputFormat,
+				Version:         version.Version,
+			}
+
+			encoder := newRobotEncoder(os.Stdout)
+			if err := encoder.Encode(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding causality result: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
 
-		// Build burndown data
-		now := time.Now()
-		burndown := calculateBurndownAt(targetSprint, issues, now)
-		burndown.RobotEnvelope = NewRobotEnvelope(analysis.ComputeDataHash(issues))
-		issueMap := make(map[string]model.Issue, len(issues))
-		for _, iss := range issues {
-			issueMap[iss.ID] = iss
-		}
-		if scopeChanges, err := computeSprintScopeChanges(cwd, targetSprint, issueMap, now); err == nil && len(scopeChanges) > 0 {
-			burndown.ScopeChanges = scopeChanges
-		}
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-sprint-list", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-sprint-show", robotDispatchContext)
 
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(burndown); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding burndown: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
+		// Handle --robot-sprint-list and --robot-sprint-show flags (bv-156)
+		if *robotSprintList || *robotSprintShow != "" {
+			if *robotSprintShow == "" {
+				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-sprint-list", robotDispatchContext)
+			}
 
-	// Handle --robot-forecast flag (bv-158)
-	if *robotForecast != "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
 
-		// Build graph stats for depth calculation
-		analyzer := analysis.NewAnalyzer(issues)
-		graphStats := analyzer.Analyze()
-
-		// Filter issues by label and sprint if specified
-		targetIssues := make([]model.Issue, 0, len(issues))
-		var sprintBeadIDs map[string]bool
-		if *forecastSprint != "" {
 			sprints, err := loader.LoadSprints(cwd)
-			if err == nil {
-				for _, s := range sprints {
-					if s.ID == *forecastSprint {
-						sprintBeadIDs = make(map[string]bool)
-						for _, bid := range s.BeadIDs {
-							sprintBeadIDs[bid] = true
-						}
-						break
-					}
-				}
-			}
-			if sprintBeadIDs == nil {
-				fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *forecastSprint)
-				os.Exit(1)
-			}
-		}
-
-		for _, iss := range issues {
-			// Filter by label
-			if *forecastLabel != "" {
-				hasLabel := false
-				for _, l := range iss.Labels {
-					if l == *forecastLabel {
-						hasLabel = true
-						break
-					}
-				}
-				if !hasLabel {
-					continue
-				}
-			}
-			// Filter by sprint
-			if sprintBeadIDs != nil && !sprintBeadIDs[iss.ID] {
-				continue
-			}
-			targetIssues = append(targetIssues, iss)
-		}
-
-		now := time.Now()
-		agents := *forecastAgents
-		if agents <= 0 {
-			agents = 1
-		}
-
-		type ForecastSummary struct {
-			TotalMinutes  int       `json:"total_minutes"`
-			TotalDays     float64   `json:"total_days"`
-			AvgConfidence float64   `json:"avg_confidence"`
-			EarliestETA   time.Time `json:"earliest_eta"`
-			LatestETA     time.Time `json:"latest_eta"`
-		}
-		type ForecastOutput struct {
-			RobotEnvelope
-			Agents        int                    `json:"agents"`
-			Filters       map[string]string      `json:"filters,omitempty"`
-			ForecastCount int                    `json:"forecast_count"`
-			Forecasts     []analysis.ETAEstimate `json:"forecasts"`
-			Summary       *ForecastSummary       `json:"summary,omitempty"`
-		}
-
-		var forecasts []analysis.ETAEstimate
-		var outputErr error
-
-		if *robotForecast == "all" {
-			// Forecast all open issues
-			for _, iss := range targetIssues {
-				if iss.Status == model.StatusClosed {
-					continue
-				}
-				eta, err := analysis.EstimateETAForIssue(issues, &graphStats, iss.ID, agents, now)
-				if err != nil {
-					continue
-				}
-				forecasts = append(forecasts, eta)
-			}
-		} else {
-			// Single issue forecast
-			eta, err := analysis.EstimateETAForIssue(issues, &graphStats, *robotForecast, agents, now)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error loading sprints: %v\n", err)
 				os.Exit(1)
 			}
-			forecasts = append(forecasts, eta)
-		}
 
-		// Build summary if multiple forecasts
-		var summary *ForecastSummary
-		if len(forecasts) > 1 {
-			totalMin := 0
-			totalConf := 0.0
-			earliest := forecasts[0].ETADate
-			latest := forecasts[0].ETADate
-			for _, f := range forecasts {
-				totalMin += f.EstimatedMinutes
-				totalConf += f.Confidence
-				if f.ETADate.Before(earliest) {
-					earliest = f.ETADate
-				}
-				if f.ETADate.After(latest) {
-					latest = f.ETADate
-				}
-			}
-			summary = &ForecastSummary{
-				TotalMinutes:  totalMin,
-				TotalDays:     float64(totalMin) / (60.0 * 8.0), // 8hr workday
-				AvgConfidence: totalConf / float64(len(forecasts)),
-				EarliestETA:   earliest,
-				LatestETA:     latest,
-			}
-		}
+			dataHash := analysis.ComputeDataHash(issues)
 
-		// Build output
-		filters := make(map[string]string)
-		if *forecastLabel != "" {
-			filters["label"] = *forecastLabel
-		}
-		if *forecastSprint != "" {
-			filters["sprint"] = *forecastSprint
-		}
-
-		output := ForecastOutput{
-			RobotEnvelope: NewRobotEnvelope(analysis.ComputeDataHash(issues)),
-			Agents:        agents,
-			ForecastCount: len(forecasts),
-			Forecasts:     forecasts,
-			Summary:       summary,
-		}
-		if len(filters) > 0 {
-			output.Filters = filters
-		}
-
-		encoder := newRobotEncoder(os.Stdout)
-		if outputErr = encoder.Encode(output); outputErr != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding forecast: %v\n", outputErr)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-capacity flag (bv-160)
-	if *robotCapacity {
-		// Build graph stats for analysis
-		analyzer := analysis.NewAnalyzer(issues)
-		graphStats := analyzer.Analyze()
-
-		// Filter issues by label if specified
-		targetIssues := issues
-		if *capacityLabel != "" {
-			filtered := make([]model.Issue, 0)
-			for _, iss := range issues {
-				for _, l := range iss.Labels {
-					if l == *capacityLabel {
-						filtered = append(filtered, iss)
+			if *robotSprintShow != "" {
+				// Find specific sprint
+				var found *model.Sprint
+				for i := range sprints {
+					if sprints[i].ID == *robotSprintShow {
+						found = &sprints[i]
 						break
 					}
 				}
-			}
-			targetIssues = filtered
-		}
-
-		// Calculate open issues only
-		openIssues := make([]model.Issue, 0)
-		issueMap := make(map[string]model.Issue)
-		for _, iss := range targetIssues {
-			issueMap[iss.ID] = iss
-			if iss.Status != model.StatusClosed {
-				openIssues = append(openIssues, iss)
-			}
-		}
-
-		now := time.Now()
-		agents := *capacityAgents
-		if agents <= 0 {
-			agents = 1
-		}
-
-		// Calculate total work remaining
-		medianMinutes := 60 // default
-		totalMinutes := 0
-		for _, iss := range openIssues {
-			eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, iss.ID, 1, now)
-			if err == nil {
-				totalMinutes += eta.EstimatedMinutes
-			}
-		}
-
-		// Analyze parallelizability by finding dependency chains
-		// Serial work = longest chain (critical path)
-		// Parallelizable = work that can run concurrently
-
-		// Build dependency adjacency for open issues
-		blockedBy := make(map[string][]string) // issue -> its blockers
-		blocks := make(map[string][]string)    // issue -> issues it blocks
-		for _, iss := range openIssues {
-			for _, dep := range iss.Dependencies {
-				if dep == nil {
-					continue
+				if found == nil {
+					fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotSprintShow)
+					os.Exit(1)
 				}
-				depID := dep.DependsOnID
-				if _, exists := issueMap[depID]; exists {
-					blockedBy[iss.ID] = append(blockedBy[iss.ID], depID)
-					blocks[depID] = append(blocks[depID], iss.ID)
+				// Wrap sprint with standard envelope
+				type SprintShowOutput struct {
+					RobotEnvelope
+					Sprint *model.Sprint `json:"sprint"`
+				}
+				output := SprintShowOutput{
+					RobotEnvelope: NewRobotEnvelope(dataHash),
+					Sprint:        found,
+				}
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding sprint: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// Output all sprints as JSON
+				output := struct {
+					RobotEnvelope
+					SprintCount int            `json:"sprint_count"`
+					Sprints     []model.Sprint `json:"sprints"`
+				}{
+					RobotEnvelope: NewRobotEnvelope(dataHash),
+					SprintCount:   len(sprints),
+					Sprints:       sprints,
+				}
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding sprints: %v\n", err)
+					os.Exit(1)
 				}
 			}
+			os.Exit(0)
 		}
 
-		// Find issues with no blockers (can start immediately)
-		actionable := make([]string, 0)
-		for _, iss := range openIssues {
-			hasOpenBlocker := false
-			for _, depID := range blockedBy[iss.ID] {
-				if dep, ok := issueMap[depID]; ok && dep.Status != model.StatusClosed {
-					hasOpenBlocker = true
-					break
+		// Handle --robot-burndown flag (bv-159)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-burndown", robotDispatchContext)
+
+		// Handle --robot-forecast flag (bv-158)
+		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-forecast", robotDispatchContext)
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-capacity", robotDispatchContext)
+
+		// Handle --robot-capacity flag (bv-160)
+		if *robotCapacity {
+			// Build graph stats for analysis
+			analyzer := analysis.NewAnalyzer(issues)
+			graphStats := analyzer.Analyze()
+
+			// Filter issues by label if specified
+			targetIssues := issues
+			if *capacityLabel != "" {
+				filtered := make([]model.Issue, 0)
+				for _, iss := range issues {
+					for _, l := range iss.Labels {
+						if l == *capacityLabel {
+							filtered = append(filtered, iss)
+							break
+						}
+					}
+				}
+				targetIssues = filtered
+			}
+
+			// Calculate open issues only
+			openIssues := make([]model.Issue, 0)
+			issueMap := make(map[string]model.Issue)
+			for _, iss := range targetIssues {
+				issueMap[iss.ID] = iss
+				if iss.Status != model.StatusClosed {
+					openIssues = append(openIssues, iss)
 				}
 			}
-			if !hasOpenBlocker {
-				actionable = append(actionable, iss.ID)
-			}
-		}
 
-		// Calculate critical path (longest chain)
-		var longestChain []string
-		var dfs func(id string, path []string)
-		visited := make(map[string]bool)
-		dfs = func(id string, path []string) {
-			if visited[id] {
-				return
+			now := time.Now()
+			agents := *capacityAgents
+			if agents <= 0 {
+				agents = 1
 			}
-			visited[id] = true
-			path = append(path, id)
-			if len(path) > len(longestChain) {
-				longestChain = make([]string, len(path))
-				copy(longestChain, path)
-			}
-			for _, nextID := range blocks[id] {
-				if dep, ok := issueMap[nextID]; ok && dep.Status != model.StatusClosed {
-					dfs(nextID, path)
+
+			// Calculate total work remaining
+			medianMinutes := 60 // default
+			totalMinutes := 0
+			for _, iss := range openIssues {
+				eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, iss.ID, 1, now)
+				if err == nil {
+					totalMinutes += eta.EstimatedMinutes
 				}
 			}
-			visited[id] = false
-		}
-		for _, startID := range actionable {
-			dfs(startID, nil)
-		}
 
-		// Calculate serial minutes (work on critical path)
-		serialMinutes := 0
-		for _, id := range longestChain {
-			eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, id, 1, now)
-			if err == nil {
-				serialMinutes += eta.EstimatedMinutes
+			// Analyze parallelizability by finding dependency chains
+			// Serial work = longest chain (critical path)
+			// Parallelizable = work that can run concurrently
+
+			// Build dependency adjacency for open issues
+			blockedBy := make(map[string][]string) // issue -> its blockers
+			blocks := make(map[string][]string)    // issue -> issues it blocks
+			for _, iss := range openIssues {
+				for _, dep := range iss.Dependencies {
+					if dep == nil {
+						continue
+					}
+					depID := dep.DependsOnID
+					if _, exists := issueMap[depID]; exists {
+						blockedBy[iss.ID] = append(blockedBy[iss.ID], depID)
+						blocks[depID] = append(blocks[depID], iss.ID)
+					}
+				}
 			}
-		}
 
-		// Parallelizable percentage
-		parallelizablePct := 0.0
-		if totalMinutes > 0 {
-			parallelizablePct = float64(totalMinutes-serialMinutes) / float64(totalMinutes) * 100
-		}
-
-		// Calculate estimated completion with N agents
-		// Serial work must be done sequentially, parallel work can be divided
-		parallelMinutes := totalMinutes - serialMinutes
-		effectiveMinutes := serialMinutes + parallelMinutes/agents
-		estimatedDays := float64(effectiveMinutes) / (60.0 * 8.0) // 8hr workday
-
-		// Find bottlenecks (issues blocking the most other issues)
-		type Bottleneck struct {
-			ID          string   `json:"id"`
-			Title       string   `json:"title"`
-			BlocksCount int      `json:"blocks_count"`
-			Blocks      []string `json:"blocks,omitempty"`
-		}
-		bottlenecks := make([]Bottleneck, 0)
-		for _, iss := range openIssues {
-			if len(blocks[iss.ID]) > 1 {
-				blockedIssues := blocks[iss.ID]
-				bottlenecks = append(bottlenecks, Bottleneck{
-					ID:          iss.ID,
-					Title:       iss.Title,
-					BlocksCount: len(blockedIssues),
-					Blocks:      blockedIssues,
-				})
+			// Find issues with no blockers (can start immediately)
+			actionable := make([]string, 0)
+			for _, iss := range openIssues {
+				hasOpenBlocker := false
+				for _, depID := range blockedBy[iss.ID] {
+					if dep, ok := issueMap[depID]; ok && dep.Status != model.StatusClosed {
+						hasOpenBlocker = true
+						break
+					}
+				}
+				if !hasOpenBlocker {
+					actionable = append(actionable, iss.ID)
+				}
 			}
-		}
-		// Sort by blocks count descending
-		sort.Slice(bottlenecks, func(i, j int) bool {
-			return bottlenecks[i].BlocksCount > bottlenecks[j].BlocksCount
-		})
-		if len(bottlenecks) > 5 {
-			bottlenecks = bottlenecks[:5]
-		}
 
-		// Build output
-		type CapacityOutput struct {
-			RobotEnvelope
-			Agents            int          `json:"agents"`
-			Label             string       `json:"label,omitempty"`
-			OpenIssueCount    int          `json:"open_issue_count"`
-			TotalMinutes      int          `json:"total_minutes"`
-			TotalDays         float64      `json:"total_days"`
-			SerialMinutes     int          `json:"serial_minutes"`
-			ParallelMinutes   int          `json:"parallel_minutes"`
-			ParallelizablePct float64      `json:"parallelizable_pct"`
-			EstimatedDays     float64      `json:"estimated_days"`
-			CriticalPathLen   int          `json:"critical_path_length"`
-			CriticalPath      []string     `json:"critical_path,omitempty"`
-			ActionableCount   int          `json:"actionable_count"`
-			Actionable        []string     `json:"actionable,omitempty"`
-			Bottlenecks       []Bottleneck `json:"bottlenecks,omitempty"`
-		}
-
-		output := CapacityOutput{
-			RobotEnvelope:     NewRobotEnvelope(analysis.ComputeDataHash(issues)),
-			Agents:            agents,
-			OpenIssueCount:    len(openIssues),
-			TotalMinutes:      totalMinutes,
-			TotalDays:         float64(totalMinutes) / (60.0 * 8.0),
-			SerialMinutes:     serialMinutes,
-			ParallelMinutes:   parallelMinutes,
-			ParallelizablePct: parallelizablePct,
-			EstimatedDays:     estimatedDays,
-			CriticalPathLen:   len(longestChain),
-			CriticalPath:      longestChain,
-			ActionableCount:   len(actionable),
-			Actionable:        actionable,
-			Bottlenecks:       bottlenecks,
-		}
-		if *capacityLabel != "" {
-			output.Label = *capacityLabel
-		}
-
-		// Suppress unused variable warning
-		_ = medianMinutes
-
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding capacity: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --robot-metrics flag (bv-84tp)
-	if *robotMetrics {
-		output := metrics.GetAllMetrics()
-		encoder := newRobotEncoder(os.Stdout)
-		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding metrics: %v\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	// Handle --diff-since flag
-	if *diffSince != "" {
-		// Auto-enable robot diff for non-interactive/agent contexts
-		if !*robotDiff && (envRobot || !stdoutIsTTY) {
-			*robotDiff = true
-		}
-
-		cwd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		gitLoader := loader.NewGitLoader(cwd)
-
-		// Load historical issues
-		historicalIssues, err := gitLoader.LoadAt(*diffSince)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
-			os.Exit(1)
-		}
-
-		// Get revision info for timestamp
-		revision, err := gitLoader.ResolveRevision(*diffSince)
-		if err != nil {
-			revision = *diffSince
-		}
-
-		// Create snapshots
-		fromSnapshot := analysis.NewSnapshotAt(historicalIssues, time.Time{}, revision)
-		toSnapshot := analysis.NewSnapshot(issues)
-
-		// Compute diff
-		diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
-
-		if *robotDiff {
-			// JSON output
-			output := struct {
-				GeneratedAt      string                 `json:"generated_at"`
-				ResolvedRevision string                 `json:"resolved_revision"`
-				AsOf             string                 `json:"as_of,omitempty"`        // "to" snapshot ref (if --as-of used)
-				AsOfCommit       string                 `json:"as_of_commit,omitempty"` // Resolved commit SHA for "to"
-				FromDataHash     string                 `json:"from_data_hash"`
-				ToDataHash       string                 `json:"to_data_hash"`
-				Diff             *analysis.SnapshotDiff `json:"diff"`
-			}{
-				GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-				ResolvedRevision: revision,
-				AsOf:             *asOf,
-				AsOfCommit:       asOfResolved,
-				FromDataHash:     analysis.ComputeDataHash(historicalIssues),
-				ToDataHash:       dataHash,
-				Diff:             diff,
+			// Calculate critical path (longest chain)
+			var longestChain []string
+			var dfs func(id string, path []string)
+			visited := make(map[string]bool)
+			dfs = func(id string, path []string) {
+				if visited[id] {
+					return
+				}
+				visited[id] = true
+				path = append(path, id)
+				if len(path) > len(longestChain) {
+					longestChain = make([]string, len(path))
+					copy(longestChain, path)
+				}
+				for _, nextID := range blocks[id] {
+					if dep, ok := issueMap[nextID]; ok && dep.Status != model.StatusClosed {
+						dfs(nextID, path)
+					}
+				}
+				visited[id] = false
 			}
+			for _, startID := range actionable {
+				dfs(startID, nil)
+			}
+
+			// Calculate serial minutes (work on critical path)
+			serialMinutes := 0
+			for _, id := range longestChain {
+				eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, id, 1, now)
+				if err == nil {
+					serialMinutes += eta.EstimatedMinutes
+				}
+			}
+
+			// Parallelizable percentage
+			parallelizablePct := 0.0
+			if totalMinutes > 0 {
+				parallelizablePct = float64(totalMinutes-serialMinutes) / float64(totalMinutes) * 100
+			}
+
+			// Calculate estimated completion with N agents
+			// Serial work must be done sequentially, parallel work can be divided
+			parallelMinutes := totalMinutes - serialMinutes
+			effectiveMinutes := serialMinutes + parallelMinutes/agents
+			estimatedDays := float64(effectiveMinutes) / (60.0 * 8.0) // 8hr workday
+
+			// Find bottlenecks (issues blocking the most other issues)
+			type Bottleneck struct {
+				ID          string   `json:"id"`
+				Title       string   `json:"title"`
+				BlocksCount int      `json:"blocks_count"`
+				Blocks      []string `json:"blocks,omitempty"`
+			}
+			bottlenecks := make([]Bottleneck, 0)
+			for _, iss := range openIssues {
+				if len(blocks[iss.ID]) > 1 {
+					blockedIssues := blocks[iss.ID]
+					bottlenecks = append(bottlenecks, Bottleneck{
+						ID:          iss.ID,
+						Title:       iss.Title,
+						BlocksCount: len(blockedIssues),
+						Blocks:      blockedIssues,
+					})
+				}
+			}
+			// Sort by blocks count descending
+			sort.Slice(bottlenecks, func(i, j int) bool {
+				return bottlenecks[i].BlocksCount > bottlenecks[j].BlocksCount
+			})
+			if len(bottlenecks) > 5 {
+				bottlenecks = bottlenecks[:5]
+			}
+
+			// Build output
+			type CapacityOutput struct {
+				RobotEnvelope
+				Agents            int          `json:"agents"`
+				Label             string       `json:"label,omitempty"`
+				OpenIssueCount    int          `json:"open_issue_count"`
+				TotalMinutes      int          `json:"total_minutes"`
+				TotalDays         float64      `json:"total_days"`
+				SerialMinutes     int          `json:"serial_minutes"`
+				ParallelMinutes   int          `json:"parallel_minutes"`
+				ParallelizablePct float64      `json:"parallelizable_pct"`
+				EstimatedDays     float64      `json:"estimated_days"`
+				CriticalPathLen   int          `json:"critical_path_length"`
+				CriticalPath      []string     `json:"critical_path,omitempty"`
+				ActionableCount   int          `json:"actionable_count"`
+				Actionable        []string     `json:"actionable,omitempty"`
+				Bottlenecks       []Bottleneck `json:"bottlenecks,omitempty"`
+			}
+
+			output := CapacityOutput{
+				RobotEnvelope:     NewRobotEnvelope(analysis.ComputeDataHash(issues)),
+				Agents:            agents,
+				OpenIssueCount:    len(openIssues),
+				TotalMinutes:      totalMinutes,
+				TotalDays:         float64(totalMinutes) / (60.0 * 8.0),
+				SerialMinutes:     serialMinutes,
+				ParallelMinutes:   parallelMinutes,
+				ParallelizablePct: parallelizablePct,
+				EstimatedDays:     estimatedDays,
+				CriticalPathLen:   len(longestChain),
+				CriticalPath:      longestChain,
+				ActionableCount:   len(actionable),
+				Actionable:        actionable,
+				Bottlenecks:       bottlenecks,
+			}
+			if *capacityLabel != "" {
+				output.Label = *capacityLabel
+			}
+
+			// Suppress unused variable warning
+			_ = medianMinutes
 
 			encoder := newRobotEncoder(os.Stdout)
 			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding diff: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error encoding capacity: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// Human-readable output
-			printDiffSummary(diff, *diffSince)
+			os.Exit(0)
 		}
-		os.Exit(0)
-	}
 
-	// Handle --as-of flag for TUI mode (robot commands already handled above with historical data)
-	if *asOf != "" {
+		// Handle --robot-metrics flag (bv-84tp)
+		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-metrics", robotDispatchContext)
+
+		// Handle --diff-since flag
+		if *diffSince != "" {
+			// Auto-enable robot diff for non-interactive/agent contexts
+			if !*robotDiff && (envRobot || !stdoutIsTTY) {
+				*robotDiff = true
+			}
+
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			gitLoader := loader.NewGitLoader(cwd)
+
+			// Load historical issues
+			historicalIssues, err := gitLoader.LoadAt(*diffSince)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
+				os.Exit(1)
+			}
+
+			// Get revision info for timestamp
+			revision, err := gitLoader.ResolveRevision(*diffSince)
+			if err != nil {
+				revision = *diffSince
+			}
+
+			// Create snapshots
+			fromSnapshot := analysis.NewSnapshotAt(historicalIssues, time.Time{}, revision)
+			toSnapshot := analysis.NewSnapshot(issues)
+
+			// Compute diff
+			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
+
+			if *robotDiff {
+				diffDispatchContext := robotDispatchContext
+				diffDispatchContext.Diff = diff
+				diffDispatchContext.DiffHistoricalIssues = historicalIssues
+				diffDispatchContext.DiffResolvedRevision = revision
+				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-diff", diffDispatchContext)
+			} else {
+				// Human-readable output
+				printDiffSummary(diff, *diffSince)
+			}
+			os.Exit(0)
+		}
+
+		// Handle --as-of flag for TUI mode (robot commands already handled above with historical data)
+		if *asOf != "" {
+			if len(issues) == 0 {
+				fmt.Printf("No issues found at %s.\n", *asOf)
+				return nil
+			}
+
+			// Launch TUI with historical issues (already loaded, no live reload)
+			m := ui.NewModel(issues, activeRecipe, "")
+			defer m.Stop()
+			if err := runTUIProgram(m); err != nil {
+				fmt.Printf("Error running beads viewer: %v\n", err)
+				os.Exit(1)
+			}
+			return nil
+		}
+
+		if *exportFile != "" {
+			fmt.Printf("Exporting to %s...\n", *exportFile)
+
+			// Load and run pre-export hooks
+			cwd, cwdErr := os.Getwd()
+			if cwdErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not get working directory for hooks: %v\n", cwdErr)
+			}
+			var executor *hooks.Executor
+			if !*noHooks {
+				hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
+				if err := hookLoader.Load(); err != nil {
+					fmt.Printf("Warning: failed to load hooks: %v\n", err)
+				} else if hookLoader.HasHooks() {
+					ctx := hooks.ExportContext{
+						ExportPath:   *exportFile,
+						ExportFormat: "markdown",
+						IssueCount:   len(issues),
+						Timestamp:    time.Now(),
+					}
+					executor = hooks.NewExecutor(hookLoader.Config(), ctx)
+
+					// Run pre-export hooks
+					if err := executor.RunPreExport(); err != nil {
+						fmt.Printf("Error: pre-export hook failed: %v\n", err)
+						os.Exit(1)
+					}
+				}
+			}
+
+			// Perform the export
+			if err := export.SaveMarkdownToFile(issues, *exportFile); err != nil {
+				fmt.Printf("Error exporting: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Run post-export hooks
+			if executor != nil {
+				if err := executor.RunPostExport(); err != nil {
+					fmt.Printf("Warning: post-export hook failed: %v\n", err)
+					// Don't exit, just warn
+				}
+
+				// Print hook summary if any hooks ran
+				if len(executor.Results()) > 0 {
+					fmt.Println(executor.Summary())
+				}
+			}
+
+			fmt.Println("Done!")
+			os.Exit(0)
+		}
+
 		if len(issues) == 0 {
-			fmt.Printf("No issues found at %s.\n", *asOf)
-			return
+			fmt.Println("No issues found. Create some with 'br create'!")
+			os.Exit(0)
 		}
 
-		// Launch TUI with historical issues (already loaded, no live reload)
-		m := ui.NewModel(issues, activeRecipe, "")
-		defer m.Stop()
+		// Apply recipe filters and sorting if specified
+		if activeRecipe != nil {
+			issues = applyRecipeFilters(issues, activeRecipe)
+			issues = applyRecipeSort(issues, activeRecipe)
+		}
+
+		// Background mode rollout (bv-o11l):
+		// - CLI flags override env var
+		// - env var overrides user config file
+		if *backgroundMode && *noBackgroundMode {
+			fmt.Fprintln(os.Stderr, "Error: --background-mode and --no-background-mode are mutually exclusive")
+			os.Exit(2)
+		}
+		if *backgroundMode {
+			_ = os.Setenv("BV_BACKGROUND_MODE", "1")
+		} else if *noBackgroundMode {
+			_ = os.Setenv("BV_BACKGROUND_MODE", "0")
+		} else if v, ok := os.LookupEnv("BV_BACKGROUND_MODE"); ok && strings.TrimSpace(v) != "" {
+			// Respect explicit user env var.
+		} else if enabled, ok := loadBackgroundModeFromUserConfig(); ok {
+			if enabled {
+				_ = os.Setenv("BV_BACKGROUND_MODE", "1")
+			} else {
+				_ = os.Setenv("BV_BACKGROUND_MODE", "0")
+			}
+		}
+
+		// Initial Model with live reload support
+		m := ui.NewModel(issues, activeRecipe, beadsPath)
+		defer m.Stop() // Clean up file watcher
+
+		// Enable workspace mode if loading from workspace config
+		if workspaceInfo != nil {
+			m.EnableWorkspaceMode(ui.WorkspaceInfo{
+				Enabled:      true,
+				RepoCount:    workspaceInfo.TotalRepos,
+				FailedCount:  workspaceInfo.FailedRepos,
+				TotalIssues:  workspaceInfo.TotalIssues,
+				RepoPrefixes: workspaceInfo.RepoPrefixes,
+			})
+		}
+
+		// Debug render mode - output a view to file and exit
+		if *debugRender != "" {
+			output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
+			fmt.Println(output)
+			os.Exit(0)
+		}
+
+		// Run Program
 		if err := runTUIProgram(m); err != nil {
 			fmt.Printf("Error running beads viewer: %v\n", err)
 			os.Exit(1)
 		}
-		return
-	}
 
-	if *exportFile != "" {
-		fmt.Printf("Exporting to %s...\n", *exportFile)
+		return nil
+	})
+	rootCmd.SetArgs(rewriteSingleDashLongFlags(os.Args[1:], rootCmd.Flags()))
 
-		// Load and run pre-export hooks
-		cwd, _ := os.Getwd()
-		var executor *hooks.Executor
-		if !*noHooks {
-			hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
-			if err := hookLoader.Load(); err != nil {
-				fmt.Printf("Warning: failed to load hooks: %v\n", err)
-			} else if hookLoader.HasHooks() {
-				ctx := hooks.ExportContext{
-					ExportPath:   *exportFile,
-					ExportFormat: "markdown",
-					IssueCount:   len(issues),
-					Timestamp:    time.Now(),
-				}
-				executor = hooks.NewExecutor(hookLoader.Config(), ctx)
-
-				// Run pre-export hooks
-				if err := executor.RunPreExport(); err != nil {
-					fmt.Printf("Error: pre-export hook failed: %v\n", err)
-					os.Exit(1)
-				}
-			}
-		}
-
-		// Perform the export
-		if err := export.SaveMarkdownToFile(issues, *exportFile); err != nil {
-			fmt.Printf("Error exporting: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Run post-export hooks
-		if executor != nil {
-			if err := executor.RunPostExport(); err != nil {
-				fmt.Printf("Warning: post-export hook failed: %v\n", err)
-				// Don't exit, just warn
-			}
-
-			// Print hook summary if any hooks ran
-			if len(executor.Results()) > 0 {
-				fmt.Println(executor.Summary())
-			}
-		}
-
-		fmt.Println("Done!")
-		os.Exit(0)
-	}
-
-	if len(issues) == 0 {
-		fmt.Println("No issues found. Create some with 'br create'!")
-		os.Exit(0)
-	}
-
-	// Apply recipe filters and sorting if specified
-	if activeRecipe != nil {
-		issues = applyRecipeFilters(issues, activeRecipe)
-		issues = applyRecipeSort(issues, activeRecipe)
-	}
-
-	// Background mode rollout (bv-o11l):
-	// - CLI flags override env var
-	// - env var overrides user config file
-	if *backgroundMode && *noBackgroundMode {
-		fmt.Fprintln(os.Stderr, "Error: --background-mode and --no-background-mode are mutually exclusive")
-		os.Exit(2)
-	}
-	if *backgroundMode {
-		_ = os.Setenv("BV_BACKGROUND_MODE", "1")
-	} else if *noBackgroundMode {
-		_ = os.Setenv("BV_BACKGROUND_MODE", "0")
-	} else if v, ok := os.LookupEnv("BV_BACKGROUND_MODE"); ok && strings.TrimSpace(v) != "" {
-		// Respect explicit user env var.
-	} else if enabled, ok := loadBackgroundModeFromUserConfig(); ok {
-		if enabled {
-			_ = os.Setenv("BV_BACKGROUND_MODE", "1")
-		} else {
-			_ = os.Setenv("BV_BACKGROUND_MODE", "0")
-		}
-	}
-
-	// Initial Model with live reload support
-	m := ui.NewModel(issues, activeRecipe, beadsPath)
-	defer m.Stop() // Clean up file watcher
-
-	// Enable workspace mode if loading from workspace config
-	if workspaceInfo != nil {
-		m.EnableWorkspaceMode(ui.WorkspaceInfo{
-			Enabled:      true,
-			RepoCount:    workspaceInfo.TotalRepos,
-			FailedCount:  workspaceInfo.FailedRepos,
-			TotalIssues:  workspaceInfo.TotalIssues,
-			RepoPrefixes: workspaceInfo.RepoPrefixes,
-		})
-	}
-
-	// Debug render mode - output a view to file and exit
-	if *debugRender != "" {
-		output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
-		fmt.Println(output)
-		os.Exit(0)
-	}
-
-	// Run Program
-	if err := runTUIProgram(m); err != nil {
-		fmt.Printf("Error running beads viewer: %v\n", err)
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -5026,8 +4521,8 @@ func runTUIProgram(m ui.Model) error {
 	}
 
 	_, err := p.Run()
-	if err != nil && errors.Is(err, tea.ErrProgramKilled) {
-		if err == tea.ErrProgramKilled || errors.Is(err, tea.ErrInterrupted) {
+	if err != nil {
+		if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, tea.ErrInterrupted) {
 			return nil
 		}
 	}
@@ -5039,7 +4534,7 @@ func countEdges(issues []model.Issue) int {
 	count := 0
 	for _, issue := range issues {
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type == model.DepBlocks {
+			if dep != nil && dep.Type.IsBlocking() {
 				count++
 			}
 		}
@@ -5367,7 +4862,7 @@ func applyRecipeFilters(issues []model.Issue, r *recipe.Recipe) []model.Issue {
 		if f.HasBlockers != nil {
 			hasOpenBlockers := false
 			for _, dep := range issue.Dependencies {
-				if dep.Type == model.DepBlocks && openBlockers[dep.DependsOnID] {
+				if dep != nil && dep.Type.IsBlocking() && openBlockers[dep.DependsOnID] {
 					hasOpenBlockers = true
 					break
 				}
@@ -5381,7 +4876,7 @@ func applyRecipeFilters(issues []model.Issue, r *recipe.Recipe) []model.Issue {
 		if f.Actionable != nil && *f.Actionable {
 			hasOpenBlockers := false
 			for _, dep := range issue.Dependencies {
-				if dep.Type == model.DepBlocks && openBlockers[dep.DependsOnID] {
+				if dep != nil && dep.Type.IsBlocking() && openBlockers[dep.DependsOnID] {
 					hasOpenBlockers = true
 					break
 				}
@@ -5430,30 +4925,29 @@ func applyRecipeSort(issues []model.Issue, r *recipe.Recipe) []model.Issue {
 	}
 
 	sort.SliceStable(issues, func(i, j int) bool {
-		var less bool
+		// For descending, swap comparison operands
+		a, b := i, j
+		if !ascending {
+			a, b = j, i
+		}
 
 		switch s.Field {
 		case "priority":
-			less = issues[i].Priority < issues[j].Priority
+			return issues[a].Priority < issues[b].Priority
 		case "created":
-			less = issues[i].CreatedAt.Before(issues[j].CreatedAt)
+			return issues[a].CreatedAt.Before(issues[b].CreatedAt)
 		case "updated":
-			less = issues[i].UpdatedAt.Before(issues[j].UpdatedAt)
+			return issues[a].UpdatedAt.Before(issues[b].UpdatedAt)
 		case "title":
-			less = strings.ToLower(issues[i].Title) < strings.ToLower(issues[j].Title)
+			return strings.ToLower(issues[a].Title) < strings.ToLower(issues[b].Title)
 		case "id":
-			less = naturalLess(issues[i].ID, issues[j].ID)
+			return naturalLess(issues[a].ID, issues[b].ID)
 		case "status":
-			less = issues[i].Status < issues[j].Status
+			return issues[a].Status < issues[b].Status
 		default:
 			// Unknown sort field, maintain order
 			return false
 		}
-
-		if ascending {
-			return less
-		}
-		return !less
 	})
 
 	return issues
@@ -5939,9 +5433,11 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer dstFile.Close()
 
 	_, err = io.Copy(dstFile, srcFile)
+	if closeErr := dstFile.Close(); err == nil {
+		err = closeErr
+	}
 	return err
 }
 
@@ -6842,7 +6338,7 @@ func absInt(v int) int {
 // BurndownOutput represents the JSON output for --robot-burndown (bv-159)
 type BurndownOutput struct {
 	RobotEnvelope
-	SprintID string `json:"sprint_id"`
+	SprintID          string                `json:"sprint_id"`
 	SprintName        string                `json:"sprint_name"`
 	StartDate         time.Time             `json:"start_date"`
 	EndDate           time.Time             `json:"end_date"`
@@ -7167,7 +6663,7 @@ func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Ti
 	idealLine := generateIdealLine(sprint, totalIssues)
 
 	return BurndownOutput{
-		SprintID: sprint.ID,
+		SprintID:          sprint.ID,
 		SprintName:        sprint.Name,
 		StartDate:         sprint.StartDate,
 		EndDate:           sprint.EndDate,
@@ -7406,10 +6902,35 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 
-	// Check for closed beads (status = closed)
-	issueStatusMap := make(map[string]bool)
+	// Build map of bead ID -> latest commit SHA that touched it before/at ClosedAt.
+	// This attributes closure only to the most relevant commit, not every commit.
+	closedBeadCommit := make(map[string]string) // beadID -> commitSHA
 	for _, issue := range issues {
-		issueStatusMap[issue.ID] = issue.Status == model.StatusClosed
+		if issue.Status != model.StatusClosed || issue.ClosedAt == nil {
+			continue
+		}
+		// Find the commit closest to (but not after) the closure time
+		var bestSHA string
+		var bestDist time.Duration = -1
+		for sha, commit := range commitMap {
+			for _, id := range commit.BeadsAdded {
+				if id != issue.ID {
+					continue
+				}
+				commitDate, _ := time.Parse(time.RFC3339, commit.Date)
+				if commitDate.IsZero() {
+					continue
+				}
+				dist := issue.ClosedAt.Sub(commitDate)
+				if dist >= 0 && (bestDist < 0 || dist < bestDist) {
+					bestSHA = sha
+					bestDist = dist
+				}
+			}
+		}
+		if bestSHA != "" {
+			closedBeadCommit[issue.ID] = bestSHA
+		}
 	}
 
 	// Convert map to sorted slice
@@ -7422,6 +6943,9 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 			if !seen[id] {
 				seen[id] = true
 				dedupedAdded = append(dedupedAdded, id)
+				if closedBeadCommit[id] == commit.SHA {
+					commit.BeadsClosed = append(commit.BeadsClosed, id)
+				}
 			}
 		}
 		commit.BeadsAdded = dedupedAdded

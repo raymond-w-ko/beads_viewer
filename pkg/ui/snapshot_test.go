@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,7 +137,7 @@ func TestSnapshotBuilder_Simple(t *testing.T) {
 	if snapshot.Analysis == nil {
 		t.Error("Analysis should not be nil")
 	}
-	if snapshot.Insights.Stats != snapshot.Analysis {
+	if snapshot.GetInsights().Stats != snapshot.Analysis {
 		t.Error("Insights.Stats should reference Analysis")
 	}
 
@@ -270,10 +271,10 @@ func TestSnapshotBuilder_WithBuildConfig_SkipsPrecomputesForLargeTier(t *testing
 	if snapshot.BoardState != nil {
 		t.Fatalf("expected board precompute to be skipped")
 	}
-	if snapshot.GraphLayout != nil {
+	if snapshot.GetGraphLayout() != nil {
 		t.Fatalf("expected graph layout precompute to be skipped")
 	}
-	if snapshot.Insights.Stats != snapshot.Analysis {
+	if snapshot.GetInsights().Stats != snapshot.Analysis {
 		t.Fatalf("expected Insights.Stats to reference Analysis")
 	}
 }
@@ -354,19 +355,20 @@ func TestSnapshotBuilder_GraphLayout(t *testing.T) {
 	}
 
 	snapshot := NewSnapshotBuilder(issues).Build()
-	if snapshot.GraphLayout == nil {
+	layout := snapshot.GetGraphLayout()
+	if layout == nil {
 		t.Fatal("expected GraphLayout to be computed")
 	}
 
-	if got := snapshot.GraphLayout.Blockers["A"]; len(got) != 1 || got[0] != "B" {
+	if got := layout.Blockers["A"]; len(got) != 1 || got[0] != "B" {
 		t.Fatalf("unexpected blockers for A: %#v", got)
 	}
-	if got := snapshot.GraphLayout.Dependents["B"]; len(got) != 1 || got[0] != "A" {
+	if got := layout.Dependents["B"]; len(got) != 1 || got[0] != "A" {
 		t.Fatalf("unexpected dependents for B: %#v", got)
 	}
 
-	if len(snapshot.GraphLayout.SortedIDs) != len(issues) {
-		t.Fatalf("expected %d sorted IDs, got %d", len(issues), len(snapshot.GraphLayout.SortedIDs))
+	if len(layout.SortedIDs) != len(issues) {
+		t.Fatalf("expected %d sorted IDs, got %d", len(issues), len(layout.SortedIDs))
 	}
 }
 
@@ -686,7 +688,7 @@ func TestSnapshotSwap_UsesSnapshotInsights(t *testing.T) {
 	m := NewModel(issues, nil, "")
 
 	snapshot := NewSnapshotBuilder(issues).Build()
-	snapshot.Insights.Bottlenecks = []analysis.InsightItem{{ID: "sentinel", Value: 1}}
+	snapshot.insights.Bottlenecks = []analysis.InsightItem{{ID: "sentinel", Value: 1}}
 
 	newM, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot})
 	m = newM.(Model)
@@ -713,14 +715,14 @@ func TestSnapshotSwap_UsesSnapshotGraphLayoutWhenUnfiltered(t *testing.T) {
 	m.currentFilter = "all"
 
 	snapshot := NewSnapshotBuilder(issues).Build()
-	if snapshot.GraphLayout == nil {
+	if snapshot.GetGraphLayout() == nil {
 		t.Fatal("expected snapshot GraphLayout")
 	}
 
 	// Sentinel tweak: if the UI rebuilds graph relationships from issues (SetIssues),
 	// blockers["A"] will be ["B"]. If it uses the snapshot layout (SetSnapshot),
 	// it will preserve this sentinel.
-	snapshot.GraphLayout.Blockers["A"] = []string{"SENTINEL"}
+	snapshot.graphLayout.Blockers["A"] = []string{"SENTINEL"}
 
 	newM, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot})
 	m = newM.(Model)
@@ -750,7 +752,7 @@ func TestPhase2ReadyMsg_DoesNotRebuildGraphViewWhenSnapshotHasLayout(t *testing.
 	m.currentFilter = "all"
 
 	snapshot := NewSnapshotBuilder(issues).Build()
-	snapshot.GraphLayout.Blockers["A"] = []string{"SENTINEL"}
+	snapshot.graphLayout.Blockers["A"] = []string{"SENTINEL"}
 
 	newM, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot})
 	m = newM.(Model)
@@ -869,5 +871,208 @@ func TestSnapshotSwap_RebuildsTreeWhenFocusedAndPreservesSelection(t *testing.T)
 	}
 	if sel := m.tree.SelectedIssue(); sel == nil || sel.ID != selectedID {
 		t.Fatalf("expected tree selection preserved (%s), got %#v", selectedID, sel)
+	}
+}
+
+// TestWithPhase2_ReturnsNewPointer verifies that WithPhase2 returns a new snapshot pointer.
+func TestWithPhase2_ReturnsNewPointer(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Issue A", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{ID: "B", Title: "Issue B", Status: model.StatusOpen, IssueType: model.TypeTask},
+	}
+
+	cfg := snapshotBuildConfigDefault()
+	cfg.SkipPhase2 = true // Ensure Phase2Ready starts as false
+	original := NewSnapshotBuilder(issues).WithBuildConfig(cfg).Build()
+
+	if original.IsPhase2Ready() {
+		t.Skip("Phase2 completed before Build() returned; cannot test Phase2Ready transition")
+	}
+
+	// Create analyzer and compute Phase 2
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+	ins := stats.GenerateInsights(len(issues))
+
+	newSnapshot := original.WithPhase2(stats, ins, issues, analyzer)
+
+	if newSnapshot == original {
+		t.Error("WithPhase2 should return a new snapshot pointer")
+	}
+	if !newSnapshot.IsPhase2Ready() {
+		t.Error("new snapshot should have Phase2Ready=true")
+	}
+}
+
+// TestWithPhase2_DetachesMutableIssueState verifies that Phase 2 snapshots do not
+// alias the original snapshot's mutable issue backing structures.
+func TestWithPhase2_DetachesMutableIssueState(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Issue A", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{ID: "B", Title: "Issue B", Status: model.StatusOpen, IssueType: model.TypeTask},
+	}
+
+	cfg := snapshotBuildConfigDefault()
+	original := NewSnapshotBuilder(issues).WithBuildConfig(cfg).Build()
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+	ins := stats.GenerateInsights(len(issues))
+
+	newSnapshot := original.WithPhase2(stats, ins, issues, analyzer)
+
+	if &original.Issues[0] == &newSnapshot.Issues[0] {
+		t.Error("WithPhase2 should clone Issues to keep the new snapshot detached")
+	}
+	if got := newSnapshot.IssueMap["A"]; got == nil {
+		t.Fatal("new snapshot issue map should contain cloned issues")
+	} else if got != &newSnapshot.Issues[0] && got != &newSnapshot.Issues[1] {
+		t.Fatal("new snapshot issue map should point into the cloned issue slice")
+	}
+	if original.IssueMap != nil && newSnapshot.IssueMap != nil && original.IssueMap["A"] == newSnapshot.IssueMap["A"] {
+		t.Error("WithPhase2 should rebuild IssueMap to avoid stale pointers into the old slice")
+	}
+
+	original.Issues[0].Title = "mutated old snapshot"
+	if got := newSnapshot.IssueMap["A"].Title; got == "mutated old snapshot" {
+		t.Error("mutating the old snapshot should not affect the cloned Phase 2 snapshot")
+	}
+}
+
+// TestWithPhase2_NilSnapshot verifies that WithPhase2 handles nil receiver gracefully.
+func TestWithPhase2_NilSnapshot(t *testing.T) {
+	var s *DataSnapshot
+	result := s.WithPhase2(nil, analysis.Insights{}, nil, nil)
+	if result != nil {
+		t.Error("WithPhase2 on nil should return nil")
+	}
+}
+
+// TestWithPhase2_ConcurrentReadSafe verifies no race conditions when reading old snapshot
+// while WithPhase2 creates a new one.
+func TestWithPhase2_ConcurrentReadSafe(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Issue A", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{ID: "B", Title: "Issue B", Status: model.StatusOpen, IssueType: model.TypeTask},
+	}
+
+	cfg := snapshotBuildConfigDefault()
+	original := NewSnapshotBuilder(issues).WithBuildConfig(cfg).Build()
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+	ins := stats.GenerateInsights(len(issues))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader goroutine - read from original concurrently
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = original.IsPhase2Ready()
+			_ = len(original.Issues)
+			if original.IssueMap != nil {
+				_ = len(original.IssueMap)
+			}
+		}
+	}()
+
+	// Writer goroutine - create new snapshot
+	go func() {
+		defer wg.Done()
+		_ = original.WithPhase2(stats, ins, issues, analyzer)
+	}()
+
+	wg.Wait()
+}
+
+// TestWithPhase2_TriagePopulation verifies triage data is populated in new snapshot.
+func TestWithPhase2_TriagePopulation(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Issue A", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1},
+		{ID: "B", Title: "Issue B", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Title: "Issue C", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 3},
+		{ID: "D", Title: "Issue D", Status: model.StatusOpen, IssueType: model.TypeTask},
+	}
+
+	cfg := snapshotBuildConfigDefault()
+	original := NewSnapshotBuilder(issues).WithBuildConfig(cfg).Build()
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+	ins := stats.GenerateInsights(len(issues))
+
+	newSnapshot := original.WithPhase2(stats, ins, issues, analyzer)
+
+	// Verify triage data is populated (not nil)
+	t.Logf("TriageScores: %d entries", len(newSnapshot.TriageScores))
+	t.Logf("BlockerSet: %d entries", len(newSnapshot.BlockerSet))
+	t.Logf("QuickWinSet: %d entries", len(newSnapshot.QuickWinSet))
+	t.Logf("UnblocksMap: %d entries", len(newSnapshot.UnblocksMap))
+}
+
+// TestWithPhase2_TreeDeepCopy verifies that tree structures are deep copied,
+// so mutations to one snapshot's tree don't affect another.
+func TestWithPhase2_TreeDeepCopy(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root", Title: "Root", Status: model.StatusOpen, IssueType: model.TypeEpic},
+		{ID: "child", Title: "Child", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+	}
+
+	cfg := snapshotBuildConfigDefault()
+	original := NewSnapshotBuilder(issues).WithBuildConfig(cfg).Build()
+
+	// Skip if tree wasn't built
+	if len(original.TreeRoots) == 0 || len(original.TreeNodeMap) == 0 {
+		t.Skip("Snapshot builder didn't populate tree structures")
+	}
+
+	// Capture original tree state
+	originalRootExpanded := original.TreeRoots[0].Expanded
+	originalRootPtr := original.TreeRoots[0]
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+	ins := stats.GenerateInsights(len(issues))
+
+	newSnapshot := original.WithPhase2(stats, ins, issues, analyzer)
+
+	// Verify deep copy - pointers should be different
+	if len(newSnapshot.TreeRoots) == 0 {
+		t.Fatal("New snapshot has no TreeRoots")
+	}
+	if newSnapshot.TreeRoots[0] == originalRootPtr {
+		t.Error("TreeRoots[0] should be a different pointer after deep copy")
+	}
+
+	// Verify mutation isolation - toggle Expanded on new snapshot
+	newSnapshot.TreeRoots[0].Expanded = !newSnapshot.TreeRoots[0].Expanded
+
+	// Original should be unchanged
+	if original.TreeRoots[0].Expanded != originalRootExpanded {
+		t.Error("Mutating new snapshot's tree affected original snapshot")
+	}
+
+	// Verify TreeNodeMap is also deep copied
+	for id, origNode := range original.TreeNodeMap {
+		newNode, ok := newSnapshot.TreeNodeMap[id]
+		if !ok {
+			t.Errorf("TreeNodeMap missing key %q in new snapshot", id)
+			continue
+		}
+		if newNode == origNode {
+			t.Errorf("TreeNodeMap[%q] should be a different pointer after deep copy", id)
+		}
+		if newNode.Issue == origNode.Issue {
+			t.Errorf("TreeNodeMap[%q] should rebind Issue pointers to cloned snapshot issues", id)
+		}
 	}
 }

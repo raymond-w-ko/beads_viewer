@@ -102,6 +102,9 @@ func checkForUpdates(client *http.Client, url string) (string, string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return "", "", err
 	}
 	defer resp.Body.Close()
@@ -353,6 +356,9 @@ func GetLatestRelease() (*Release, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return nil, fmt.Errorf("failed to fetch release info: %w", err)
 	}
 	defer resp.Body.Close()
@@ -426,6 +432,11 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// When CheckRedirect returns a non-nil error, resp may be non-nil
+		// with an unclosed Body. Close it to avoid leaking connections.
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		return fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -442,9 +453,22 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer out.Close()
 
-	n, err := io.Copy(out, resp.Body)
+	// Cap download size to prevent unbounded disk writes from malicious/corrupted responses.
+	// Allow 10% overhead for encoding variance; minimum 100MB for safety.
+	var reader io.Reader = resp.Body
+	if expectedSize > 0 {
+		maxSize := expectedSize + expectedSize/10
+		if maxSize < 100*1024*1024 {
+			maxSize = 100 * 1024 * 1024
+		}
+		reader = io.LimitReader(resp.Body, maxSize)
+	}
+
+	n, err := io.Copy(out, reader)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
@@ -543,10 +567,14 @@ func extractBinary(archivePath, destPath string) error {
 			if err != nil {
 				return fmt.Errorf("failed to create binary: %w", err)
 			}
-			defer out.Close()
 
-			if _, err := io.Copy(out, tr); err != nil {
-				return fmt.Errorf("failed to extract binary: %w", err)
+			_, copyErr := io.Copy(out, tr)
+			closeErr := out.Close()
+			if copyErr != nil {
+				return fmt.Errorf("failed to extract binary: %w", copyErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("failed to flush extracted binary: %w", closeErr)
 			}
 			return nil
 		}
@@ -709,9 +737,11 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer destFile.Close()
 
 	_, err = io.Copy(destFile, sourceFile)
+	if closeErr := destFile.Close(); err == nil {
+		err = closeErr
+	}
 	return err
 }
 

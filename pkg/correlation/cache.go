@@ -5,10 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
+	"golang.org/x/sync/singleflight"
 )
 
 // CacheKey uniquely identifies a cached history report
@@ -25,10 +31,11 @@ func (k CacheKey) String() string {
 
 // CacheEntry holds a cached report with metadata
 type CacheEntry struct {
-	Key        CacheKey
-	Report     *HistoryReport
-	CreatedAt  time.Time
-	AccessedAt time.Time
+	Key             CacheKey
+	Report          *HistoryReport
+	CreatedAt       time.Time
+	AccessedAt      time.Time
+	ComputeDuration time.Duration // How long it took to generate this report
 }
 
 // HistoryCache provides thread-safe caching of history reports with LRU eviction
@@ -46,6 +53,8 @@ const DefaultCacheMaxAge = 5 * time.Minute
 
 // DefaultCacheMaxSize is the default maximum number of cache entries
 const DefaultCacheMaxSize = 10
+
+var correlationCacheLogf = log.Printf
 
 // NewHistoryCache creates a new cache with default settings
 func NewHistoryCache(repoPath string) *HistoryCache {
@@ -101,6 +110,11 @@ func (c *HistoryCache) Get(key CacheKey) (*HistoryReport, bool) {
 
 // Put stores a report in the cache
 func (c *HistoryCache) Put(key CacheKey, report *HistoryReport) {
+	c.PutWithDuration(key, report, 0)
+}
+
+// PutWithDuration stores a report with its compute duration for XFetch
+func (c *HistoryCache) PutWithDuration(key CacheKey, report *HistoryReport, computeDuration time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -112,6 +126,7 @@ func (c *HistoryCache) Put(key CacheKey, report *HistoryReport) {
 		c.entries[keyStr].Report = report
 		c.entries[keyStr].CreatedAt = now
 		c.entries[keyStr].AccessedAt = now
+		c.entries[keyStr].ComputeDuration = computeDuration
 		c.moveToEndLocked(keyStr)
 		return
 	}
@@ -123,12 +138,37 @@ func (c *HistoryCache) Put(key CacheKey, report *HistoryReport) {
 
 	// Add new entry
 	c.entries[keyStr] = &CacheEntry{
-		Key:        key,
-		Report:     report,
-		CreatedAt:  now,
-		AccessedAt: now,
+		Key:             key,
+		Report:          report,
+		CreatedAt:       now,
+		AccessedAt:      now,
+		ComputeDuration: computeDuration,
 	}
 	c.order = append(c.order, keyStr)
+}
+
+// GetWithMeta retrieves a cached report with its metadata for XFetch decisions
+func (c *HistoryCache) GetWithMeta(key CacheKey) (*HistoryReport, time.Time, time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	keyStr := key.String()
+	entry, ok := c.entries[keyStr]
+	if !ok {
+		return nil, time.Time{}, 0, false
+	}
+
+	// Check if entry is expired
+	if time.Since(entry.CreatedAt) > c.maxAge {
+		c.removeEntryLocked(keyStr)
+		return nil, time.Time{}, 0, false
+	}
+
+	// Update access time and LRU order
+	entry.AccessedAt = time.Now()
+	c.moveToEndLocked(keyStr)
+
+	return entry.Report, entry.CreatedAt, entry.ComputeDuration, true
 }
 
 // Invalidate removes all entries (called when HEAD or beads change)
@@ -271,10 +311,19 @@ func getGitHead(repoPath string) (string, error) {
 
 // hashBeads creates a hash of bead IDs and statuses
 func hashBeads(beads []BeadInfo) string {
-	h := sha256.New()
+	if len(beads) == 0 {
+		return hex.EncodeToString(sha256.New().Sum(nil))[:12]
+	}
+
+	entries := make([]string, 0, len(beads))
 	for _, b := range beads {
-		h.Write([]byte(b.ID))
-		h.Write([]byte(b.Status))
+		entries = append(entries, b.ID+"\x00"+b.Status)
+	}
+	sort.Strings(entries)
+
+	h := sha256.New()
+	for _, entry := range entries {
+		h.Write([]byte(entry))
 	}
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
@@ -304,26 +353,35 @@ func hashOptions(opts CorrelatorOptions) string {
 
 // CachedCorrelator wraps a Correlator with caching support
 type CachedCorrelator struct {
-	correlator *Correlator
-	cache      *HistoryCache
-	hits       int64 // Cache hit count (for stats)
-	misses     int64 // Cache miss count (for stats)
-	mu         sync.Mutex
+	correlator       *Correlator
+	cache            *HistoryCache
+	sf               singleflight.Group
+	generateReportFn func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error)
+	shouldRefreshFn  func(time.Time, time.Duration, float64, time.Time) bool
+	hits             int64 // Cache hit count (for stats)
+	misses           int64 // Cache miss count (for stats)
+	mu               sync.Mutex
 }
 
 // NewCachedCorrelator creates a correlator with caching enabled
 func NewCachedCorrelator(repoPath string) *CachedCorrelator {
+	correlator := NewCorrelator(repoPath)
 	return &CachedCorrelator{
-		correlator: NewCorrelator(repoPath),
-		cache:      NewHistoryCache(repoPath),
+		correlator:       correlator,
+		cache:            NewHistoryCache(repoPath),
+		generateReportFn: correlator.GenerateReport,
+		shouldRefreshFn:  xfetch.ShouldRefresh,
 	}
 }
 
 // NewCachedCorrelatorWithOptions creates a correlator with custom cache settings
 func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSize int) *CachedCorrelator {
+	correlator := NewCorrelator(repoPath)
 	return &CachedCorrelator{
-		correlator: NewCorrelator(repoPath),
-		cache:      NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),
+		correlator:       correlator,
+		cache:            NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),
+		generateReportFn: correlator.GenerateReport,
+		shouldRefreshFn:  xfetch.ShouldRefresh,
 	}
 }
 
@@ -333,31 +391,87 @@ func (c *CachedCorrelator) GenerateReport(beads []BeadInfo, opts CorrelatorOptio
 	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
 	if err != nil {
 		// If we can't build a cache key, fall back to uncached
-		return c.correlator.GenerateReport(beads, opts)
+		return c.generate(beads, opts)
 	}
 
-	// Check cache
-	if report, ok := c.cache.Get(key); ok {
-		c.mu.Lock()
-		c.hits++
-		c.mu.Unlock()
+	// Check cache with XFetch probabilistic early refresh
+	if report, createdAt, computeDuration, ok := c.cache.GetWithMeta(key); ok {
+		c.recordHit()
+
+		// XFetch: probabilistically trigger background refresh before expiry
+		// This prevents all clients from refreshing simultaneously
+		shouldRefresh := xfetch.ShouldRefresh
+		if c.shouldRefreshFn != nil {
+			shouldRefresh = c.shouldRefreshFn
+		}
+		if computeDuration > 0 && shouldRefresh(createdAt, computeDuration, 1.0, time.Now()) {
+			refreshBeads, refreshOpts := cloneCorrelatorInputs(beads, opts)
+			// Trigger background refresh (non-blocking)
+			go func() {
+				_, err, shared := c.sf.Do(key.String(), func() (interface{}, error) {
+					if existing, existingCreatedAt, _, ok := c.cache.GetWithMeta(key); ok && existingCreatedAt.After(createdAt) {
+						return existing, nil
+					}
+
+					start := time.Now()
+					freshReport, err := c.generate(refreshBeads, refreshOpts)
+					if err != nil {
+						return nil, err
+					}
+					c.cacheReportIfCurrent(key, refreshBeads, refreshOpts, freshReport, time.Since(start))
+					return freshReport, nil
+				})
+				if err != nil {
+					logCorrelationCacheSingleflightError("background refresh", key, shared, err)
+				}
+			}()
+		}
+
 		return report, nil
 	}
 
-	// Cache miss - generate report
-	c.mu.Lock()
-	c.misses++
-	c.mu.Unlock()
+	result, err, shared := c.sf.Do(key.String(), func() (interface{}, error) {
+		// Another caller may have filled the cache while we waited to enter the flight.
+		if report, _, _, ok := c.cache.GetWithMeta(key); ok {
+			c.recordHit()
+			return report, nil
+		}
 
-	report, err := c.correlator.GenerateReport(beads, opts)
+		c.recordMiss()
+
+		start := time.Now()
+		report, err := c.generate(beads, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		c.cacheReportIfCurrent(key, beads, opts, report, time.Since(start))
+		return report, nil
+	})
 	if err != nil {
+		logCorrelationCacheSingleflightError("report generation", key, shared, err)
 		return nil, err
 	}
 
-	// Store in cache
-	c.cache.Put(key, report)
+	report, ok := result.(*HistoryReport)
+	if !ok {
+		return nil, fmt.Errorf("unexpected singleflight result type %T", result)
+	}
 
 	return report, nil
+}
+
+func logCorrelationCacheSingleflightError(operation string, key CacheKey, shared bool, err error) {
+	if err == nil {
+		return
+	}
+	correlationCacheLogf(
+		"correlation cache singleflight %s failed for key %s (shared=%t): %v",
+		operation,
+		key.String(),
+		shared,
+		err,
+	)
 }
 
 // InvalidateCache clears all cached entries
@@ -398,4 +512,50 @@ type CachedCorrelatorStats struct {
 	CacheSize int
 	MaxSize   int
 	MaxAge    time.Duration
+}
+
+func (c *CachedCorrelator) generate(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
+	if c.generateReportFn != nil {
+		return c.generateReportFn(beads, opts)
+	}
+	return c.correlator.GenerateReport(beads, opts)
+}
+
+func (c *CachedCorrelator) recordHit() {
+	c.mu.Lock()
+	c.hits++
+	c.mu.Unlock()
+}
+
+func (c *CachedCorrelator) recordMiss() {
+	c.mu.Lock()
+	c.misses++
+	c.mu.Unlock()
+}
+
+func (c *CachedCorrelator) cacheReportIfCurrent(expectedKey CacheKey, beads []BeadInfo, opts CorrelatorOptions, report *HistoryReport, computeDuration time.Duration) bool {
+	currentKey, err := BuildCacheKey(c.cache.repoPath, beads, opts)
+	if err != nil {
+		return false
+	}
+	if currentKey != expectedKey {
+		return false
+	}
+
+	c.cache.PutWithDuration(expectedKey, report, computeDuration)
+	return true
+}
+
+func cloneCorrelatorInputs(beads []BeadInfo, opts CorrelatorOptions) ([]BeadInfo, CorrelatorOptions) {
+	clonedBeads := append([]BeadInfo(nil), beads...)
+	clonedOpts := opts
+	if opts.Since != nil {
+		since := *opts.Since
+		clonedOpts.Since = &since
+	}
+	if opts.Until != nil {
+		until := *opts.Until
+		clonedOpts.Until = &until
+	}
+	return clonedBeads, clonedOpts
 }

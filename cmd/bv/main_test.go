@@ -1,16 +1,41 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
+
+func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (string, string, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("command %v timed out\nstdout:\n%s\nstderr:\n%s", args, stdout.String(), stderr.String())
+	}
+
+	return stdout.String(), stderr.String(), err
+}
 
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
 	issues := []model.Issue{
@@ -78,11 +103,148 @@ func TestRobotFlagsOutputJSON(t *testing.T) {
 		{"--robot-insights"},
 		{"--robot-priority"},
 		{"--robot-recipes"},
+		{"--robot-docs", "commands"},
+		{"--robot-next"},
+		{"--robot-triage"},
+		{"--robot-label-health"},
+		{"--robot-label-flow"},
+		{"--robot-label-attention"},
+		{"--robot-capacity"},
 	} {
 		out := run(flag...)
 		if !json.Valid(out) {
 			t.Fatalf("%v did not return valid JSON: %s", flag, string(out))
 		}
+	}
+}
+
+func TestCLIFlagCompatibility(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeTestBeadsFixture(t, tmpDir)
+
+	exe := buildTestBinary(t)
+
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command(exe, args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("command %v failed: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+
+	t.Run("double-dash robot flag", func(t *testing.T) {
+		out := run("--robot-next", "--format", "json")
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("expected JSON output for long flags, got %q", out)
+		}
+	})
+
+	t.Run("single-dash compatibility", func(t *testing.T) {
+		out := run("-robot-next", "-format", "json")
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("expected JSON output for single-dash long flags, got %q", out)
+		}
+	})
+
+	t.Run("short aliases", func(t *testing.T) {
+		out := run("--robot-insights", "-l", "backend", "-f", "json")
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("expected JSON output for short aliases, got %q", out)
+		}
+	})
+
+	t.Run("grouped help output", func(t *testing.T) {
+		out := run("--help")
+		for _, snippet := range []string{
+			"General Flags:",
+			"Search & Filters:",
+			"Robot & Planning Flags:",
+			"Export & Reporting:",
+			"Agent File Management:",
+			"-f, --format",
+			"-l, --label",
+			"-r, --recipe",
+		} {
+			if !strings.Contains(out, snippet) {
+				t.Fatalf("help output missing %q:\n%s", snippet, out)
+			}
+		}
+	})
+
+	t.Run("version flag", func(t *testing.T) {
+		out := strings.TrimSpace(run("--version"))
+		if !strings.HasPrefix(out, "bv ") {
+			t.Fatalf("expected version output, got %q", out)
+		}
+	})
+}
+
+func TestModifierFlagValidation(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+
+	tests := []struct {
+		name        string
+		args        []string
+		wantMessage string
+	}{
+		{
+			name:        "robot diff requires diff since",
+			args:        []string{"--robot-diff"},
+			wantMessage: "Error: --robot-diff requires --diff-since",
+		},
+		{
+			name:        "robot drift requires check drift",
+			args:        []string{"--robot-drift"},
+			wantMessage: "Error: --robot-drift requires --check-drift",
+		},
+		{
+			name:        "schema command requires robot schema",
+			args:        []string{"--schema-command", "robot-triage"},
+			wantMessage: "Error: --schema-command requires --robot-schema",
+		},
+		{
+			name:        "watch export requires export pages",
+			args:        []string{"--watch-export"},
+			wantMessage: "Error: --watch-export requires --export-pages",
+		},
+		{
+			name:        "history since requires history mode",
+			args:        []string{"--history-since", "30 days ago"},
+			wantMessage: "Error: --history-since requires one of --robot-history or --bead-history",
+		},
+		{
+			name:        "capacity agents requires robot capacity",
+			args:        []string{"--agents", "3"},
+			wantMessage: "Error: --agents requires --robot-capacity",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, err := runCommandWithTimeout(t, tmpDir, exe, tt.args...)
+			if err == nil {
+				t.Fatalf("expected %v to fail, got success\nstdout:\n%s\nstderr:\n%s", tt.args, stdout, stderr)
+			}
+
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("expected ExitError for %v, got %T", tt.args, err)
+			}
+			if exitErr.ExitCode() != 1 {
+				t.Fatalf("exit code = %d, want 1\nstdout:\n%s\nstderr:\n%s", exitErr.ExitCode(), stdout, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("expected empty stdout for %v, got:\n%s", tt.args, stdout)
+			}
+			if !strings.Contains(stderr, tt.wantMessage) {
+				t.Fatalf("stderr missing %q\nfull stderr:\n%s", tt.wantMessage, stderr)
+			}
+		})
 	}
 }
 
@@ -250,6 +412,24 @@ func TestFormatCycle(t *testing.T) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+func writeTestBeadsFixture(t *testing.T, dir string) {
+	t.Helper()
+
+	beads := `{"id":"A","title":"Root","status":"open","priority":1,"issue_type":"task","labels":["backend"]}
+{"id":"B","title":"Blocked","status":"blocked","priority":2,"issue_type":"task","labels":["backend"],"dependencies":[{"depends_on_id":"A","type":"blocks"}]}
+{"id":"C","title":"UI","status":"open","priority":2,"issue_type":"task","labels":["frontend"]}`
+
+	if err := os.WriteFile(filepath.Join(dir, ".beads.jsonl"), []byte(beads), 0o644); err != nil {
+		t.Fatalf("write beads file: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "beads.jsonl"), []byte(beads), 0o644); err != nil {
+		t.Fatalf("write beads dir: %v", err)
+	}
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()

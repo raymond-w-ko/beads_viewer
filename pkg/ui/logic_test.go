@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
@@ -124,6 +126,80 @@ func TestApplyRecipe_Sorting(t *testing.T) {
 	}
 	if filtered[2].ID != "C" {
 		t.Errorf("Expected C third, got %s", filtered[2].ID)
+	}
+}
+
+func TestNewModel_RecipeSortDescendingTieBreaksByID(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "d", Priority: 1},
+		{ID: "c", Priority: 1},
+		{ID: "b", Priority: 1},
+		{ID: "a", Priority: 1},
+		{ID: "z", Priority: 2},
+	}
+
+	r := &recipe.Recipe{
+		Sort: recipe.SortConfig{
+			Field:     "priority",
+			Direction: "desc",
+		},
+	}
+
+	expected := []string{"z", "a", "b", "c", "d"}
+	for _, perm := range [][]model.Issue{
+		issues,
+		{issues[4], issues[0], issues[1], issues[2], issues[3]},
+		{issues[3], issues[2], issues[1], issues[0], issues[4]},
+	} {
+		m := NewModel(append([]model.Issue(nil), perm...), r, "")
+		filtered := m.FilteredIssues()
+		if len(filtered) != len(expected) {
+			t.Fatalf("Expected %d issues, got %d", len(expected), len(filtered))
+		}
+		for i, want := range expected {
+			if filtered[i].ID != want {
+				t.Fatalf("Input order %v: position %d = %s, want %s", perm, i, filtered[i].ID, want)
+			}
+		}
+	}
+}
+
+func TestAttentionView_CloseRestoresInsightsPanel(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Alpha", Status: model.StatusOpen, Priority: 1},
+		{ID: "B", Title: "Beta", Status: model.StatusOpen, Priority: 2},
+	}
+
+	m := NewModel(issues, nil, "")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m = updated.(Model)
+	m.insightsPanel.focusedPanel = PanelCycles
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	m = updated.(Model)
+	if !m.showAttentionView {
+		t.Fatal("Expected attention view to open")
+	}
+	if m.insightsPanel.extraText == "" {
+		t.Fatal("Expected attention view to render overlay text")
+	}
+	if m.insightsPanel.focusedPanel != PanelCycles {
+		t.Fatalf("Expected attention view to preserve focused panel %v, got %v", PanelCycles, m.insightsPanel.focusedPanel)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.showAttentionView {
+		t.Fatal("Expected attention view to close")
+	}
+	if m.insightsPanel.extraText != "" {
+		t.Fatalf("Expected overlay text cleared, got %q", m.insightsPanel.extraText)
+	}
+	if m.insightsPanel.focusedPanel != PanelCycles {
+		t.Fatalf("Expected insights panel focus restored to %v, got %v", PanelCycles, m.insightsPanel.focusedPanel)
+	}
+	if m.insightsPanel.insights.Stats == nil {
+		t.Fatal("Expected insights panel data restored after closing attention view")
 	}
 }
 

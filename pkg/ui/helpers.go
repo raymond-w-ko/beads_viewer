@@ -130,6 +130,9 @@ func buildTreeRecursive(id string, issueMap map[string]*model.Issue, depType str
 
 	// Recursively add children (dependencies)
 	for _, dep := range issue.Dependencies {
+		if dep == nil {
+			continue
+		}
 		childNode := buildTreeRecursive(dep.DependsOnID, issueMap, string(dep.Type), visited, depth+1, maxDepth)
 		if childNode != nil {
 			node.Children = append(node.Children, childNode)

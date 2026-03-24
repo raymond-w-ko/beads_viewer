@@ -102,7 +102,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "You're already running bv!"},
 				Spacer{Lines: 1},
 				Section{Title: "Basic Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "j / k", Desc: "Move down / up"},
 					{Key: "Enter", Desc: "Open issue details"},
 					{Key: "Esc", Desc: "Close overlay / go back"},
@@ -110,7 +110,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Switching Views"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "b", Desc: "Board (Kanban)"},
 					{Key: "g", Desc: "Graph (dependencies)"},
 					{Key: "i", Desc: "Insights panel"},
@@ -118,7 +118,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Getting Help"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "?", Desc: "Quick help overlay"},
 					{Key: "Space", Desc: "This tutorial (in help)"},
 					{Key: ";", Desc: "Shortcuts sidebar"},
@@ -140,7 +140,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Think of your project's work as beads on a string - discrete items that together form the complete picture."},
 				Spacer{Lines: 1},
 				Section{Title: "Issue Types"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "bug", Desc: "Something broken that needs fixing"},
 					{Key: "feature", Desc: "New functionality to add"},
 					{Key: "task", Desc: "General work item"},
@@ -174,7 +174,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Auth Fix BLOCKS Deploy. You can't deploy until auth is fixed."},
 				Spacer{Lines: 1},
 				Section{Title: "Visual Indicators"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Red", Desc: "Blocked - waiting on something"},
 					{Key: "Green", Desc: "Ready - no blockers, can start"},
 					{Key: "->", Desc: "Shows what this issue blocks"},
@@ -196,7 +196,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Labels provide flexible categorization that cuts across types and priorities."},
 				Spacer{Lines: 1},
 				Section{Title: "Common Label Patterns"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Area", Desc: "frontend, backend, api, database"},
 					{Key: "Owner", Desc: "team-alpha, @alice, contractor"},
 					{Key: "Scope", Desc: "mvp, v2, tech-debt, nice-to-have"},
@@ -204,7 +204,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Working with Labels"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "L", Desc: "Open label picker"},
 					{Key: "Shift+L", Desc: "Filter by label"},
 					{Key: "[", Desc: "Labels dashboard view"},
@@ -221,7 +221,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "How important? Where in the workflow?"},
 				Spacer{Lines: 1},
 				Section{Title: "Priority Levels"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "P0", Desc: "Critical/emergency - drop everything"},
 					{Key: "P1", Desc: "High priority - this sprint/week"},
 					{Key: "P2", Desc: "Medium - this cycle/month"},
@@ -237,7 +237,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Changing Priority/Status"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "p", Desc: "Change priority"},
 					{Key: "s", Desc: "Change status"},
 				}},
@@ -276,7 +276,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Visual Encoding"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Node size", Desc: "Priority (bigger = higher)"},
 					{Key: "Green", Desc: "Closed"},
 					{Key: "Blue", Desc: "In progress"},
@@ -305,7 +305,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "If you know vim, you're already at home. If not, you'll pick it up in minutes."},
 				Spacer{Lines: 1},
 				Section{Title: "Core Movement"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "j", Desc: "Move down"},
 					{Key: "k", Desc: "Move up"},
 					{Key: "h", Desc: "Move left (multi-column)"},
@@ -313,7 +313,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Jump Commands"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "g", Desc: "Jump to top"},
 					{Key: "G", Desc: "Jump to bottom"},
 					{Key: "Ctrl+d", Desc: "Half-page down"},
@@ -321,7 +321,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Universal Keys"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "?", Desc: "Help overlay"},
 					{Key: "Esc", Desc: "Close / go back"},
 					{Key: "Enter", Desc: "Select / open"},
@@ -341,7 +341,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "This is where you'll spend most of your time."},
 				Spacer{Lines: 1},
 				Section{Title: "Filtering"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "o", Desc: "Open issues only"},
 					{Key: "c", Desc: "Closed issues only"},
 					{Key: "r", Desc: "Ready (no blockers)"},
@@ -349,7 +349,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Searching"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "/", Desc: "Fuzzy search (fast, typo-tolerant)"},
 					{Key: "Ctrl+S", Desc: "Semantic search (vector index)"},
 					{Key: "H", Desc: "Hybrid ranking (semantic)"},
@@ -381,7 +381,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Detail View Actions"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "O", Desc: "Open in external editor"},
 					{Key: "C", Desc: "Copy issue ID to clipboard"},
 					{Key: "j / k", Desc: "Scroll content"},
@@ -402,7 +402,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Press Tab from Detail view to enter Split view."},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Tab", Desc: "Switch focus between panes"},
 					{Key: "j / k", Desc: "Navigate in focused pane"},
 					{Key: "Esc", Desc: "Return to full list"},
@@ -428,7 +428,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Press b to switch to the board view."},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "h / l", Desc: "Move between columns"},
 					{Key: "j / k", Desc: "Move within column"},
 					{Key: "Tab", Desc: "Toggle detail panel"},
@@ -436,14 +436,14 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Grouping Modes"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "s", Desc: "Cycle: Status -> Priority -> Type"},
 					{Key: "e", Desc: "Toggle empty columns"},
 					{Key: "d", Desc: "Inline card expansion"},
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Card Border Colors"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Red", Desc: "Has blockers"},
 					{Key: "Yellow", Desc: "High-impact (blocks others)"},
 					{Key: "Green", Desc: "Ready to work"},
@@ -468,7 +468,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "j / k", Desc: "Navigate between nodes"},
 					{Key: "h / l", Desc: "Navigate siblings"},
 					{Key: "f", Desc: "Focus on subgraph"},
@@ -522,7 +522,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Press h to see commits correlated with bead changes."},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "j / k", Desc: "Navigate timeline"},
 					{Key: "v", Desc: "Toggle Bead/Git mode"},
 					{Key: "f", Desc: "Toggle file tree panel"},
@@ -530,7 +530,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Causality Markers"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Direct", Desc: "Commit mentions bead ID"},
 					{Key: "Temporal", Desc: "Within time window"},
 					{Key: "File", Desc: "Touches associated files"},
@@ -556,7 +556,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Hybrid mode re-ranks those semantic matches using graph signals (impact, status, priority, recency), so results stay relevant while surfacing what matters most."},
 				Spacer{Lines: 1},
 				Section{Title: "Search Modes"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "/", Desc: "Fuzzy search (literal text)"},
 					{Key: "Ctrl+S", Desc: "Semantic search (meaning)"},
 					{Key: "H", Desc: "Hybrid ranking (meaning + graph)"},
@@ -588,14 +588,14 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "See how your project looked at any point"},
 				Spacer{Lines: 1},
 				Section{Title: "Accessing Time Travel"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "t", Desc: "Full time travel with git ref input"},
 					{Key: "T", Desc: "Quick travel to HEAD~5"},
 					{Key: "h", Desc: "History view (visual timeline)"},
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Git Reference Syntax"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "HEAD~5", Desc: "5 commits ago"},
 					{Key: "main", Desc: "Tip of main branch"},
 					{Key: "v1.2.0", Desc: "Tagged release"},
@@ -619,7 +619,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Press [ to open the Labels dashboard."},
 				Spacer{Lines: 1},
 				Section{Title: "Health Indicators"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "OK", Desc: "Healthy - good progress, few blockers"},
 					{Key: "WARN", Desc: "Warning - stale or slow velocity"},
 					{Key: "CRIT", Desc: "Critical - high blocked ratio"},
@@ -679,7 +679,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Create .beads/workspace.json with repo paths and prefixes."},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "w", Desc: "Toggle workspace picker"},
 					{Key: "W", Desc: "Workspace-wide search"},
 				}},
@@ -697,7 +697,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "Press ' (single quote) to open the recipe picker."},
 				Spacer{Lines: 1},
 				Section{Title: "Built-in Recipes"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "Sprint Ready", Desc: "Actionable work for this sprint"},
 					{Key: "Quick Wins", Desc: "Low-effort items"},
 					{Key: "Blocked Review", Desc: "Stuck items needing attention"},
@@ -720,7 +720,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "Designed for AI coding agents"},
 				Spacer{Lines: 1},
 				Section{Title: "Human vs Agent"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "bv", Desc: "Interactive TUI for humans"},
 					{Key: "--robot-*", Desc: "JSON output for agents"},
 				}},
@@ -782,7 +782,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Code{Text: "br create --title=\"Login fails with special chars\" \\\n  --type=bug --priority=2"},
 				Spacer{Lines: 1},
 				Section{Title: "Step 2: Assess Severity"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "P0", Desc: "System down, data loss"},
 					{Key: "P1", Desc: "Major feature broken"},
 					{Key: "P2", Desc: "Feature degraded"},
@@ -844,7 +844,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Paragraph{Text: "No separate tool installation. No access requests."},
 				Spacer{Lines: 1},
 				Section{Title: "Step 2: Point to Help"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "?", Desc: "Quick reference overlay"},
 					{Key: "`", Desc: "Full interactive tutorial"},
 					{Key: ";", Desc: "Shortcuts sidebar"},
@@ -881,7 +881,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Sharing Options"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "GitHub Pages", Desc: "Use wizard for auto-deploy"},
 					{Key: "Cloudflare", Desc: "Upload ./dashboard"},
 					{Key: "Email", Desc: "Zip and send"},
@@ -900,7 +900,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 			Section: "Reference",
 			Elements: []TutorialElement{
 				Section{Title: "Global"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "?", Desc: "Help overlay"},
 					{Key: "q", Desc: "Quit"},
 					{Key: "Esc", Desc: "Close/back"},
@@ -908,7 +908,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Navigation"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "j / k", Desc: "Move down/up"},
 					{Key: "h / l", Desc: "Move left/right"},
 					{Key: "g / G", Desc: "Top/bottom"},
@@ -916,7 +916,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				}},
 				Spacer{Lines: 1},
 				Section{Title: "Filtering"},
-				KeyTable{Bindings: []KeyBinding{
+				KeyTable{Bindings: []KeyHint{
 					{Key: "/", Desc: "Fuzzy search"},
 					{Key: "Ctrl+S", Desc: "Semantic search"},
 					{Key: "H", Desc: "Hybrid ranking"},

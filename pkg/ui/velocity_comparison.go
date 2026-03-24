@@ -256,11 +256,8 @@ func (m *VelocityComparisonModel) View() string {
 					Background(ThemeBg("#333"))
 			}
 
-			// Truncate label if needed
-			displayLabel := row.Label
-			if len(displayLabel) > labelWidth {
-				displayLabel = displayLabel[:labelWidth-1] + "…"
-			}
+			// Truncate label if needed (UTF-8 safe)
+			displayLabel := truncateRunesHelper(row.Label, labelWidth, "…")
 
 			// Format trend with color
 			trendStyle := t.Renderer.NewStyle()
