@@ -2965,6 +2965,7 @@
            x-transition:leave="transition ease-in duration-200"
            x-transition:leave-start="md:translate-x-0 translate-y-0"
            x-transition:leave-end="md:translate-x-full translate-y-full"
+           @keydown.escape.window="if (graphDetailNode && !selectedIssue) { graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250); }"
            @touchstart.passive="touchStartY = $event.touches[0].clientY; touchStartX = $event.touches[0].clientX; touchCurrentY = touchStartY; touchCurrentX = touchStartX; swiping = true"
            @touchmove.passive="if(swiping) { touchCurrentY = $event.touches[0].clientY; touchCurrentX = $event.touches[0].clientX; if(isMobile && touchCurrentY > touchStartY) { $el.style.transform = 'translateY(' + Math.max(0, touchCurrentY - touchStartY) + 'px)'; } else if(!isMobile && touchCurrentX > touchStartX) { $el.style.transform = 'translateX(' + Math.max(0, touchCurrentX - touchStartX) + 'px)'; } }"
            @touchend="if(swiping) { const swipeY = touchCurrentY - touchStartY; const swipeX = touchCurrentX - touchStartX; if((isMobile && swipeY > 100) || (!isMobile && swipeX > 100)) { graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250); } $el.style.transform = ''; swiping = false; }"
@@ -2997,12 +2998,23 @@
                     x-text="'P' + (graphDetailNode?.priority ?? 2)"></span>
               <code class="text-xs font-medium text-beads-600 dark:text-beads-400 bg-beads-50 dark:bg-beads-900/20 px-2 py-0.5 rounded truncate" x-text="graphDetailNode?.id"></code>
             </div>
-            <button @click="graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250)"
-                    class="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
-              <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-              </svg>
-            </button>
+            <div class="flex items-center gap-1 shrink-0">
+              <button @click="if (graphDetailNode?.id) selectIssue(graphDetailNode.id)"
+                      title="Open full issue details (or double-click the node)"
+                      class="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-beads-700 dark:text-beads-300 bg-beads-50 dark:bg-beads-900/30 hover:bg-beads-100 dark:hover:bg-beads-900/50 border border-beads-200 dark:border-beads-700/50 rounded-md transition-colors">
+                <span>Open</span>
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                </svg>
+              </button>
+              <button @click="graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250)"
+                      title="Close detail pane (Esc)"
+                      class="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
+                <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
           </div>
           <h2 class="text-base font-semibold text-gray-900 dark:text-white leading-snug line-clamp-2" x-text="graphDetailNode?.title" :title="graphDetailNode?.title"></h2>
         </div>
@@ -3188,12 +3200,21 @@
       <div class="absolute bottom-4 left-4 pointer-events-auto transition-opacity duration-200"
            :class="graphDetailNode ? 'hidden md:block' : ''">
         <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
-          <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2">Legend</div>
-          <div class="flex flex-wrap gap-x-3 md:gap-x-4 gap-y-1 text-[10px] md:text-xs">
+          <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2" x-text="graphHeatmapActive ? 'Heatmap: ' + {pagerank:'PageRank',betweenness:'Betweenness',critical:'Critical Path',indegree:'In-Degree'}[graphSizeMetric] : 'Legend'"></div>
+          <!-- Status color legend (default) -->
+          <div x-show="!graphHeatmapActive" class="flex flex-wrap gap-x-3 md:gap-x-4 gap-y-1 text-[10px] md:text-xs">
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-green-500"></div> Open</div>
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-yellow-500"></div> In Progress</div>
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-gray-400"></div> Closed</div>
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-red-500"></div> Blocked</div>
+          </div>
+          <!-- Heatmap color scale (when heatmap is active) -->
+          <div x-show="graphHeatmapActive" class="text-[10px] md:text-xs">
+            <div class="flex items-center gap-2">
+              <span class="text-gray-500 dark:text-gray-400">Low</span>
+              <div class="flex-1 h-2.5 md:h-3 rounded-full" style="background: linear-gradient(to right, hsl(120,80%,50%), hsl(90,80%,50%), hsl(60,80%,50%), hsl(30,80%,50%), hsl(0,80%,50%));"></div>
+              <span class="text-gray-500 dark:text-gray-400">High</span>
+            </div>
           </div>
           <!-- Keyboard hints only on desktop -->
           <div class="hidden md:block mt-2 pt-2 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400 space-y-1">

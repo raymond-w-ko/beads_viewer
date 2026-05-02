@@ -291,8 +291,10 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 				continue
 			}
 			// Use composite ID (issue_id:comment_id) to avoid UNIQUE constraint
-			// violations when exporting workspaces with multiple repos (bv-76)
-			compositeID := fmt.Sprintf("%s:%d", issue.ID, comment.ID)
+			// violations when exporting workspaces with multiple repos (bv-76).
+			// Comment.ID is a string (UUIDv7 in beads v1.0+, integer-as-string
+			// in legacy data), so format with %s.
+			compositeID := fmt.Sprintf("%s:%s", issue.ID, comment.ID)
 			_, err := stmt.Exec(
 				compositeID,
 				issue.ID,
@@ -301,7 +303,7 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 				comment.CreatedAt.Format(time.RFC3339),
 			)
 			if err != nil {
-				return fmt.Errorf("insert comment %d for issue %s: %w", comment.ID, issue.ID, err)
+				return fmt.Errorf("insert comment %s for issue %s: %w", comment.ID, issue.ID, err)
 			}
 		}
 	}
@@ -330,17 +332,50 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	}
 	defer stmt.Close()
 
-	// Build dependency lookup maps
+	// Build status lookup so dep counts can ignore satisfied (closed/
+	// tombstoned) endpoints, and so dangling refs (an edge whose other
+	// end isn't in this export's issue universe) are excluded — keeping
+	// these counts consistent with the materialized view, which uses
+	// `JOIN issues i2 ON ...` for the same lists and therefore drops
+	// any edge whose endpoint isn't a known issue (bv-issue#143/#144).
+	statusByID := make(map[string]model.Status, len(e.Issues))
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
+		statusByID[issue.ID] = issue.Status
+	}
+	// isActiveCounterpart returns true when `id` is a known issue that
+	// is neither closed nor tombstoned. Unknown ids return false so a
+	// dangling dep edge doesn't get counted on either side.
+	isActiveCounterpart := func(id string) bool {
+		s, ok := statusByID[id]
+		if !ok {
+			return false
+		}
+		return !s.IsClosed() && !s.IsTombstone()
+	}
+
+	// Build dependency lookup maps. Count an edge only when *both*
+	// endpoints are active issues — closing a blocker drops its
+	// dependents' blocked_by_count to zero (the user-visible bug),
+	// and a dep whose other end fell out of the export at all
+	// shouldn't pad the counts above what the materialized view
+	// surfaces.
 	blocksCount := make(map[string]int)
 	blockedByCount := make(map[string]int)
 	for _, dep := range e.Deps {
-		if dep != nil && dep.Type.IsBlocking() {
-			// dep.IssueID depends on dep.DependsOnID, so:
-			// - DependsOnID blocks IssueID
-			// - IssueID is blocked by DependsOnID
-			blocksCount[dep.DependsOnID]++
-			blockedByCount[dep.IssueID]++
+		if dep == nil || !dep.Type.IsBlocking() {
+			continue
 		}
+		// dep.IssueID depends on dep.DependsOnID, so:
+		// - DependsOnID blocks IssueID
+		// - IssueID is blocked by DependsOnID
+		if !isActiveCounterpart(dep.DependsOnID) || !isActiveCounterpart(dep.IssueID) {
+			continue
+		}
+		blocksCount[dep.DependsOnID]++
+		blockedByCount[dep.IssueID]++
 	}
 
 	// Get triage scores if available

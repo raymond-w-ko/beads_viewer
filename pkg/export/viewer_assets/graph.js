@@ -1028,9 +1028,17 @@ function prepareGraphData(layout = null) {
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
             inCycle: pre?.inCycle ?? false,
 
-            // Dependency counts (prefer pre-computed)
-            blockerCount: pre?.inDegree ?? dependencies.filter(d => d.issue_id === issue.id).length,
-            dependentCount: pre?.outDegree ?? dependencies.filter(d => d.depends_on_id === issue.id).length,
+            // Dependency counts. Prefer the active-blocker count from the
+            // materialized view (issue.blocker_count / dependent_count) so
+            // closed blockers don't keep their dependents looking blocked
+            // (bv-issue#143/#144). Fall back to pre-computed graph degrees,
+            // then to a raw dependency-row count.
+            blockerCount: issue.blocker_count
+                ?? pre?.inDegree
+                ?? dependencies.filter(d => d.issue_id === issue.id).length,
+            dependentCount: issue.dependent_count
+                ?? pre?.outDegree
+                ?? dependencies.filter(d => d.depends_on_id === issue.id).length,
 
             // Position: pre-computed uses fx/fy to skip simulation
             x: pos ? pos[0] : undefined,
@@ -1100,7 +1108,18 @@ function getNodeColor(node) {
         return getLabelColor(node);
     }
 
-    // Status-based color
+    // Status-based color, with derived "blocked" semantics so the graph
+    // matches the issues view: an open / in-progress node with at least one
+    // active (non-closed, non-tombstoned) blocker is treated as blocked.
+    // The materialized view already excludes resolved blockers from
+    // blockerCount, so this branch only fires when there really is an
+    // open dependency upstream (bv-issue#143/#144).
+    if (
+        node.blockerCount > 0
+        && (node.status === 'open' || node.status === 'in_progress')
+    ) {
+        return THEME.status.blocked;
+    }
     return THEME.status[node.status] || THEME.status.open;
 }
 

@@ -301,6 +301,9 @@ type TriageOptions struct {
 	GroupByTrack bool // Group recommendations by execution track (connected component)
 	GroupByLabel bool // Group recommendations by primary label
 
+	// bv-140: Scope triage to subgraph rooted at a specific epic/issue
+	RootIssueID string // If set, filter issues to the subgraph rooted at this ID
+
 	// History report for staleness analysis
 	History *correlation.HistoryReport
 }
@@ -331,6 +334,13 @@ func ComputeTriageWithOptions(issues []model.Issue, opts TriageOptions) TriageRe
 
 // ComputeTriageWithOptionsAndTime generates triage with a deterministic clock (testing).
 func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, now time.Time) TriageResult {
+	// bv-140: If a root issue is specified, filter to the subgraph rooted at that issue.
+	// "Rooted at" means the root itself plus all issues that transitively depend on it
+	// (descendants in the dependency DAG). This scopes triage to a specific epic.
+	if opts.RootIssueID != "" {
+		issues = extractDescendantSubgraph(issues, opts.RootIssueID)
+	}
+
 	// Build analyzer and stats
 	analyzer := NewAnalyzer(issues)
 
@@ -364,6 +374,56 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 	}
 
 	return ComputeTriageFromAnalyzer(analyzer, stats, issues, opts, now)
+}
+
+// extractDescendantSubgraph returns the subgraph rooted at rootID: the root
+// itself plus all issues that transitively depend on it (its descendants).
+// This is the reverse of following DependsOnID — we build an adjacency from
+// blocker -> dependents and BFS downward.
+func extractDescendantSubgraph(issues []model.Issue, rootID string) []model.Issue {
+	// Build reverse adjacency: parentID -> []childIDs
+	// An issue with DependsOnID=X means X is the parent/blocker, so X -> issue.ID
+	children := make(map[string][]string, len(issues))
+	issueMap := make(map[string]struct{}, len(issues))
+	for _, iss := range issues {
+		issueMap[iss.ID] = struct{}{}
+		for _, dep := range iss.Dependencies {
+			if dep != nil {
+				children[dep.DependsOnID] = append(children[dep.DependsOnID], iss.ID)
+			}
+		}
+	}
+
+	// Verify root exists
+	if _, ok := issueMap[rootID]; !ok {
+		return nil
+	}
+
+	// BFS from root through reverse edges (parent -> children)
+	visited := make(map[string]bool, len(issues))
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		if visited[curr] {
+			continue
+		}
+		visited[curr] = true
+		for _, childID := range children[curr] {
+			if !visited[childID] {
+				queue = append(queue, childID)
+			}
+		}
+	}
+
+	// Collect visited issues preserving original order
+	result := make([]model.Issue, 0, len(visited))
+	for _, iss := range issues {
+		if visited[iss.ID] {
+			result = append(result, iss)
+		}
+	}
+	return result
 }
 
 // ComputeTriageFromAnalyzer generates triage reusing an existing analyzer and stats.
@@ -411,9 +471,22 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// Compute enhanced triage scores (bv-147)
 	triageScores := computeTriageScoresFromImpact(impactScores, unblocksMap, analyzer, DefaultTriageScoringOptions())
 
-	// Build recommendations using enhanced scores (bv-148)
-	// Pass triageCtx instead of analyzer for cached blocker lookups (bv-k4az)
-	recommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, opts.TopN)
+	// Build recommendations using enhanced scores (bv-148).
+	// Top picks need to search the *full* scored set, not the
+	// length-capped recommendations slice — otherwise, when the top
+	// opts.TopN scored items happen to all be blocked, buildTopPicks
+	// filters them out and returns an empty list. `bv --robot-next`
+	// then reports "no actionable work" even though plenty exists
+	// further down the score list (issue #146 / PR #147).
+	//
+	// So: build the recommendations against the full triageScores set
+	// first, slice to opts.TopN for the user-visible recommendations
+	// list, and feed the *unsliced* set into buildTopPicks.
+	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores))
+	recommendations := allRecommendations
+	if len(recommendations) > opts.TopN {
+		recommendations = recommendations[:opts.TopN]
+	}
 
 	// Build quick wins
 	quickWins := buildQuickWins(impactScores, unblocksMap, opts.QuickWinN)
@@ -421,13 +494,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// Build blockers to clear (uses cached actionable issues)
 	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
 
-	// Build top picks for quick ref
-	topPicks := buildTopPicks(recommendations, 3)
+	// Build top picks for quick ref. Pass the full set so blocked
+	// high-priority items don't crowd genuine actionable work out of
+	// the picks (issue #146).
+	topPicks := buildTopPicks(allRecommendations, 3)
 
 	// Determine top issue for commands
 	topID := ""
-	if len(recommendations) > 0 {
-		topID = recommendations[0].ID
+	if len(topPicks) > 0 {
+		topID = topPicks[0].ID
 	}
 
 	elapsed := time.Since(start)

@@ -78,6 +78,22 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/insta
 
 ---
 
+## Generating the JSONL File (`br` and `bd`)
+
+`bv` reads from `.beads/beads.jsonl`. Both the Rust-based `br` and the original Go-based `bd` can generate this file.
+
+**Rust (`br`) users** — `br` writes `.beads/beads.jsonl` by default; no extra steps needed.
+
+**Go (`bd`) users** — run:
+
+```bash
+bd export --no-memories -o .beads/beads.jsonl
+```
+
+Once the file exists, `bv` works identically regardless of which tool produced it.
+
+---
+
 ## 🤖 Agent Quickstart (Robot Mode)
 
 ⚠️ **Never run bare `bv` in an agent context** — it launches the interactive TUI. Always use `--robot-*`.

@@ -165,6 +165,178 @@ func TestSQLiteExporter_InsertsMetricsAndTriageRecommendations(t *testing.T) {
 	}
 }
 
+// TestSQLiteExporter_ResolvedBlockerExcludedFromCounts is a regression test
+// for bv-issue#143/#144: closing a blocker must drop its dependents'
+// blocked_by_count to 0 so the materialized view stops surfacing them as
+// blocked, keeping the issues view, the graph view's effective coloring,
+// and the blocked_by_ids list aligned.
+func TestSQLiteExporter_ResolvedBlockerExcludedFromCounts(t *testing.T) {
+	now := time.Now().UTC()
+	issues := []*model.Issue{
+		// A is open and historically depends on B
+		{
+			ID: "A", Title: "A", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+		// B was the blocker, but is now closed — it should NOT count
+		// against A's blocked_by_count anymore.
+		{
+			ID: "B", Title: "B", Status: model.StatusClosed, Priority: 2,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+		// C still actively blocks A — should count.
+		{
+			ID: "C", Title: "C", Status: model.StatusOpen, Priority: 2,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	deps := []*model.Dependency{
+		{IssueID: "A", DependsOnID: "B", Type: model.DepBlocks, CreatedAt: now, CreatedBy: "test"},
+		{IssueID: "A", DependsOnID: "C", Type: model.DepBlocks, CreatedAt: now, CreatedBy: "test"},
+	}
+
+	stats := analysis.NewGraphStatsForTest(
+		map[string]float64{"A": 0.3, "B": 0.3, "C": 0.4},
+		map[string]float64{"A": 0, "B": 0, "C": 0},
+		nil, nil, nil,
+		map[string]float64{"A": 1, "B": 0, "C": 0},
+		map[string]int{"A": 2, "B": 0, "C": 0},
+		map[string]int{"A": 0, "B": 1, "C": 1},
+		nil, 0, []string{"B", "C", "A"},
+	)
+
+	exporter := NewSQLiteExporter(issues, deps, stats, nil)
+	exporter.Config.IncludeRobotOutputs = false
+
+	outDir := t.TempDir()
+	if err := exporter.Export(outDir); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	dbPath := filepath.Join(outDir, "beads.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("Open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// In issue_metrics: A is blocked by 1 active blocker (C only — B is closed)
+	var blockedByA, blocksA int
+	if err := db.QueryRow(
+		`SELECT blocks_count, blocked_by_count FROM issue_metrics WHERE issue_id = ?`, "A",
+	).Scan(&blocksA, &blockedByA); err != nil {
+		t.Fatalf("Scan A: %v", err)
+	}
+	if blockedByA != 1 {
+		t.Fatalf("A.blocked_by_count: closed B should be excluded, expected 1 (C only), got %d", blockedByA)
+	}
+
+	// B is closed: it no longer blocks A.
+	var blocksB int
+	if err := db.QueryRow(
+		`SELECT blocks_count FROM issue_metrics WHERE issue_id = ?`, "B",
+	).Scan(&blocksB); err != nil {
+		t.Fatalf("Scan B: %v", err)
+	}
+	if blocksB != 0 {
+		t.Fatalf("B.blocks_count: closed B should not block anything, expected 0, got %d", blocksB)
+	}
+
+	// C still blocks A.
+	var blocksC int
+	if err := db.QueryRow(
+		`SELECT blocks_count FROM issue_metrics WHERE issue_id = ?`, "C",
+	).Scan(&blocksC); err != nil {
+		t.Fatalf("Scan C: %v", err)
+	}
+	if blocksC != 1 {
+		t.Fatalf("C.blocks_count: should still block A, expected 1, got %d", blocksC)
+	}
+
+	// Materialized view: A's blocked_by_ids list excludes B, includes C.
+	var blockedByIDs sql.NullString
+	if err := db.QueryRow(
+		`SELECT blocked_by_ids FROM issue_overview_mv WHERE id = ?`, "A",
+	).Scan(&blockedByIDs); err != nil {
+		t.Fatalf("Scan mv A: %v", err)
+	}
+	if !blockedByIDs.Valid || blockedByIDs.String != "C" {
+		t.Fatalf("A.blocked_by_ids in mv: expected only \"C\" (closed B excluded), got valid=%v value=%q",
+			blockedByIDs.Valid, blockedByIDs.String)
+	}
+}
+
+// TestSQLiteExporter_DanglingDepIgnored locks the consistency contract
+// between the Go-side issue_metrics counts and the SQL-side
+// issue_overview_mv id lists: a dependency edge whose other endpoint
+// isn't in the export's issue universe must be excluded from both
+// surfaces. Pre-fix, the materialized view's `JOIN issues` dropped
+// dangling refs but the Go counter happily counted them, so an issue
+// could end up with `blocked_by_count = 2` while
+// `blocked_by_ids = "C"` (length 1) for the same row.
+func TestSQLiteExporter_DanglingDepIgnored(t *testing.T) {
+	now := time.Now().UTC()
+	issues := []*model.Issue{
+		{
+			ID: "A", Title: "A", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "C", Title: "C", Status: model.StatusOpen, Priority: 2,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	deps := []*model.Dependency{
+		// dangling: GHOST is referenced but not present in `issues`.
+		{IssueID: "A", DependsOnID: "GHOST", Type: model.DepBlocks, CreatedAt: now, CreatedBy: "test"},
+		// real edge: should still count.
+		{IssueID: "A", DependsOnID: "C", Type: model.DepBlocks, CreatedAt: now, CreatedBy: "test"},
+	}
+
+	stats := analysis.NewGraphStatsForTest(
+		map[string]float64{"A": 0.5, "C": 0.5},
+		map[string]float64{"A": 0, "C": 0},
+		nil, nil, nil,
+		map[string]float64{"A": 1, "C": 0},
+		map[string]int{"A": 2, "C": 0},
+		map[string]int{"A": 0, "C": 1},
+		nil, 0, []string{"C", "A"},
+	)
+
+	exporter := NewSQLiteExporter(issues, deps, stats, nil)
+	exporter.Config.IncludeRobotOutputs = false
+	outDir := t.TempDir()
+	if err := exporter.Export(outDir); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	dbPath := filepath.Join(outDir, "beads.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("Open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var blockedByA int
+	if err := db.QueryRow(
+		`SELECT blocked_by_count FROM issue_metrics WHERE issue_id = ?`, "A",
+	).Scan(&blockedByA); err != nil {
+		t.Fatalf("Scan A metrics: %v", err)
+	}
+	if blockedByA != 1 {
+		t.Fatalf("A.blocked_by_count: dangling GHOST must be excluded, expected 1 (C only), got %d", blockedByA)
+	}
+
+	var ids sql.NullString
+	if err := db.QueryRow(
+		`SELECT blocked_by_ids FROM issue_overview_mv WHERE id = ?`, "A",
+	).Scan(&ids); err != nil {
+		t.Fatalf("Scan mv: %v", err)
+	}
+	if !ids.Valid || ids.String != "C" {
+		t.Fatalf("blocked_by_ids in mv: expected \"C\", got valid=%v value=%q", ids.Valid, ids.String)
+	}
+}
+
 func TestSQLiteExporter_writeRobotOutputs_WritesExpectedFiles(t *testing.T) {
 	now := time.Now().UTC()
 	issues := []*model.Issue{{

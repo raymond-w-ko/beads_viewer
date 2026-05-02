@@ -654,6 +654,7 @@ func main() {
 		RobotTriageByLabelFlag:  robotTriageByLabel,
 		RobotNextFlag:           robotNext,
 		RobotHistoryFlag:        robotHistory,
+		GraphRoot:               graphRoot,
 		BeadHistoryFlag:         beadHistory,
 		RobotExplainCorrFlag:    robotExplainCorrelation,
 		RobotConfirmCorrFlag:    robotConfirmCorrelation,
@@ -704,7 +705,7 @@ func main() {
 			{modifier: "suggest-confidence", requires: []string{"robot-suggest"}},
 			{modifier: "suggest-bead", requires: []string{"robot-suggest"}},
 			{modifier: "graph-format", requires: []string{"robot-graph"}},
-			{modifier: "graph-root", requires: []string{"robot-graph"}},
+			{modifier: "graph-root", requires: []string{"robot-graph", "robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "graph-depth", requires: []string{"robot-graph"}},
 			{modifier: "graph-preset", requires: []string{"export-graph"}},
 			{modifier: "graph-title", requires: []string{"export-graph"}},
@@ -7140,11 +7141,13 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		"robot-triage": {
 			Flag: "--robot-triage", Description: "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
 			KeyFields:   []string{"triage.quick_ref.top_picks", "triage.recommendations", "triage.quick_wins", "triage.blockers_to_clear", "triage.project_health"},
+			Params:      []string{"--graph-root <id>"},
 			NeedsIssues: true,
 		},
 		"robot-next": {
 			Flag: "--robot-next", Description: "Single top recommendation with claim/show commands.",
 			KeyFields:   []string{"id", "title", "score", "reasons", "unblocks", "claim_command", "show_command"},
+			Params:      []string{"--graph-root <id>"},
 			NeedsIssues: true,
 		},
 		"robot-plan": {
@@ -7165,11 +7168,13 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		"robot-triage-by-track": {
 			Flag: "--robot-triage-by-track", Description: "Triage grouped by independent parallel execution tracks.",
 			KeyFields:   []string{"tracks[].track_id", "tracks[].top_pick", "tracks[].items"},
+			Params:      []string{"--graph-root <id>"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-label": {
 			Flag: "--robot-triage-by-label", Description: "Triage grouped by label for area-focused agents.",
 			KeyFields:   []string{"labels[].label", "labels[].top_pick", "labels[].items"},
+			Params:      []string{"--graph-root <id>"},
 			NeedsIssues: true,
 		},
 		"robot-alerts": {

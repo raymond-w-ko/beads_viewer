@@ -143,6 +143,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotLabelHealthFlag    *bool
 	RobotLabelFlowFlag      *bool
 	RobotLabelAttentionFlag *bool
+	GraphRoot               *string // bv-140: scope triage to subgraph rooted at this issue
 	BeadHistoryFlag         *string
 	RobotExplainCorrFlag    *string
 	RobotConfirmCorrFlag    *string
@@ -328,7 +329,13 @@ func dispatchRobotFlagOrExit(registry *RobotRegistry, flagName string, ctx Robot
 		return
 	}
 
-	if !result.AlreadyReported {
+	// Only emit an "Error handling …" line when the handler actually failed
+	// (non-zero exit or a returned err) AND that failure has not already been
+	// reported by the handler itself. Previously we printed the error banner
+	// on every success path too; callers that use cmd.CombinedOutput (like
+	// TestCLIFlagCompatibility) saw it merged into stdout and treated the
+	// output as invalid JSON.
+	if !result.AlreadyReported && (result.Err != nil || result.ExitCode != 0) {
 		if result.Err != nil {
 			fmt.Fprintf(ctx.StderrOrDefault(), "Error handling %s: %v\n", formatRobotFlag(flagName), result.Err)
 		} else {
@@ -1678,12 +1685,19 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		}
 	}
 
+	// bv-140: scope triage to a subgraph if --graph-root is specified
+	var rootIssueID string
+	if cfg.GraphRoot != nil && *cfg.GraphRoot != "" {
+		rootIssueID = *cfg.GraphRoot
+	}
+
 	triage := analysis.ComputeTriageWithOptions(ctx.Issues, analysis.TriageOptions{
 		GroupByTrack:  cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
 		GroupByLabel:  cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
 		WaitForPhase2: true,
 		UseFastConfig: true,
 		History:       historyReport,
+		RootIssueID:   rootIssueID,
 	})
 
 	var feedbackInfo *analysis.FeedbackJSON
@@ -1772,6 +1786,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 			"jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",
 			"jq '.triage.recommendations_by_label[].claim_command' - Claim commands per label",
 			"jq '.feedback.weight_adjustments' - View feedback-adjusted weights (bv-90)",
+			"--graph-root <id> - Scope triage to subgraph rooted at a specific epic (bv-140)",
 		},
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {

@@ -373,6 +373,143 @@ func TestTriageNoRecommendationsCommands(t *testing.T) {
 	}
 }
 
+func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
+	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "blocker",
+			Title:     "Root blocker",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "parent",
+			Title:     "Blocked parent",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "blocker", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "child",
+			Title:     "High-priority child",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "parent", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+
+	if triage.QuickRef.ActionableCount != 1 {
+		t.Fatalf("expected only the root blocker to be actionable, got %d", triage.QuickRef.ActionableCount)
+	}
+	if triage.QuickRef.BlockedCount != 2 {
+		t.Fatalf("expected parent and child blocked, got %d", triage.QuickRef.BlockedCount)
+	}
+
+	for _, pick := range triage.QuickRef.TopPicks {
+		if pick.ID == "parent" || pick.ID == "child" {
+			t.Fatalf("blocked issue %q must not appear in top picks", pick.ID)
+		}
+	}
+	if len(triage.QuickRef.TopPicks) == 0 || triage.QuickRef.TopPicks[0].ID != "blocker" {
+		t.Fatalf("expected blocker to be the top actionable pick, got %+v", triage.QuickRef.TopPicks)
+	}
+
+	expectedClaim := "CI=1 br update blocker --status in_progress --json"
+	if triage.Commands.ClaimTop != expectedClaim {
+		t.Fatalf("expected claim_top %q, got %q", expectedClaim, triage.Commands.ClaimTop)
+	}
+
+	var childRec *Recommendation
+	var parentRec *Recommendation
+	for i := range triage.Recommendations {
+		switch triage.Recommendations[i].ID {
+		case "child":
+			childRec = &triage.Recommendations[i]
+		case "parent":
+			parentRec = &triage.Recommendations[i]
+		}
+	}
+	if childRec == nil {
+		t.Fatal("expected child recommendation to remain visible with blocked_by context")
+	}
+	if len(childRec.BlockedBy) != 1 || childRec.BlockedBy[0] != "parent" {
+		t.Fatalf("expected child blocked_by parent, got %v", childRec.BlockedBy)
+	}
+	if parentRec == nil {
+		t.Fatal("expected parent recommendation to remain visible with blocked_by context")
+	}
+	if len(parentRec.BlockedBy) != 1 || parentRec.BlockedBy[0] != "blocker" {
+		t.Fatalf("expected parent blocked_by blocker, got %v", parentRec.BlockedBy)
+	}
+}
+
+func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
+	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "parent",
+			Title:     "Parent issue",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "child",
+			Title:     "Higher-priority child",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "parent", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+
+	for _, pick := range triage.QuickRef.TopPicks {
+		if pick.ID == "child" {
+			t.Fatalf("parent-child child must not appear in top picks while parent is open")
+		}
+	}
+	if len(triage.QuickRef.TopPicks) == 0 || triage.QuickRef.TopPicks[0].ID != "parent" {
+		t.Fatalf("expected parent to be the claimable top pick, got %+v", triage.QuickRef.TopPicks)
+	}
+
+	expectedClaim := "CI=1 br update parent --status in_progress --json"
+	if triage.Commands.ClaimTop != expectedClaim {
+		t.Fatalf("expected claim_top %q, got %q", expectedClaim, triage.Commands.ClaimTop)
+	}
+
+	var childRec *Recommendation
+	for i := range triage.Recommendations {
+		if triage.Recommendations[i].ID == "child" {
+			childRec = &triage.Recommendations[i]
+			break
+		}
+	}
+	if childRec == nil {
+		t.Fatal("expected child recommendation to remain visible with blocked_by context")
+	}
+	if len(childRec.BlockedBy) != 1 || childRec.BlockedBy[0] != "parent" {
+		t.Fatalf("expected child blocked_by parent, got %v", childRec.BlockedBy)
+	}
+}
+
 func TestTriageInProgressAction(t *testing.T) {
 	// Test the different staleness thresholds for in_progress items
 	tests := []struct {
@@ -1418,6 +1555,75 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 }
 
+// TestComputeTriage_TopPicksReachActionableBeyondTopN is a regression
+// test for issue #146 / PR #147: when the top opts.TopN scored
+// recommendations are all blocked, top_picks must still surface
+// actionable work from further down the scored set, not return empty.
+// Pre-fix the buildRecommendations call truncated to opts.TopN before
+// buildTopPicks ran its blocked-filter, so a workload of "8 blocked
+// urgent bugs + 1 ready low-priority task" caused `bv --robot-next`
+// to report no work.
+func TestComputeTriage_TopPicksReachActionableBeyondTopN(t *testing.T) {
+	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "ready-low-impact",
+			Title:     "Ready low impact",
+			Status:    model.StatusOpen,
+			Priority:  4,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+	}
+	for i := 0; i < 8; i++ {
+		blockedID := "blocked-urgent-" + string(rune('a'+i))
+		gateID := "zz-gate-" + string(rune('a'+i))
+		issues = append(issues,
+			model.Issue{
+				ID:        blockedID,
+				Title:     "Blocked urgent bug",
+				Status:    model.StatusOpen,
+				Priority:  0,
+				IssueType: model.TypeBug,
+				Labels:    []string{"urgent"},
+				UpdatedAt: now.Add(-30 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{
+					{IssueID: blockedID, DependsOnID: gateID, Type: model.DepBlocks},
+				},
+			},
+			model.Issue{
+				ID:        gateID,
+				Title:     "Gate",
+				Status:    model.StatusOpen,
+				Priority:  4,
+				IssueType: model.TypeTask,
+				UpdatedAt: now,
+			},
+		)
+	}
+
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+
+	// TopN=3 — the top 3 scored items are all the blocked-urgent
+	// bugs. Pre-fix, top_picks would be empty because buildTopPicks
+	// filtered them out and never saw the actionable item further
+	// down the list.
+	triage := ComputeTriageFromAnalyzer(analyzer, stats, issues, TriageOptions{TopN: 3}, now)
+	if len(triage.Recommendations) != 3 {
+		t.Fatalf("recommendations should still be capped at TopN=3, got %d", len(triage.Recommendations))
+	}
+	if len(triage.QuickRef.TopPicks) == 0 {
+		t.Fatal("top picks must surface actionable work that lies past the capped recommendations slice")
+	}
+	for _, pick := range triage.QuickRef.TopPicks {
+		if blockers := analyzer.GetOpenBlockers(pick.ID); len(blockers) > 0 {
+			t.Fatalf("top pick %q is blocked by %v — buildTopPicks must filter blockers", pick.ID, blockers)
+		}
+	}
+}
+
 // TestBuildTopPicks_LimitRespected verifies the limit is respected when filtering.
 func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	recommendations := []Recommendation{
@@ -1450,5 +1656,80 @@ func TestBuildTopPicks_AllBlocked(t *testing.T) {
 	picks := buildTopPicks(recommendations, 10)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
+	}
+}
+
+// bv-140: Tests for extractDescendantSubgraph and RootIssueID triage scoping
+
+func TestExtractDescendantSubgraph_Basic(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "epic-1", Title: "Epic", Status: model.StatusOpen},
+		{ID: "task-a", Title: "Task A", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "task-a", DependsOnID: "epic-1", Type: model.DepBlocks}}},
+		{ID: "task-b", Title: "Task B", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "task-b", DependsOnID: "task-a", Type: model.DepBlocks}}},
+		{ID: "unrelated", Title: "Unrelated", Status: model.StatusOpen},
+	}
+
+	result := extractDescendantSubgraph(issues, "epic-1")
+	if len(result) != 3 {
+		t.Fatalf("expected 3 issues (epic-1 + task-a + task-b), got %d", len(result))
+	}
+
+	ids := make(map[string]bool)
+	for _, iss := range result {
+		ids[iss.ID] = true
+	}
+	for _, expected := range []string{"epic-1", "task-a", "task-b"} {
+		if !ids[expected] {
+			t.Errorf("expected %s in subgraph, not found", expected)
+		}
+	}
+	if ids["unrelated"] {
+		t.Errorf("unrelated issue should not be in subgraph")
+	}
+}
+
+func TestExtractDescendantSubgraph_RootOnly(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "solo", Title: "Solo Issue", Status: model.StatusOpen},
+		{ID: "other", Title: "Other Issue", Status: model.StatusOpen},
+	}
+	result := extractDescendantSubgraph(issues, "solo")
+	if len(result) != 1 || result[0].ID != "solo" {
+		t.Errorf("expected only the root issue, got %d issues", len(result))
+	}
+}
+
+func TestExtractDescendantSubgraph_NonexistentRoot(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "a", Title: "A", Status: model.StatusOpen},
+	}
+	result := extractDescendantSubgraph(issues, "nonexistent")
+	if result != nil {
+		t.Errorf("expected nil for nonexistent root, got %d issues", len(result))
+	}
+}
+
+func TestComputeTriageWithOptions_RootIssueID(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "epic-1", Title: "Epic", Status: model.StatusOpen},
+		{ID: "task-a", Title: "Task A", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "task-a", DependsOnID: "epic-1", Type: model.DepBlocks}}},
+		{ID: "task-b", Title: "Task B", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "task-b", DependsOnID: "task-a", Type: model.DepBlocks}}},
+		{ID: "unrelated", Title: "Unrelated", Status: model.StatusOpen},
+	}
+
+	// Without scoping: all 4 issues counted
+	fullTriage := ComputeTriageWithOptions(issues, TriageOptions{})
+	if fullTriage.ProjectHealth.Counts.Total != 4 {
+		t.Errorf("expected 4 total issues without scoping, got %d", fullTriage.ProjectHealth.Counts.Total)
+	}
+
+	// With scoping to epic-1: only 3 issues (epic-1 + task-a + task-b)
+	scopedTriage := ComputeTriageWithOptions(issues, TriageOptions{RootIssueID: "epic-1"})
+	if scopedTriage.ProjectHealth.Counts.Total != 3 {
+		t.Errorf("expected 3 total issues with RootIssueID=epic-1, got %d", scopedTriage.ProjectHealth.Counts.Total)
 	}
 }

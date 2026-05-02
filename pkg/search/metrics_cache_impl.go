@@ -269,9 +269,13 @@ func (c *metricsCache) ensureFresh() error {
 		return nil
 	}
 
-	// Use singleflight to prevent cache stampede: callers that observe the same
-	// source hash coalesce into a single refresh attempt for that snapshot.
-	_, err, _ = c.sf.Do(metricsCacheRefreshFlightKey+":"+hash, func() (interface{}, error) {
+	// Use singleflight to prevent cache stampede. Key is constant (not
+	// hash-suffixed) so concurrent refreshes coalesce even when callers
+	// observed different source hashes mid-drift — otherwise two workers that
+	// each compute a slightly different hash trigger two parallel Refresh()
+	// calls, defeating the stampede guard. After Refresh() runs once, every
+	// coalesced caller observes the latest snapshot in the cache.
+	_, err, _ = c.sf.Do(metricsCacheRefreshFlightKey, func() (interface{}, error) {
 		if c.isFreshForHash(hash) {
 			return nil, nil
 		}

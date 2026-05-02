@@ -10,5 +10,13 @@ func TestMain(m *testing.M) {
 	os.Setenv("BV_NO_BROWSER", "1")
 	os.Setenv("BV_TEST_MODE", "1")
 
+	// Cloudflare deploy tests rely on simulating an unauthenticated wrangler
+	// via stub binaries. Real CLOUDFLARE_API_TOKEN/ACCOUNT_ID values inherited
+	// from the developer's shell short-circuit CheckWranglerStatus to
+	// Authenticated=true and bypass the unauth path under test, so unset them
+	// before any test runs (bv-142 follow-up).
+	os.Unsetenv("CLOUDFLARE_API_TOKEN")
+	os.Unsetenv("CLOUDFLARE_ACCOUNT_ID")
+
 	os.Exit(m.Run())
 }

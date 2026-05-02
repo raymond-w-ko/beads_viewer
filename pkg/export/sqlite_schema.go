@@ -239,17 +239,26 @@ func CreateMaterializedViews(db *sql.DB) error {
 				-- dep.IssueID depends on dep.DependsOnID, so:
 				-- - blocks_ids are the issues that depend on i (downstream)
 				-- - blocked_by_ids are the issues i depends on (upstream)
+				-- Both lists are filtered to ACTIVE endpoints so closing a
+				-- blocker actually unblocks its dependents in this view
+				-- (bv-issue#143/#144).
 				(SELECT GROUP_CONCAT(issue_id) FROM (
-					SELECT issue_id
-					FROM dependencies
-					WHERE depends_on_id = i.id AND (type = 'blocks' OR type = '')
-					ORDER BY issue_id
+					SELECT d.issue_id AS issue_id
+					FROM dependencies d
+					JOIN issues i2 ON d.issue_id = i2.id
+					WHERE d.depends_on_id = i.id
+					  AND (d.type = 'blocks' OR d.type = '')
+					  AND i2.status NOT IN ('closed', 'tombstone')
+					ORDER BY d.issue_id
 				)) as blocks_ids,
 				(SELECT GROUP_CONCAT(depends_on_id) FROM (
-					SELECT depends_on_id
-					FROM dependencies
-					WHERE issue_id = i.id AND (type = 'blocks' OR type = '')
-					ORDER BY depends_on_id
+					SELECT d.depends_on_id AS depends_on_id
+					FROM dependencies d
+					JOIN issues i2 ON d.depends_on_id = i2.id
+					WHERE d.issue_id = i.id
+					  AND (d.type = 'blocks' OR d.type = '')
+					  AND i2.status NOT IN ('closed', 'tombstone')
+					ORDER BY d.depends_on_id
 				)) as blocked_by_ids
 			FROM issues i
 			LEFT JOIN issue_metrics m ON i.id = m.issue_id

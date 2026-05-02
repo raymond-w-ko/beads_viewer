@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -93,17 +94,7 @@ func (ctx *TriageContext) ActionableIssues() []model.Issue {
 	ctx.lock()
 	defer ctx.unlock()
 
-	if ctx.actionableComputed {
-		return ctx.actionable
-	}
-
-	// Compute actionable issues
-	ctx.actionable = ctx.analyzer.GetActionableIssues()
-	ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
-	for _, issue := range ctx.actionable {
-		ctx.actionableSet[issue.ID] = true
-	}
-	ctx.actionableComputed = true
+	ctx.ensureActionableInternal()
 	return ctx.actionable
 }
 
@@ -114,17 +105,23 @@ func (ctx *TriageContext) IsActionable(id string) bool {
 	ctx.lock()
 	defer ctx.unlock()
 
-	// Ensure computed (inline to avoid nested lock)
-	if !ctx.actionableComputed {
-		ctx.actionable = ctx.analyzer.GetActionableIssues()
-		ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
-		for _, issue := range ctx.actionable {
-			ctx.actionableSet[issue.ID] = true
-		}
-		ctx.actionableComputed = true
+	ctx.ensureActionableInternal()
+	return ctx.actionableSet[id]
+}
+
+// ensureActionableInternal populates actionable caches without locking.
+// MUST be called while holding the lock.
+func (ctx *TriageContext) ensureActionableInternal() {
+	if ctx.actionableComputed {
+		return
 	}
 
-	return ctx.actionableSet[id]
+	ctx.actionable = ctx.analyzer.GetActionableIssues()
+	ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
+	for _, issue := range ctx.actionable {
+		ctx.actionableSet[issue.ID] = true
+	}
+	ctx.actionableComputed = true
 }
 
 // ActionableCount returns the number of actionable issues.
@@ -200,13 +197,41 @@ func (ctx *TriageContext) getOpenBlockersInternal(id string) []string {
 		return blockers
 	}
 
-	// Compute open blockers
-	blockers := ctx.analyzer.GetOpenBlockers(id)
+	blockerSet := make(map[string]struct{})
+	for _, blockerID := range ctx.analyzer.GetOpenBlockers(id) {
+		blockerSet[blockerID] = struct{}{}
+	}
+
+	if issue, ok := ctx.analyzer.issueMap[id]; ok {
+		for _, dep := range issue.Dependencies {
+			if dep == nil || dep.Type != model.DepParentChild {
+				continue
+			}
+			parent, exists := ctx.analyzer.issueMap[dep.DependsOnID]
+			if !exists || isClosedLikeStatus(parent.Status) {
+				continue
+			}
+			blockerSet[dep.DependsOnID] = struct{}{}
+		}
+	}
+
+	if len(blockerSet) == 0 {
+		ctx.openBlockers[id] = nil
+		return nil
+	}
+
+	blockers := make([]string, 0, len(blockerSet))
+	for blockerID := range blockerSet {
+		blockers = append(blockers, blockerID)
+	}
+	sort.Strings(blockers)
 	ctx.openBlockers[id] = blockers
 	return blockers
 }
 
-// OpenBlockers returns the IDs of open issues that block the given issue.
+// OpenBlockers returns the IDs of open issues that block claiming the given issue.
+// In triage, parent-child parents count because br ready/update treats them as
+// ready-work blockers even though lower-level graph metrics keep them separate.
 //
 // Returns nil if the issue doesn't exist or has no open blockers.
 // Time complexity: O(d) on first call where d is dependency count, O(1) thereafter.

@@ -1067,9 +1067,14 @@ function parseLabelsJSON(labelsStr) {
 }
 
 function getGraphViewData() {
+  // Pull from issue_overview_mv so the graph sees the same active-blocker
+  // counts the issues view does — closing a blocker drops its dependents'
+  // blocker_count to 0 here too, which getNodeColor uses to derive the
+  // effective "blocked" colouring (bv-issue#143/#144).
   const issues = execQuery(`
-    SELECT id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at
-    FROM issues
+    SELECT id, title, description, status, priority, issue_type, assignee, labels,
+           created_at, updated_at, blocker_count, dependent_count
+    FROM issue_overview_mv
   `).map(row => ({
     id: row.id,
     title: row.title || '',
@@ -1081,6 +1086,10 @@ function getGraphViewData() {
     labels: parseLabelsJSON(row.labels),
     created_at: row.created_at,
     updated_at: row.updated_at,
+    // Pre-computed active-blocker / active-dependent counts from the
+    // materialized view (which excludes closed/tombstoned endpoints).
+    blocker_count: row.blocker_count ?? 0,
+    dependent_count: row.dependent_count ?? 0,
   }));
 
   const dependencies = execQuery(`
@@ -2466,7 +2475,14 @@ function beadsApp() {
         }
       });
 
-      // Force-graph integration: clicking a node opens the issue modal without changing routes.
+      // Force-graph integration: double-click opens the full issue modal.
+      // Single click pins the node in the side detail pane (handled by the
+      // listener registered later inside loadGraph). Detect double-click via a
+      // manual timer so we don't depend on `event.detail` (which some
+      // force-graph builds and synthetic events do not populate reliably —
+      // bv-142).
+      const DBLCLICK_MS = 350;
+      let _lastNodeClick = { id: null, t: 0 };
       document.addEventListener('bv-graph:nodeClick', (e) => {
         const nodeId = e?.detail?.node?.id;
         const ev = e?.detail?.event;
@@ -2475,12 +2491,22 @@ function beadsApp() {
         // Let graph interactions work:
         // - Shift+click triggers what-if
         // - Ctrl/Meta+click highlights dependency paths
-        if (ev && (ev.shiftKey || ev.ctrlKey || ev.metaKey)) return;
+        if (ev && (ev.shiftKey || ev.ctrlKey || ev.metaKey)) {
+          _lastNodeClick = { id: null, t: 0 };
+          return;
+        }
 
-        // Open the issue modal on double-click.
-        if (ev && typeof ev.detail === 'number' && ev.detail < 2) return;
+        const now = Date.now();
+        const isDouble =
+          _lastNodeClick.id === nodeId &&
+          now - _lastNodeClick.t < DBLCLICK_MS;
 
-        this.selectIssue(nodeId);
+        if (isDouble) {
+          _lastNodeClick = { id: null, t: 0 };
+          this.selectIssue(nodeId);
+        } else {
+          _lastNodeClick = { id: nodeId, t: now };
+        }
       });
 
       try {
