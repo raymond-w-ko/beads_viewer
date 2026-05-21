@@ -35,6 +35,9 @@ func WithDebounceDuration(d time.Duration) WatcherOption {
 // WithPollInterval sets the polling interval for fallback mode.
 func WithPollInterval(d time.Duration) WatcherOption {
 	return func(w *Watcher) {
+		if d <= 0 {
+			d = DefaultPollInterval
+		}
 		w.pollInterval = d
 	}
 }
@@ -74,6 +77,7 @@ type Watcher struct {
 	fsWatcher   *fsnotify.Watcher
 	debouncer   *Debouncer
 	useFallback bool
+	lastExists  bool
 	lastMtime   time.Time
 	lastSize    int64
 
@@ -118,8 +122,6 @@ func (w *Watcher) Start() error {
 		return ErrAlreadyStarted
 	}
 
-	w.ctx, w.cancel = context.WithCancel(context.Background())
-
 	// Reset per-start state.
 	w.useFallback = false
 	w.forcePollEnv = false
@@ -146,12 +148,17 @@ func (w *Watcher) Start() error {
 			return ErrPermission
 		}
 		// File might not exist yet, that's okay
+		w.lastExists = false
 		w.lastMtime = time.Time{}
 		w.lastSize = 0
 	} else {
+		w.lastExists = true
 		w.lastMtime = info.ModTime()
 		w.lastSize = info.Size()
 	}
+
+	w.ctx, w.cancel = newRunContext()
+	runCtx := w.ctx
 
 	// Try to use fsnotify
 	if !forcePoll && !w.useFallback {
@@ -165,7 +172,7 @@ func (w *Watcher) Start() error {
 			} else {
 				w.fsWatcher = fsw
 				w.useFallback = false
-				go w.watchFsnotify()
+				go w.watchFsnotify(runCtx)
 			}
 		} else {
 			w.useFallback = true
@@ -176,7 +183,7 @@ func (w *Watcher) Start() error {
 
 	// Start polling as fallback or primary
 	if w.useFallback {
-		go w.watchPolling()
+		go w.watchPolling(runCtx)
 	}
 
 	w.started = true
@@ -186,9 +193,8 @@ func (w *Watcher) Start() error {
 // Stop stops watching the file.
 // Note: The changeCh channel is intentionally NOT closed here. Closing it would
 // cause race conditions with notifyChange() and break WatchFileCmd (which would
-// receive immediately and potentially loop). Since Stop() is only called at
-// program exit, the goroutine blocked on Changed() is cleaned up by process
-// termination.
+// receive immediately and potentially loop). Callers that wait on Changed()
+// should also have their own shutdown signal.
 func (w *Watcher) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -262,8 +268,13 @@ func envBool(name string) bool {
 	}
 }
 
+// newRunContext returns a context whose cancel function is owned by Watcher.Stop.
+func newRunContext() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
 // watchFsnotify monitors using fsnotify events.
-func (w *Watcher) watchFsnotify() {
+func (w *Watcher) watchFsnotify(ctx context.Context) {
 	targetFile := filepath.Base(w.path)
 
 	// Capture channel references to avoid race with Stop() setting fsWatcher to nil
@@ -278,7 +289,7 @@ func (w *Watcher) watchFsnotify() {
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 
 		case event, ok := <-events:
@@ -292,13 +303,7 @@ func (w *Watcher) watchFsnotify() {
 				continue
 			}
 
-			switch {
-			case event.Op&fsnotify.Remove != 0:
-				w.onError(ErrFileRemoved)
-
-			case event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0:
-				w.debouncer.Trigger(w.notifyChange)
-			}
+			w.handleFsnotifyFileEvent(event.Op)
 
 		case err, ok := <-errors:
 			if !ok {
@@ -309,24 +314,50 @@ func (w *Watcher) watchFsnotify() {
 	}
 }
 
+func (w *Watcher) handleFsnotifyFileEvent(op fsnotify.Op) {
+	if op&fsnotify.Remove != 0 {
+		if w.recordMissing() {
+			w.onError(ErrFileRemoved)
+		}
+		return
+	}
+	if op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
+		return
+	}
+
+	info, err := os.Stat(w.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if op&fsnotify.Rename != 0 && w.recordMissing() {
+				w.onError(ErrFileRemoved)
+			}
+		} else if os.IsPermission(err) {
+			w.onError(ErrPermission)
+		} else {
+			w.onError(err)
+		}
+		return
+	}
+
+	w.recordStat(info.ModTime(), info.Size())
+	w.debouncer.Trigger(w.notifyChange)
+}
+
 // watchPolling monitors using periodic stat checks.
-func (w *Watcher) watchPolling() {
+func (w *Watcher) watchPolling(ctx context.Context) {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 
 		case <-ticker.C:
 			info, err := os.Stat(w.path)
 			if err != nil {
 				if os.IsNotExist(err) {
-					// Only report if file existed before
-					w.mu.RLock()
-					hadFile := !w.lastMtime.IsZero()
-					w.mu.RUnlock()
+					hadFile := w.recordMissing()
 					if hadFile {
 						w.onError(ErrFileRemoved)
 					}
@@ -338,19 +369,35 @@ func (w *Watcher) watchPolling() {
 				continue
 			}
 
-			w.mu.Lock()
-			changed := info.ModTime().After(w.lastMtime) || info.Size() != w.lastSize
-			if changed {
-				w.lastMtime = info.ModTime()
-				w.lastSize = info.Size()
-			}
-			w.mu.Unlock()
+			changed := w.recordStat(info.ModTime(), info.Size())
 
 			if changed {
 				w.debouncer.Trigger(w.notifyChange)
 			}
 		}
 	}
+}
+
+func (w *Watcher) recordMissing() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	hadFile := w.lastExists
+	w.lastExists = false
+	w.lastMtime = time.Time{}
+	w.lastSize = 0
+	return hadFile
+}
+
+func (w *Watcher) recordStat(mtime time.Time, size int64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	changed := !w.lastExists || !mtime.Equal(w.lastMtime) || size != w.lastSize
+	w.lastExists = true
+	w.lastMtime = mtime
+	w.lastSize = size
+	return changed
 }
 
 // notifyChange invokes the onChange callback and signals the change channel.

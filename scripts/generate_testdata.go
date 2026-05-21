@@ -1,13 +1,15 @@
+//go:build ignore
 // +build ignore
 
 // generate_testdata.go creates standard test datasets for benchmarking.
 // Usage: go run scripts/generate_testdata.go
 //
 // Creates:
-//   tests/testdata/benchmark/small.jsonl   (100 issues)
-//   tests/testdata/benchmark/medium.jsonl  (1000 issues)
-//   tests/testdata/benchmark/large.jsonl   (5000 issues)
-//   tests/testdata/benchmark/huge.jsonl    (20000 issues)
+//
+//	tests/testdata/benchmark/small.jsonl   (100 issues)
+//	tests/testdata/benchmark/medium.jsonl  (1000 issues)
+//	tests/testdata/benchmark/large.jsonl   (5000 issues)
+//	tests/testdata/benchmark/huge.jsonl    (20000 issues)
 package main
 
 import (
@@ -20,9 +22,9 @@ import (
 )
 
 type datasetSpec struct {
-	name  string
-	size  int
-	desc  string
+	name string
+	size int
+	desc string
 }
 
 var datasets = []datasetSpec{
@@ -111,7 +113,15 @@ func addRealisticContent(issues []model.Issue, datasetDesc string) {
 	}
 
 	for i := range issues {
-		issues[i].Title = fmt.Sprintf("[%s] %s #%d", datasetDesc[:6], titles[i%len(titles)], i)
+		issues[i].Title = fmt.Sprintf("[%s] %s #%d", datasetDescPrefix(datasetDesc), titles[i%len(titles)], i)
 		issues[i].Description = descriptions[i%len(descriptions)]
 	}
+}
+
+func datasetDescPrefix(desc string) string {
+	runes := []rune(desc)
+	if len(runes) <= 6 {
+		return desc
+	}
+	return string(runes[:6])
 }

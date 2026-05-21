@@ -5,7 +5,7 @@
 package export
 
 import (
-	"context"
+	"bytes"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -24,9 +24,9 @@ type LiveReloadHub struct {
 	mu      sync.RWMutex
 	clients map[chan struct{}]struct{}
 
-	// context for shutdown
-	ctx    context.Context
-	cancel context.CancelFunc
+	// shutdown signal
+	done     chan struct{}
+	stopOnce sync.Once
 
 	// debounce rapid file changes
 	lastEvent time.Time
@@ -40,14 +40,11 @@ func NewLiveReloadHub(bundlePath string) (*LiveReloadHub, error) {
 		return nil, fmt.Errorf("create fsnotify watcher: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	hub := &LiveReloadHub{
 		bundlePath: bundlePath,
 		watcher:    watcher,
 		clients:    make(map[chan struct{}]struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
+		done:       make(chan struct{}),
 		debounce:   200 * time.Millisecond,
 	}
 
@@ -76,16 +73,18 @@ func (h *LiveReloadHub) Start() error {
 
 // Stop shuts down the live-reload hub.
 func (h *LiveReloadHub) Stop() {
-	h.cancel()
-	h.watcher.Close()
+	h.stopOnce.Do(func() {
+		close(h.done)
+		_ = h.watcher.Close()
 
-	// Close all client channels
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for ch := range h.clients {
-		close(ch)
-	}
-	h.clients = make(map[chan struct{}]struct{})
+		// Close all client channels
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for ch := range h.clients {
+			close(ch)
+		}
+		h.clients = make(map[chan struct{}]struct{})
+	})
 }
 
 // ClientCount returns the number of connected clients.
@@ -99,7 +98,7 @@ func (h *LiveReloadHub) ClientCount() int {
 func (h *LiveReloadHub) watchLoop() {
 	for {
 		select {
-		case <-h.ctx.Done():
+		case <-h.done:
 			return
 
 		case event, ok := <-h.watcher.Events:
@@ -162,15 +161,11 @@ func (h *LiveReloadHub) SSEHandler() http.HandlerFunc {
 
 		// Register this client
 		clientCh := make(chan struct{}, 1)
-		h.mu.Lock()
-		h.clients[clientCh] = struct{}{}
-		h.mu.Unlock()
+		h.addClient(clientCh)
 
 		// Cleanup on disconnect
 		defer func() {
-			h.mu.Lock()
-			delete(h.clients, clientCh)
-			h.mu.Unlock()
+			h.removeClient(clientCh)
 		}()
 
 		// Send initial connection event
@@ -182,7 +177,7 @@ func (h *LiveReloadHub) SSEHandler() http.HandlerFunc {
 			select {
 			case <-r.Context().Done():
 				return
-			case <-h.ctx.Done():
+			case <-h.done:
 				return
 			case _, ok := <-clientCh:
 				if !ok {
@@ -193,6 +188,18 @@ func (h *LiveReloadHub) SSEHandler() http.HandlerFunc {
 			}
 		}
 	}
+}
+
+func (h *LiveReloadHub) addClient(ch chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[ch] = struct{}{}
+}
+
+func (h *LiveReloadHub) removeClient(ch chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.clients, ch)
 }
 
 // LiveReloadScript returns JavaScript that connects to the SSE endpoint and reloads on events.
@@ -274,22 +281,10 @@ func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 	// Buffer the content
 	w.buf = append(w.buf, b...)
 
-	// Check if we have the closing body tag
-	bodyClose := []byte("</body>")
-	if idx := findLastIndex(w.buf, bodyClose); idx >= 0 && !w.injected {
-		// Inject before </body>
-		newBuf := make([]byte, 0, len(w.buf)+len(w.inject))
-		newBuf = append(newBuf, w.buf[:idx]...)
-		newBuf = append(newBuf, w.inject...)
-		newBuf = append(newBuf, w.buf[idx:]...)
-		w.buf = newBuf
-		w.injected = true
-	}
-
 	// If we've seen </html>, flush everything
 	if findLastIndex(w.buf, []byte("</html>")) >= 0 {
-		w.committed = true
-		_, err := w.ResponseWriter.Write(w.buf)
+		w.injectScript()
+		err := w.commit()
 		return len(b), err
 	}
 
@@ -299,16 +294,43 @@ func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 // Flush ensures any remaining buffered content is written.
 func (w *injectingResponseWriter) Flush() {
 	if !w.committed && len(w.buf) > 0 {
-		w.committed = true
-		// Inject at end if we haven't yet and there's content
-		if !w.injected {
-			w.buf = append(w.buf, w.inject...)
-		}
-		w.ResponseWriter.Write(w.buf)
+		w.injectScript()
+		_ = w.commit()
 	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func (w *injectingResponseWriter) injectScript() {
+	if w.injected {
+		return
+	}
+
+	insertAt := findLastIndex(w.buf, []byte("</body>"))
+	if insertAt < 0 {
+		insertAt = findLastIndex(w.buf, []byte("</html>"))
+	}
+	if insertAt < 0 {
+		w.buf = append(w.buf, w.inject...)
+	} else {
+		newBuf := make([]byte, 0, len(w.buf)+len(w.inject))
+		newBuf = append(newBuf, w.buf[:insertAt]...)
+		newBuf = append(newBuf, w.inject...)
+		newBuf = append(newBuf, w.buf[insertAt:]...)
+		w.buf = newBuf
+	}
+	w.injected = true
+}
+
+func (w *injectingResponseWriter) commit() error {
+	if w.committed {
+		return nil
+	}
+	w.committed = true
+	w.Header().Del("Content-Length")
+	_, err := w.ResponseWriter.Write(w.buf)
+	return err
 }
 
 // findLastIndex finds the last occurrence of needle in haystack.
@@ -316,17 +338,5 @@ func findLastIndex(haystack, needle []byte) int {
 	if len(needle) == 0 {
 		return -1
 	}
-	for i := len(haystack) - len(needle); i >= 0; i-- {
-		found := true
-		for j := 0; j < len(needle); j++ {
-			if haystack[i+j] != needle[j] {
-				found = false
-				break
-			}
-		}
-		if found {
-			return i
-		}
-	}
-	return -1
+	return bytes.LastIndex(haystack, needle)
 }

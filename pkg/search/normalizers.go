@@ -2,21 +2,28 @@ package search
 
 import (
 	"math"
+	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // normalizeStatus maps status to [0,1] range favoring actionable states.
 func normalizeStatus(status string) float64 {
-	switch status {
-	case "open":
+	switch model.Status(strings.ToLower(strings.TrimSpace(status))) {
+	case model.StatusOpen:
 		return 1.0
-	case "in_progress":
+	case model.StatusInProgress, model.StatusHooked, model.StatusReview:
 		return 0.8
-	case "blocked":
+	case model.StatusPinned:
+		return 0.7
+	case model.StatusBlocked:
 		return 0.5
-	case "closed":
+	case model.StatusDraft, model.StatusDeferred:
+		return 0.2
+	case model.StatusClosed:
 		return 0.1
-	case "tombstone":
+	case model.StatusTombstone:
 		return 0.0
 	default:
 		return 0.5

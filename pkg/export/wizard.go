@@ -6,8 +6,10 @@ package export
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +30,7 @@ type WizardConfig struct {
 	// Source metadata for reliable updates
 	SourceBeadsDir string `json:"source_beads_dir,omitempty"`
 	SourceRepoRoot string `json:"source_repo_root,omitempty"`
+	SourcePath     string `json:"source_path,omitempty"`
 	LastIssueCount int    `json:"last_issue_count,omitempty"`
 	LastDataHash   string `json:"last_data_hash,omitempty"`
 
@@ -676,8 +679,12 @@ func (w *Wizard) OfferPreview() (string, error) {
 
 	fmt.Println("")
 	fmt.Printf("Starting preview server for %s...\n", w.bundlePath)
-	fmt.Println("Press Ctrl+C in the browser tab when done, then return here.")
+	fmt.Println("Use the prompt below when done previewing.")
 	fmt.Println("")
+
+	if _, err := validatePreviewBundle(w.bundlePath); err != nil {
+		return "", fmt.Errorf("preview bundle is not valid: %w", err)
+	}
 
 	// Start preview server
 	port, err := FindAvailablePort(PreviewPortRangeStart, PreviewPortRangeEnd)
@@ -687,17 +694,19 @@ func (w *Wizard) OfferPreview() (string, error) {
 
 	server := NewPreviewServer(w.bundlePath, port)
 
-	// Open browser
+	// Start server in goroutine
+	errChan := make(chan error, 1)
 	go func() {
-		time.Sleep(500 * time.Millisecond)
-		url := server.URL()
-		OpenInBrowser(url)
+		if err := server.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errChan <- err
+		}
 	}()
 
-	// Start server in goroutine
-	go func() {
-		server.Start()
-	}()
+	select {
+	case err := <-errChan:
+		return "", fmt.Errorf("start preview server: %w", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	// Wait for user to press enter with a simple huh form
 	var cont bool = true // Default to continue after preview
@@ -730,10 +739,11 @@ func (w *Wizard) OfferPreview() (string, error) {
 
 // PerformDeploy deploys the bundle to the configured target.
 func (w *Wizard) PerformDeploy() (*WizardResult, error) {
-	return w.PerformDeployWithIssueCount(0)
+	return w.PerformDeployWithIssueCount(skipDeploymentIssueCountVerification)
 }
 
 // PerformDeployWithIssueCount deploys the bundle and verifies the expected issue count.
+// Pass a negative value to skip live count verification.
 func (w *Wizard) PerformDeployWithIssueCount(expectedIssueCount int) (*WizardResult, error) {
 	fmt.Println("Step 7: Deploy")
 	fmt.Println("────────────────────────────")
@@ -928,6 +938,10 @@ func LoadWizardConfig() (*WizardConfig, error) {
 
 // SaveWizardConfig saves wizard configuration for future runs.
 func SaveWizardConfig(config *WizardConfig) error {
+	if config == nil {
+		return errors.New("wizard config is nil")
+	}
+
 	path := WizardConfigPath()
 	if path == "" {
 		return fmt.Errorf("could not determine config path")
@@ -936,13 +950,51 @@ func SaveWizardConfig(config *WizardConfig) error {
 	// Ensure directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("create wizard config directory: %w", err)
 	}
 
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal wizard config: %w", err)
 	}
 
-	return os.WriteFile(path, data, 0644)
+	return writeWizardConfigFile(path, data)
+}
+
+func writeWizardConfigFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary wizard config: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("chmod temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync temporary wizard config: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temporary wizard config: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace wizard config: %w", err)
+	}
+
+	cleanup = false
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,7 +317,8 @@ func TestBackgroundWorker_ContentHashDedup(t *testing.T) {
 
 	// First refresh should build snapshot and set hash
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
+	waitForWorkerIdle(t, worker, 1)
 
 	snapshot1 := worker.GetSnapshot()
 	if snapshot1 == nil {
@@ -330,7 +332,7 @@ func TestBackgroundWorker_ContentHashDedup(t *testing.T) {
 
 	// Second refresh with same content should be deduped (snapshot unchanged)
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForWorkerIdle(t, worker, 2)
 
 	snapshot2 := worker.GetSnapshot()
 	hash2 := worker.LastHash()
@@ -368,7 +370,8 @@ func TestBackgroundWorker_ContentHashChanges(t *testing.T) {
 
 	// First refresh
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
+	waitForWorkerIdle(t, worker, 1)
 
 	snapshot1 := worker.GetSnapshot()
 	if snapshot1 == nil {
@@ -384,7 +387,8 @@ func TestBackgroundWorker_ContentHashChanges(t *testing.T) {
 
 	// Second refresh with different content should rebuild
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 2)
+	waitForWorkerIdle(t, worker, 2)
 
 	snapshot2 := worker.GetSnapshot()
 	if snapshot2 == nil {
@@ -866,6 +870,71 @@ func TestBackgroundWorker_SnapshotHasDataHash(t *testing.T) {
 	}
 }
 
+func TestBackgroundWorker_BuildSnapshotDoesNotPublishHashBeforeSwap(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
+
+	content1 := `{"id":"test-1","title":"Initial","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content1), 0644); err != nil {
+		t.Fatalf("Failed to write initial test file: %v", err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{
+		BeadsPath:     beadsPath,
+		DebounceDelay: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	worker.TriggerRefresh()
+	waitForSnapshotVersion(t, worker, 1)
+
+	accepted := worker.GetSnapshot()
+	if accepted == nil {
+		t.Fatal("expected accepted initial snapshot")
+	}
+	acceptedHash := worker.LastHash()
+	if acceptedHash == "" {
+		t.Fatal("expected accepted initial hash")
+	}
+
+	content2 := `{"id":"test-1","title":"Changed","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content2), 0644); err != nil {
+		t.Fatalf("Failed to write changed test file: %v", err)
+	}
+
+	mutateWorkerForTest(worker, func() {
+		worker.forceNext = true
+	})
+
+	unaccepted := worker.buildSnapshot(false)
+	if unaccepted == nil {
+		t.Fatal("expected unaccepted changed snapshot")
+	}
+	defer loader.ReturnIssuePtrsToPool(unaccepted.pooledIssues)
+
+	if unaccepted.DataHash == "" {
+		t.Fatal("expected unaccepted snapshot DataHash")
+	}
+	if unaccepted.DataHash == acceptedHash {
+		t.Fatal("expected changed snapshot hash to differ from accepted hash")
+	}
+	if worker.GetSnapshot() != accepted {
+		t.Fatal("buildSnapshot should not swap the active snapshot")
+	}
+	if got := worker.LastHash(); got != acceptedHash {
+		t.Fatalf("LastHash changed before snapshot swap: got %q, want %q", got, acceptedHash)
+	}
+	worker.mu.RLock()
+	forceNext := worker.forceNext
+	worker.mu.RUnlock()
+	if !forceNext {
+		t.Fatal("buildSnapshot consumed a force-refresh flag that belongs to the next process run")
+	}
+}
+
 func TestWorkerError_String(t *testing.T) {
 	err := WorkerError{
 		Phase:   "load",
@@ -1111,12 +1180,18 @@ func TestBackgroundWorker_ConcurrentTrigger(t *testing.T) {
 
 	// Fire multiple TriggerRefresh calls concurrently
 	// The fix ensures only one process() runs at a time, others mark dirty
+	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		go worker.TriggerRefresh()
+		wg.Add(1)
+		go func(_ int) {
+			defer wg.Done()
+			worker.TriggerRefresh()
+		}(i)
 	}
+	wg.Wait()
 
-	// Wait for processing to complete
-	time.Sleep(400 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
+	waitForWorkerIdle(t, worker, 1)
 
 	// Worker should still be in idle state (not stuck in processing)
 	if worker.State() != WorkerIdle {
@@ -1126,6 +1201,37 @@ func TestBackgroundWorker_ConcurrentTrigger(t *testing.T) {
 	// Should have a valid snapshot
 	if worker.GetSnapshot() == nil {
 		t.Error("Expected snapshot after concurrent triggers")
+	}
+}
+
+func TestBackgroundWorker_TriggerRefreshCoalescesWhileProcessScheduled(t *testing.T) {
+	worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: ""})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker failed: %v", err)
+	}
+	defer worker.Stop()
+
+	mutateWorkerForTest(worker, func() {
+		worker.processScheduled = true
+	})
+
+	worker.TriggerRefresh()
+
+	state, dirty, scheduled := workerStateFlags(worker)
+	if state != WorkerIdle {
+		t.Fatalf("state=%v, want %v", state, WorkerIdle)
+	}
+	if !scheduled {
+		t.Fatal("expected existing scheduled process to remain scheduled")
+	}
+	if !dirty {
+		t.Fatal("expected refresh to mark worker dirty while process is scheduled")
+	}
+	if got := worker.coalesceCount.Load(); got != 1 {
+		t.Fatalf("coalesceCount=%d, want 1", got)
+	}
+	if got := worker.Metrics().ProcessingCount; got != 0 {
+		t.Fatalf("ProcessingCount=%d, want 0", got)
 	}
 }
 
@@ -1338,6 +1444,44 @@ func waitForSnapshotVersion(t *testing.T, worker *BackgroundWorker, minVersion u
 	t.Fatalf("timeout waiting for snapshot version %d (got %d)", minVersion, worker.Metrics().SnapshotVersion)
 }
 
+func waitForWorkerIdle(t *testing.T, worker *BackgroundWorker, minProcessingCount uint64) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		metrics := worker.Metrics()
+		state, dirty, scheduled := workerStateFlags(worker)
+		if state == WorkerIdle && !dirty && !scheduled && metrics.ProcessingCount >= minProcessingCount {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	metrics := worker.Metrics()
+	state, dirty, scheduled := workerStateFlags(worker)
+	t.Fatalf(
+		"timeout waiting for idle worker after %d processes (state=%v dirty=%v scheduled=%v processes=%d snapshots=%d)",
+		minProcessingCount,
+		state,
+		dirty,
+		scheduled,
+		metrics.ProcessingCount,
+		metrics.SnapshotVersion,
+	)
+}
+
+func workerStateFlags(worker *BackgroundWorker) (WorkerState, bool, bool) {
+	worker.mu.RLock()
+	defer worker.mu.RUnlock()
+	return worker.state, worker.dirty, worker.processScheduled
+}
+
+func mutateWorkerForTest(worker *BackgroundWorker, fn func()) {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	fn()
+}
+
 func TestBackgroundWorker_MalformedJSON_WarnsAndContinues(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsPath := filepath.Join(tmpDir, "beads.jsonl")
@@ -1537,9 +1681,9 @@ func TestBackgroundWorker_CheckHealth_TriggersRecoveryOnMissedHeartbeat(t *testi
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	worker.mu.Lock()
-	worker.lastHeartbeat = time.Now().Add(-time.Second)
-	worker.mu.Unlock()
+	mutateWorkerForTest(worker, func() {
+		worker.lastHeartbeat = time.Now().Add(-time.Second)
+	})
 
 	worker.checkHealth(time.Now())
 
@@ -1619,9 +1763,9 @@ func TestBackgroundWorker_MaybeIdleGC_DoesNotRunWhenProcessing(t *testing.T) {
 	now := time.Now()
 	worker.recordActivityAt(now.Add(-10 * time.Second))
 
-	worker.mu.Lock()
-	worker.state = WorkerProcessing
-	worker.mu.Unlock()
+	mutateWorkerForTest(worker, func() {
+		worker.state = WorkerProcessing
+	})
 
 	worker.maybeIdleGC(now)
 	if gcCalls != 0 {

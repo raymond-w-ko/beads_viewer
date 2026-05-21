@@ -90,7 +90,7 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	}
 
 	// Open database
-	db, err := sql.Open("sqlite", source.Path)
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(source.Path))
 	if err != nil {
 		return fmt.Errorf("cannot open database: %w", err)
 	}

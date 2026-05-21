@@ -2,8 +2,10 @@ package export
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -154,6 +156,160 @@ func TestStartPreviewWithConfig_MissingIndexReturnsError(t *testing.T) {
 	}
 }
 
+func TestPreviewFileServer_RejectsEscapedSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	if err := os.Mkdir(bundleDir, 0755); err != nil {
+		t.Fatalf("Failed to create bundle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<html>ok</html>"), 0644); err != nil {
+		t.Fatalf("Failed to create index.html: %v", err)
+	}
+
+	secretPath := filepath.Join(tmpDir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("do not serve"), 0644); err != nil {
+		t.Fatalf("Failed to create secret file: %v", err)
+	}
+	if err := os.Symlink(secretPath, filepath.Join(bundleDir, "leak.txt")); err != nil {
+		t.Skipf("Symlinks are not available on this platform: %v", err)
+	}
+
+	previewFS, err := newSafePreviewFileSystem(bundleDir)
+	if err != nil {
+		t.Fatalf("Failed to create preview filesystem: %v", err)
+	}
+	server := httptest.NewServer(noCacheMiddleware(http.FileServer(previewFS)))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/leak.txt")
+	if err != nil {
+		t.Fatalf("Failed to request escaped symlink: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+	if resp.StatusCode == http.StatusOK || strings.Contains(string(body), "do not serve") {
+		t.Fatalf("Preview server served a symlink outside the bundle: status=%d body=%q", resp.StatusCode, string(body))
+	}
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("Expected escaped symlink to be forbidden or hidden, got status %d body %q", resp.StatusCode, string(body))
+	}
+}
+
+func TestSafePreviewDir_RejectsBackslashTraversalOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("backslash path traversal is Windows-specific")
+	}
+
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<html>ok</html>"), 0644); err != nil {
+		t.Fatalf("Failed to create index.html: %v", err)
+	}
+
+	previewFS, err := newSafePreviewFileSystem(bundleDir)
+	if err != nil {
+		t.Fatalf("Failed to create preview filesystem: %v", err)
+	}
+	file, err := previewFS.Open(`/..\secret.txt`)
+	if err == nil {
+		file.Close()
+		t.Fatal("Expected Windows backslash traversal path to be rejected")
+	}
+	if !errors.Is(err, iofs.ErrPermission) {
+		t.Fatalf("Expected permission error for backslash traversal, got: %v", err)
+	}
+}
+
+func TestValidatePreviewBundle_RejectsEscapedIndexSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	if err := os.Mkdir(bundleDir, 0755); err != nil {
+		t.Fatalf("Failed to create bundle dir: %v", err)
+	}
+
+	outsideIndex := filepath.Join(tmpDir, "index.html")
+	if err := os.WriteFile(outsideIndex, []byte("<html>outside</html>"), 0644); err != nil {
+		t.Fatalf("Failed to create outside index: %v", err)
+	}
+	if err := os.Symlink(outsideIndex, filepath.Join(bundleDir, "index.html")); err != nil {
+		t.Skipf("Symlinks are not available on this platform: %v", err)
+	}
+
+	_, err := validatePreviewBundle(bundleDir)
+	if err == nil {
+		t.Fatal("Expected escaped index.html symlink to be rejected")
+	}
+	if !strings.Contains(err.Error(), "index.html escapes bundle") {
+		t.Fatalf("Expected escaped index error, got: %v", err)
+	}
+}
+
+func TestValidatePreviewBundle_RejectsIndexDirectory(t *testing.T) {
+	bundleDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(bundleDir, "index.html"), 0755); err != nil {
+		t.Fatalf("Failed to create index.html directory: %v", err)
+	}
+
+	_, err := validatePreviewBundle(bundleDir)
+	if err == nil {
+		t.Fatal("Expected index.html directory to be rejected")
+	}
+	if !strings.Contains(err.Error(), "index.html is a directory") {
+		t.Fatalf("Expected index directory error, got: %v", err)
+	}
+}
+
+func TestValidatePreviewBundle_RejectsFileBundlePath(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundlePath := filepath.Join(tmpDir, "bundle.html")
+	if err := os.WriteFile(bundlePath, []byte("<html>not a directory</html>"), 0644); err != nil {
+		t.Fatalf("Failed to create bundle file: %v", err)
+	}
+
+	_, err := validatePreviewBundle(bundlePath)
+	if err == nil {
+		t.Fatal("Expected file bundle path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "bundle path is not a directory") {
+		t.Fatalf("Expected non-directory bundle error, got: %v", err)
+	}
+}
+
+func TestPreviewServer_StatusHandler_DoesNotCountEscapedIndexSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundleDir := filepath.Join(tmpDir, "bundle")
+	if err := os.Mkdir(bundleDir, 0755); err != nil {
+		t.Fatalf("Failed to create bundle dir: %v", err)
+	}
+
+	outsideIndex := filepath.Join(tmpDir, "index.html")
+	if err := os.WriteFile(outsideIndex, []byte("<html>outside</html>"), 0644); err != nil {
+		t.Fatalf("Failed to create outside index: %v", err)
+	}
+	if err := os.Symlink(outsideIndex, filepath.Join(bundleDir, "index.html")); err != nil {
+		t.Skipf("Symlinks are not available on this platform: %v", err)
+	}
+
+	server := NewPreviewServer(bundleDir, 1234)
+	req := httptest.NewRequest(http.MethodGet, "/__preview__/status", nil)
+	rec := httptest.NewRecorder()
+	server.statusHandler(rec, req)
+
+	type statusResponse struct {
+		HasIndex bool `json:"has_index"`
+	}
+	var got statusResponse
+	if err := json.NewDecoder(io.LimitReader(rec.Body, 1024*1024)).Decode(&got); err != nil {
+		t.Fatalf("Expected valid status JSON, got error: %v", err)
+	}
+	if got.HasIndex {
+		t.Fatal("Expected escaped index.html symlink not to count as a valid index")
+	}
+}
+
 func TestPreviewServer_Integration(t *testing.T) {
 	// Create a temp bundle directory
 	tmpDir := t.TempDir()
@@ -184,7 +340,7 @@ func TestPreviewServer_Integration(t *testing.T) {
 	// Start server in goroutine
 	errChan := make(chan error, 1)
 	go func() {
-		if err := server.Start(); err != nil && err != http.ErrServerClosed {
+		if err := server.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
@@ -215,7 +371,7 @@ func TestPreviewServer_Integration(t *testing.T) {
 	}
 
 	// Check body
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		t.Fatalf("Failed to read body: %v", err)
 	}
@@ -235,7 +391,10 @@ func TestPreviewServer_Integration(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", statusResp.StatusCode)
 	}
 
-	statusBody, _ := io.ReadAll(statusResp.Body)
+	statusBody, err := io.ReadAll(io.LimitReader(statusResp.Body, 1024*1024))
+	if err != nil {
+		t.Fatalf("Failed to read status body: %v", err)
+	}
 	if len(statusBody) == 0 {
 		t.Error("Expected non-empty status response")
 	}
@@ -288,7 +447,7 @@ func TestPreviewServer_StatusHandler_EmitsValidJSON(t *testing.T) {
 	}
 
 	var got statusResponse
-	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+	if err := json.NewDecoder(io.LimitReader(rec.Body, 1024*1024)).Decode(&got); err != nil {
 		t.Fatalf("expected valid JSON, got error: %v (body=%q)", err, rec.Body.String())
 	}
 

@@ -48,11 +48,10 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 		actionableSet[issue.ID] = true
 	}
 
-	// Calculate what each actionable issue unblocks
-	unblocksMap := make(map[string][]string)
-	for _, issue := range actionable {
-		unblocksMap[issue.ID] = a.computeUnblocks(issue.ID)
-	}
+	// Create a TriageContext to correctly calculate what each actionable issue unblocks,
+	// properly accounting for parent-child blocking relationships (bv-96).
+	triageCtx := NewTriageContext(a)
+	unblocksMap := triageCtx.UnblocksMap()
 
 	// Find connected components among all issues (not just actionable)
 	// This groups actionable issues that belong to the same work stream
@@ -80,20 +79,17 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	}
 }
 
-// computeUnblocks finds issues that would become actionable if the given issue is closed
+// computeUnblocks finds issues that would become actionable if the given issue is closed.
+// This exported analysis contract uses hard blocking dependencies only; triage-specific
+// parent-child claim blocking is handled through TriageContext.
 func (a *Analyzer) computeUnblocks(issueID string) []string {
 	var unblocks []string
 
-	// Get the node ID for the issue being completed (the blocker)
 	blockerNodeID, ok := a.idToNode[issueID]
 	if !ok {
 		return nil
 	}
 
-	// Find all issues that depend on this one (incoming edges in dependency graph)
-	// Note: In our graph model, edge u -> v means u depends on v.
-	// So to find issues depending on v, we look for nodes u where u -> v exists.
-	// In gonum, To(id) returns nodes that have edges to id.
 	dependents := a.g.To(blockerNodeID)
 
 	for dependents.Next() {
@@ -101,13 +97,10 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 		dependentID := a.nodeToID[dependentNode.ID()]
 		dependentIssue := a.issueMap[dependentID]
 
-		// Skip closed/tombstone issues (they don't need unblocking)
 		if isClosedLikeStatus(dependentIssue.Status) {
 			continue
 		}
 
-		// Check if this dependent is still blocked by OTHER open issues
-		// We look at its outgoing edges (dependencies)
 		otherBlockers := a.g.From(dependentNode.ID())
 		stillBlocked := false
 
@@ -115,12 +108,10 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 			otherBlockerNode := otherBlockers.Node()
 			otherBlockerID := a.nodeToID[otherBlockerNode.ID()]
 
-			// Ignore the issue we are "completing"
 			if otherBlockerID == issueID {
 				continue
 			}
 
-			// Check status of other blocker
 			if otherBlocker, exists := a.issueMap[otherBlockerID]; exists {
 				if !isClosedLikeStatus(otherBlocker.Status) {
 					stillBlocked = true
@@ -134,7 +125,6 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 		}
 	}
 
-	// Sort for determinism
 	sort.Strings(unblocks)
 	return unblocks
 }
@@ -191,7 +181,7 @@ func (a *Analyzer) findConnectedComponents() map[string][]string {
 	for _, id := range ids {
 		issue := a.issueMap[id]
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type.IsBlocking() {
+			if dep != nil && (dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
 				if _, exists := a.issueMap[dep.DependsOnID]; exists {
 					union(issue.ID, dep.DependsOnID)
 				}

@@ -924,6 +924,7 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		return candidates[i].id < candidates[j].id
 	})
 
+	originalCandidateCount := len(candidates)
 	// Cap to limit
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
@@ -954,8 +955,8 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		Status: FeatureStatus{
 			State:   "available",
 			Count:   len(suggestions),
-			Capped:  len(suggestions) >= limit && len(candidates) >= limit,
-			Limited: len(candidates),
+			Capped:  originalCandidateCount > limit,
+			Limited: originalCandidateCount,
 		},
 		Suggestions: suggestions,
 		MaxParallel: maxParallel,

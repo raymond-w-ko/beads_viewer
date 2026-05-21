@@ -88,6 +88,24 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 	// Priority: opts.BeadsDir (set by caller, e.g. from --db) > BEADS_DB env > BEADS_DIR env > auto-discovery
 	beadsDir := opts.BeadsDir
 	if beadsDir == "" {
+		if source, ok, err := ExplicitBeadsDBSource(); err != nil {
+			return nil, err
+		} else if ok {
+			sources := []DataSource{source}
+			if opts.ValidateAfterDiscovery {
+				if err := ValidateSource(&sources[0]); err != nil && opts.Verbose {
+					opts.Logger(fmt.Sprintf("Validation failed for %s: %v", sources[0].Path, err))
+				}
+				if !opts.IncludeInvalid && !sources[0].Valid {
+					return nil, nil
+				}
+			}
+			if opts.Verbose {
+				opts.Logger(fmt.Sprintf("Discovered explicit BEADS_DB source: %s", sources[0].Path))
+			}
+			return sources, nil
+		}
+
 		// Check BEADS_DB environment variable (can be file or directory)
 		if envDB := os.Getenv("BEADS_DB"); envDB != "" {
 			beadsDir = resolveBeadsDBPath(envDB)
@@ -177,7 +195,7 @@ func resolveBeadsDBPath(dbPath string) string {
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		// Path doesn't exist -- guess based on extension
-		if strings.HasSuffix(dbPath, ".jsonl") || strings.HasSuffix(dbPath, ".db") {
+		if _, _, ok := explicitBeadsDBFileType(dbPath); ok {
 			return filepath.Dir(dbPath)
 		}
 		return dbPath

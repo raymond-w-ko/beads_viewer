@@ -2,6 +2,8 @@ package correlation
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -163,7 +165,11 @@ func TestDetermineStatusEvent(t *testing.T) {
 		{"in_progress", "closed", EventClosed},
 		{"open", "closed", EventClosed},
 		{"closed", "open", EventReopened},
-		{"closed", "in_progress", EventClaimed},
+		{"closed", "in_progress", EventReopened},
+		{"open", "tombstone", EventClosed},
+		{"in_progress", " tombstone ", EventClosed},
+		{"tombstone", "open", EventReopened},
+		{"TOMBSTONE", " In_Progress ", EventReopened},
 		{"open", "blocked", EventModified},
 		{"in_progress", "open", EventModified},
 	}
@@ -304,8 +310,8 @@ func TestBuildGitLogArgs(t *testing.T) {
 	t.Run("basic args", func(t *testing.T) {
 		args := e.buildGitLogArgs(ExtractOptions{})
 
-		// Should contain -p and --format
-		// Note: --follow was removed because it requires exactly one pathspec
+		// Should contain -p and --format; --follow is valid because the
+		// extractor appends exactly one primary beads pathspec.
 		foundP := false
 		for _, arg := range args {
 			if arg == "-p" {
@@ -358,6 +364,28 @@ func TestBuildGitLogArgs(t *testing.T) {
 			t.Error("missing --until flag")
 		}
 	})
+}
+
+func TestIsIgnorableDiffMetadataLine(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{"", true},
+		{"@@ -1 +1 @@", true},
+		{"diff --git a/file b/file", true},
+		{"index 123..456", true},
+		{"new file mode 100644", true},
+		{`+{"id":"bv-1","status":"open"}`, false},
+		{`-{"id":"bv-1","status":"closed"}`, false},
+		{" context", false},
+	}
+
+	for _, tt := range tests {
+		if got := isIgnorableDiffMetadataLine(tt.line); got != tt.want {
+			t.Fatalf("isIgnorableDiffMetadataLine(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
 }
 
 // TestParseDiff tests the diff parsing logic with mock data
@@ -526,6 +554,62 @@ func TestNewExtractor(t *testing.T) {
 	}
 	if len(e.beadsFiles) == 0 {
 		t.Error("beadsFiles should not be empty")
+	}
+}
+
+func writeHistorySelectionFiles(t *testing.T, repoPath string) string {
+	t.Helper()
+
+	beadsDir := filepath.Join(repoPath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"legacy"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(`{"id":"canonical"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return beadsDir
+}
+
+func TestNewExtractorPrefersCanonicalBeadsJSONL(t *testing.T) {
+	repoPath := t.TempDir()
+	writeHistorySelectionFiles(t, repoPath)
+
+	e := NewExtractor(repoPath, "")
+	if got, want := e.primaryBeadsFile(), ".beads/beads.jsonl"; got != want {
+		t.Fatalf("primaryBeadsFile = %s, want %s", got, want)
+	}
+}
+
+func TestNewExtractorPrefersBDCompatibilityIssuesJSONL(t *testing.T) {
+	repoPath := t.TempDir()
+	beadsDir := writeHistorySelectionFiles(t, repoPath)
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	e := NewExtractor(repoPath, "")
+	if got, want := e.primaryBeadsFile(), ".beads/issues.jsonl"; got != want {
+		t.Fatalf("primaryBeadsFile = %s, want %s", got, want)
+	}
+}
+
+func TestPickBeadsFilesDoesNotInjectBDCompatibilityCandidate(t *testing.T) {
+	repoPath := t.TempDir()
+	beadsDir := filepath.Join(repoPath, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates := []string{".beads/beads.jsonl"}
+	got := pickBeadsFiles(repoPath, candidates)
+	if len(got) != len(candidates) {
+		t.Fatalf("pickBeadsFiles injected candidates: got %#v, want %#v", got, candidates)
+	}
+	if got[0] != candidates[0] {
+		t.Fatalf("pickBeadsFiles = %#v, want %#v", got, candidates)
 	}
 }
 

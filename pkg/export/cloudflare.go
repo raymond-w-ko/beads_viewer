@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -26,7 +25,10 @@ var (
 	cfDeploymentIDRegex   = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 	cfNonAlphanumRegex    = regexp.MustCompile(`[^a-z0-9-]`)
 	cfMultipleHyphenRegex = regexp.MustCompile(`-+`)
+	cfProjectNameRegex    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 )
+
+const cloudflareProjectNameMaxLen = 63
 
 // CloudflareDeployConfig configures Cloudflare Pages deployment.
 type CloudflareDeployConfig struct {
@@ -259,21 +261,23 @@ func AuthenticateWrangler() error {
 // GenerateHeadersFile creates a _headers file for Cloudflare Pages.
 // This provides security headers without needing a service worker.
 func GenerateHeadersFile(bundlePath string) error {
-	headersContent := `/*
-  X-Frame-Options: DENY
-  X-Content-Type-Options: nosniff
-  Referrer-Policy: strict-origin-when-cross-origin
-  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
-
-/*.js
-  Content-Type: application/javascript; charset=utf-8
-
-/*.wasm
-  Content-Type: application/wasm
-
-/*.css
-  Content-Type: text/css; charset=utf-8
-`
+	headersContent := "/*\n" +
+		"  X-Frame-Options: DENY\n" +
+		"  X-Content-Type-Options: nosniff\n" +
+		"  Referrer-Policy: strict-origin-when-cross-origin\n" +
+		"  Cross-Origin-Opener-Policy: same-origin\n" +
+		"  Cross-Origin-Embedder-Policy: require-corp\n" +
+		"  Cross-Origin-Resource-Policy: same-origin\n" +
+		"  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()\n" +
+		"\n" +
+		"/*.js\n" +
+		"  Content-Type: application/javascript; charset=utf-8\n" +
+		"\n" +
+		"/*.wasm\n" +
+		"  Content-Type: application/wasm\n" +
+		"\n" +
+		"/*.css\n" +
+		"  Content-Type: text/css; charset=utf-8\n"
 
 	headersPath := filepath.Join(bundlePath, "_headers")
 	if err := os.WriteFile(headersPath, []byte(headersContent), 0644); err != nil {
@@ -313,7 +317,7 @@ func parseDeploymentID(output string) string {
 func SuggestProjectName(bundlePath string) string {
 	// Use the directory name
 	name := filepath.Base(bundlePath)
-	if name == "." || name == "/" || name == "" {
+	if isEmptyPathBase(name) {
 		// Get parent dir name
 		abs, err := filepath.Abs(bundlePath)
 		if err == nil {
@@ -322,12 +326,14 @@ func SuggestProjectName(bundlePath string) string {
 	}
 
 	// If it's bv-pages or similar, use parent project name
-	if name == "bv-pages" || name == "pages" || name == "docs" || name == "dist" {
+	if isGenericCloudflareOutputDir(name) {
 		abs, err := filepath.Abs(bundlePath)
 		if err == nil {
 			parent := filepath.Base(filepath.Dir(abs))
-			if parent != "" && parent != "." && parent != "/" {
+			if !isEmptyPathBase(parent) {
 				name = parent + "-pages"
+			} else {
+				name = ""
 			}
 		}
 	}
@@ -344,8 +350,38 @@ func SuggestProjectName(bundlePath string) string {
 	// Remove leading/trailing hyphens and collapse multiple hyphens
 	name = strings.Trim(name, "-")
 	name = cfMultipleHyphenRegex.ReplaceAllString(name, "-")
+	if name == "" {
+		return "beads-viewer-pages"
+	}
 
 	return name
+}
+
+func isGenericCloudflareOutputDir(name string) bool {
+	switch name {
+	case "bv-pages", "pages", "docs", "dist":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCloudflareProjectName(projectName string) error {
+	trimmed := strings.TrimSpace(projectName)
+	if trimmed == "" {
+		return fmt.Errorf("cloudflare project name is required")
+	}
+	if trimmed != projectName {
+		return fmt.Errorf("cloudflare project name %q must not contain leading or trailing whitespace", projectName)
+	}
+	if len(projectName) > cloudflareProjectNameMaxLen {
+		return fmt.Errorf("cloudflare project name %q is too long: %d characters, max %d",
+			projectName, len(projectName), cloudflareProjectNameMaxLen)
+	}
+	if !cfProjectNameRegex.MatchString(projectName) {
+		return fmt.Errorf("cloudflare project name %q must contain only lowercase letters, numbers, and hyphens, and start and end with a letter or number", projectName)
+	}
+	return nil
 }
 
 // DeployToCloudflarePages performs a complete deployment to Cloudflare Pages.
@@ -353,6 +389,9 @@ func DeployToCloudflarePages(config CloudflareDeployConfig) (*CloudflareDeployRe
 	// Set default branch
 	if config.Branch == "" {
 		config.Branch = "main"
+	}
+	if err := validateCloudflareProjectName(config.ProjectName); err != nil {
+		return nil, err
 	}
 
 	// 1. Check wrangler CLI status
@@ -510,6 +549,9 @@ func DeleteCloudflareProject(projectName string, confirm bool) error {
 	if !confirm {
 		return fmt.Errorf("project deletion requires confirmation")
 	}
+	if err := validateCloudflareProjectName(projectName); err != nil {
+		return err
+	}
 
 	cmd := exec.Command("wrangler", "pages", "project", "delete", projectName, "--yes")
 	output, err := cmd.CombinedOutput()
@@ -527,26 +569,21 @@ func OpenCloudflareInBrowser(projectName string) error {
 	if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
 		return nil
 	}
+	if err := validateCloudflareProjectName(projectName); err != nil {
+		return err
+	}
 
 	url := fmt.Sprintf("https://dash.cloudflare.com/?to=/:account/pages/view/%s", projectName)
 
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
-
-	return cmd.Start()
+	return startBrowserURL(url)
 }
 
 // CloudflareProjectExists checks if a Cloudflare Pages project exists.
 func CloudflareProjectExists(projectName string) (bool, error) {
+	if err := validateCloudflareProjectName(projectName); err != nil {
+		return false, err
+	}
+
 	// Try to get project info - if it fails with "not found", project doesn't exist
 	cmd := exec.Command("wrangler", "pages", "project", "list")
 	output, err := cmd.Output()
@@ -568,6 +605,9 @@ func CloudflareProjectExists(projectName string) (bool, error) {
 
 // CreateCloudflareProject creates a new Cloudflare Pages project.
 func CreateCloudflareProject(projectName string, productionBranch string) error {
+	if err := validateCloudflareProjectName(projectName); err != nil {
+		return err
+	}
 	if productionBranch == "" {
 		productionBranch = "main"
 	}
@@ -595,6 +635,10 @@ func CreateCloudflareProject(projectName string, productionBranch string) error 
 
 // EnsureCloudflareProject ensures a Cloudflare Pages project exists, creating it if necessary.
 func EnsureCloudflareProject(projectName string, productionBranch string) error {
+	if err := validateCloudflareProjectName(projectName); err != nil {
+		return err
+	}
+
 	exists, err := CloudflareProjectExists(projectName)
 	if err != nil {
 		// Can't check, try to create anyway
@@ -639,11 +683,11 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 			continue
 		}
 
-		// Check issue count matches expected
-		if expectedIssueCount > 0 && meta.IssueCount != expectedIssueCount {
-			fmt.Printf("  ⚠ Warning: Live site shows %d issues, expected %d\n",
+		// Check issue count matches expected. Zero is a valid expected
+		// count for empty exports; negative disables count comparison.
+		if expectedIssueCount >= 0 && meta.IssueCount != expectedIssueCount {
+			return fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
 				meta.IssueCount, expectedIssueCount)
-			return nil
 		}
 
 		fmt.Printf("  ✓ Deployment verified: %d issues live\n", meta.IssueCount)
@@ -651,9 +695,9 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 	}
 
 	if lastErr != nil {
-		fmt.Printf("  ⚠ Could not verify deployment: %v\n", lastErr)
+		return fmt.Errorf("deployment verification failed for %s: %w", metaURL, lastErr)
 	}
-	return nil
+	return fmt.Errorf("deployment verification timed out for %s", metaURL)
 }
 
 // DeployToCloudflareWithAutoCreate performs deployment with automatic project creation.
@@ -661,6 +705,9 @@ func DeployToCloudflareWithAutoCreate(config CloudflareDeployConfig, expectedIss
 	// Set default branch
 	if config.Branch == "" {
 		config.Branch = "main"
+	}
+	if err := validateCloudflareProjectName(config.ProjectName); err != nil {
+		return nil, err
 	}
 
 	// 1. Check wrangler CLI status
@@ -779,9 +826,12 @@ func DeployToCloudflareWithAutoCreate(config CloudflareDeployConfig, expectedIss
 		DeploymentID: deployID,
 	}
 
-	// 10. Verify deployment
-	if expectedIssueCount > 0 {
-		VerifyCloudflareDeployment(deployURL, expectedIssueCount, 30*time.Second)
+	// 10. Verify deployment. Zero is valid for empty exports; a negative
+	// sentinel means the caller opted out.
+	if expectedIssueCount >= 0 {
+		if err := VerifyCloudflareDeployment(deployURL, expectedIssueCount, 30*time.Second); err != nil {
+			return nil, fmt.Errorf("verify cloudflare deployment: %w", err)
+		}
 	}
 
 	return result, nil

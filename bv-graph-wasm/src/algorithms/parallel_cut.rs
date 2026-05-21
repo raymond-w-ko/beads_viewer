@@ -92,8 +92,12 @@ pub fn parallel_cut_suggestions(
         .filter(|item| item.parallel_gain > 0)
         .collect();
 
-    // Sort by parallel gain descending
-    suggestions.sort_by(|a, b| b.parallel_gain.cmp(&a.parallel_gain));
+    // Sort by parallel gain descending, then by node ID for determinism
+    suggestions.sort_by(|a, b| {
+        b.parallel_gain
+            .cmp(&a.parallel_gain)
+            .then_with(|| a.node.cmp(&b.node))
+    });
     suggestions.truncate(limit);
 
     ParallelCutResult {
@@ -132,7 +136,8 @@ pub fn unblock_ranking(graph: &DiGraph, closed_set: &[bool], limit: usize) -> Ve
         })
         .collect();
 
-    ranking.sort_by(|a, b| b.1.cmp(&a.1));
+    // Sort by unblocks descending, then by node ID for determinism
+    ranking.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranking.truncate(limit);
     ranking
 }
@@ -143,11 +148,7 @@ mod tests {
 
     fn make_graph(edges: &[(usize, usize)]) -> DiGraph {
         let mut g = DiGraph::new();
-        let max_node = edges
-            .iter()
-            .flat_map(|(a, b)| [*a, *b])
-            .max()
-            .unwrap_or(0);
+        let max_node = edges.iter().flat_map(|(a, b)| [*a, *b]).max().unwrap_or(0);
         for i in 0..=max_node {
             g.add_node(&format!("n{}", i));
         }

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,24 @@ func TestLiveReloadHub_StartStop(t *testing.T) {
 	}
 
 	// Should be able to stop without error
+	hub.Stop()
+}
+
+func TestLiveReloadHub_StopAfterStartFailure(t *testing.T) {
+	missingDir := filepath.Join(t.TempDir(), "missing")
+
+	hub, err := NewLiveReloadHub(missingDir)
+	if err != nil {
+		t.Fatalf("NewLiveReloadHub() error = %v", err)
+	}
+
+	if err := hub.Start(); err == nil {
+		hub.Stop()
+		t.Fatal("Expected Start() to fail for missing bundle path")
+	}
+
+	// The preview setup path calls Stop after a failed Start to close the
+	// watcher allocated by NewLiveReloadHub. This must remain safe.
 	hub.Stop()
 }
 
@@ -157,6 +176,49 @@ func TestLiveReloadMiddleware_HTML(t *testing.T) {
 	}
 }
 
+func TestLiveReloadMiddleware_RemovesStaleContentLength(t *testing.T) {
+	html := "<html><body><h1>Test</h1></body></html>"
+	handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(html)))
+		w.Write([]byte(html))
+	}))
+
+	req := httptest.NewRequest("GET", "/index.html", nil)
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length = %q, want empty after script injection", got)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "EventSource") {
+		t.Fatalf("Expected injected live reload script, got: %s", body)
+	}
+	if len(body) <= len(html) {
+		t.Fatalf("Expected injected response to grow beyond original length")
+	}
+}
+
+func TestLiveReloadMiddleware_HTMLWithoutBody(t *testing.T) {
+	handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("<html><head><title>Test</title></head></html>"))
+	}))
+
+	req := httptest.NewRequest("GET", "/index.html", nil)
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "EventSource") {
+		t.Fatalf("HTML without </body> should still receive injected script, got: %s", body)
+	}
+	if strings.Index(body, "EventSource") > strings.Index(body, "</html>") {
+		t.Fatalf("Expected script before </html>, got: %s", body)
+	}
+}
+
 func TestLiveReloadHub_FileChangeNotification(t *testing.T) {
 	dir := t.TempDir()
 
@@ -178,9 +240,7 @@ func TestLiveReloadHub_FileChangeNotification(t *testing.T) {
 
 	// Register a client channel manually
 	clientCh := make(chan struct{}, 1)
-	hub.mu.Lock()
-	hub.clients[clientCh] = struct{}{}
-	hub.mu.Unlock()
+	hub.addClient(clientCh)
 
 	// Modify the file
 	time.Sleep(300 * time.Millisecond) // Wait for debounce period to pass

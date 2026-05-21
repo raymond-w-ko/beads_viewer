@@ -1089,6 +1089,46 @@ func TestLoadIssuesFromFile_AllFields(t *testing.T) {
 	if issue.Priority != 1 {
 		t.Errorf("Priority mismatch: %d", issue.Priority)
 	}
+	if len(issue.Dependencies) != 1 {
+		t.Fatalf("expected 1 dependency, got %d", len(issue.Dependencies))
+	}
+	if issue.Dependencies[0].IssueID != "full-1" {
+		t.Errorf("dependency IssueID = %q, want full-1", issue.Dependencies[0].IssueID)
+	}
+	if issue.Dependencies[0].DependsOnID != "other-1" {
+		t.Errorf("dependency DependsOnID = %q, want other-1", issue.Dependencies[0].DependsOnID)
+	}
+}
+
+func TestLoadIssuesFromFile_DependencyTargetAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "deps.jsonl")
+	content := `{"id":"target-alias","title":"Target alias","status":"open","issue_type":"task","dependencies":[{"target_id":"root","type":"blocks"}]}
+{"id":"depends-alias","title":"Depends alias","status":"open","issue_type":"task","dependencies":[{"depends_on":"root","type":"blocks"}]}
+{"id":"canonical","title":"Canonical","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"root","type":"blocks"}]}`
+	if err := os.WriteFile(path, []byte(content+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, err := loader.LoadIssuesFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadIssuesFromFile: %v", err)
+	}
+	if len(issues) != 3 {
+		t.Fatalf("expected 3 issues, got %d", len(issues))
+	}
+	for _, issue := range issues {
+		if len(issue.Dependencies) != 1 {
+			t.Fatalf("%s expected 1 dependency, got %d", issue.ID, len(issue.Dependencies))
+		}
+		dep := issue.Dependencies[0]
+		if dep.IssueID != issue.ID {
+			t.Fatalf("%s dependency IssueID = %q, want %q", issue.ID, dep.IssueID, issue.ID)
+		}
+		if dep.DependsOnID != "root" {
+			t.Fatalf("%s dependency DependsOnID = %q, want root", issue.ID, dep.DependsOnID)
+		}
+	}
 }
 
 // =============================================================================
@@ -1264,6 +1304,21 @@ func TestGetBeadsDir_EnvVarEmpty_FallsBack(t *testing.T) {
 	}
 }
 
+func TestGetBeadsDir_BeadsDBMissingSQLiteFileUsesParentDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, ".beads", "beads.sqlite3")
+	t.Setenv(loader.BeadsDBEnvVar, dbPath)
+	t.Setenv(loader.BeadsDirEnvVar, filepath.Join(t.TempDir(), ".beads"))
+
+	result, err := loader.GetBeadsDir("/some/random/path")
+	if err != nil {
+		t.Fatalf("GetBeadsDir: %v", err)
+	}
+	if result != filepath.Dir(dbPath) {
+		t.Fatalf("BEADS_DB sqlite file should resolve to parent dir: got %s, want %s", result, filepath.Dir(dbPath))
+	}
+}
+
 func TestGetBeadsDir_FindsBeadsInGitRepo(t *testing.T) {
 	// Unset environment variable
 	oldVal := os.Getenv(loader.BeadsDirEnvVar)
@@ -1294,5 +1349,107 @@ func TestGetBeadsDir_FindsBeadsInGitRepo(t *testing.T) {
 	// Verify the path ends with .beads
 	if filepath.Base(result) != ".beads" {
 		t.Errorf("Returned path should end with .beads: got %s", result)
+	}
+}
+
+// clearBeadsEnv unsets BEADS_DB and BEADS_DIR for the duration of a test so the
+// directory-discovery path (which is what follows redirects) is exercised.
+func clearBeadsEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{loader.BeadsDBEnvVar, loader.BeadsDirEnvVar} {
+		old := os.Getenv(key)
+		os.Unsetenv(key)
+		t.Cleanup(func() {
+			if old != "" {
+				os.Setenv(key, old)
+			}
+		})
+	}
+}
+
+func TestGetBeadsDir_FollowsRedirect(t *testing.T) {
+	clearBeadsEnv(t)
+
+	root := t.TempDir()
+	source := filepath.Join(root, "workspace", ".beads")
+	target := filepath.Join(root, "tracker", ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	// Relative redirect from the source .beads to the tracker .beads.
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../../tracker/.beads\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+
+	result, err := loader.GetBeadsDir(filepath.Join(root, "workspace"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantAbs, _ := filepath.Abs(target)
+	if result != wantAbs {
+		t.Errorf("redirect not followed: got %s, want %s", result, wantAbs)
+	}
+}
+
+func TestGetBeadsDir_NoRedirectReturnsLocal(t *testing.T) {
+	clearBeadsEnv(t)
+
+	root := t.TempDir()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	result, err := loader.GetBeadsDir(root)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != beadsDir {
+		t.Errorf("without redirect should return local .beads: got %s, want %s", result, beadsDir)
+	}
+}
+
+func TestGetBeadsDir_RedirectLoopErrors(t *testing.T) {
+	clearBeadsEnv(t)
+
+	root := t.TempDir()
+	first := filepath.Join(root, "first", ".beads")
+	second := filepath.Join(root, "second", ".beads")
+	if err := os.MkdirAll(first, 0o755); err != nil {
+		t.Fatalf("mkdir first: %v", err)
+	}
+	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatalf("mkdir second: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(first, "redirect"), []byte("../../second/.beads"), 0o644); err != nil {
+		t.Fatalf("write first redirect: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "redirect"), []byte("../../first/.beads"), 0o644); err != nil {
+		t.Fatalf("write second redirect: %v", err)
+	}
+
+	if _, err := loader.GetBeadsDir(filepath.Join(root, "first")); err == nil {
+		t.Fatal("expected loop error, got nil")
+	}
+}
+
+func TestGetBeadsDir_RedirectMissingTargetErrors(t *testing.T) {
+	clearBeadsEnv(t)
+
+	root := t.TempDir()
+	source := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../does-not-exist/.beads"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+
+	if _, err := loader.GetBeadsDir(root); err == nil {
+		t.Fatal("expected missing-target error, got nil")
 	}
 }

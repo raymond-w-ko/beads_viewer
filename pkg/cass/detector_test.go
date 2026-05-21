@@ -299,10 +299,61 @@ func TestDetector_ConcurrentAccess(t *testing.T) {
 		t.Errorf("%d goroutines got non-healthy status, want all StatusHealthy", failures)
 	}
 
-	// Due to caching and locking, we should have very few actual checks
-	// (ideally 1, but could be 2-3 due to race in acquiring lock)
-	if checkCount > 5 {
-		t.Errorf("checkCount = %d, want <= 5 (caching should prevent most checks)", checkCount)
+	// checkMu should collapse concurrent cache misses into a single health probe.
+	if checkCount != 1 {
+		t.Errorf("checkCount = %d, want 1", checkCount)
+	}
+}
+
+func TestDetector_Status_DoesNotBlockDuringSlowCheck(t *testing.T) {
+	d := NewDetectorWithOptions(WithHealthTimeout(5 * time.Second))
+	d.lookPath = func(name string) (string, error) {
+		return "/usr/local/bin/cass", nil
+	}
+
+	healthStarted := make(chan struct{})
+	releaseHealth := make(chan struct{})
+	d.runCommand = func(ctx context.Context, name string, args ...string) (int, error) {
+		close(healthStarted)
+		select {
+		case <-releaseHealth:
+			return 0, nil
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		}
+	}
+
+	done := make(chan Status, 1)
+	go func() {
+		done <- d.Check()
+	}()
+
+	select {
+	case <-healthStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("cass health check did not start")
+	}
+
+	start := time.Now()
+	status := d.Status()
+	elapsed := time.Since(start)
+
+	if status != StatusUnknown {
+		t.Errorf("Status() during slow Check() = %v, want StatusUnknown", status)
+	}
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("Status() blocked for %v during slow Check(), want <= 10ms", elapsed)
+	}
+
+	close(releaseHealth)
+
+	select {
+	case status := <-done:
+		if status != StatusHealthy {
+			t.Errorf("Check() = %v, want StatusHealthy", status)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Check() did not finish after health command was released")
 	}
 }
 

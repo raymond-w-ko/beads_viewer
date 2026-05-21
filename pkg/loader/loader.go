@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	json "github.com/goccy/go-json"
 
@@ -62,7 +63,7 @@ func GetBeadsDir(repoPath string) (string, error) {
 	// Check for .beads in the given path first
 	beadsDir := filepath.Join(repoPath, ".beads")
 	if _, err := os.Stat(beadsDir); err == nil {
-		return beadsDir, nil
+		return followBeadsRedirect(beadsDir)
 	}
 
 	// If not found, check if we're in a git worktree and look in the main repo
@@ -70,7 +71,7 @@ func GetBeadsDir(repoPath string) (string, error) {
 	if err == nil && mainRepoRoot != "" && mainRepoRoot != repoPath {
 		mainBeadsDir := filepath.Join(mainRepoRoot, ".beads")
 		if _, err := os.Stat(mainBeadsDir); err == nil {
-			return mainBeadsDir, nil
+			return followBeadsRedirect(mainBeadsDir)
 		}
 	}
 
@@ -79,8 +80,99 @@ func GetBeadsDir(repoPath string) (string, error) {
 	return beadsDir, nil
 }
 
+// maxRedirectBytes and maxRedirectDepth bound .beads/redirect resolution,
+// matching br's routing limits so bv and br agree on the target store.
+const (
+	maxRedirectBytes = 4096
+	maxRedirectDepth = 10
+)
+
+// followBeadsRedirect resolves a .beads/redirect chain to its terminal beads
+// directory, mirroring `br where` so bv reads from the same store br writes to.
+// When beadsDir has no redirect file, it is returned unchanged. A malformed
+// redirect (oversized, non-UTF-8, loop, missing target, or a target that is not
+// a .beads/_beads directory) is surfaced as an error rather than silently
+// falling back to the local .beads, which would reintroduce the stale-read bug.
+func followBeadsRedirect(beadsDir string) (string, error) {
+	current := beadsDir
+	if abs, err := filepath.Abs(current); err == nil {
+		current = abs
+	}
+	start := current
+	visited := map[string]bool{current: true}
+
+	for depth := 0; ; depth++ {
+		target, ok, err := readBeadsRedirect(current)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			break
+		}
+		if depth >= maxRedirectDepth {
+			return "", fmt.Errorf("redirect chain exceeds max depth (%d): %s", maxRedirectDepth, beadsDir)
+		}
+		if abs, err := filepath.Abs(target); err == nil {
+			target = abs
+		}
+		if target == current {
+			break
+		}
+		if visited[target] {
+			return "", fmt.Errorf("redirect loop detected: %s -> %s", current, target)
+		}
+		visited[target] = true
+		current = target
+	}
+
+	// No redirect was followed: return the original directory untouched.
+	if current == start {
+		return beadsDir, nil
+	}
+
+	info, err := os.Stat(current)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("redirect target not found: %s", current)
+	}
+	if base := filepath.Base(current); base != ".beads" && base != "_beads" {
+		return "", fmt.Errorf("redirect target must be a .beads or _beads directory: %s", current)
+	}
+	return current, nil
+}
+
+// readBeadsRedirect reads the redirect file inside beadsDir. It returns the
+// resolved target directory and true when a non-empty redirect exists. Relative
+// targets resolve against beadsDir itself (so "." stays in place), matching br.
+func readBeadsRedirect(beadsDir string) (string, bool, error) {
+	redirectPath := filepath.Join(beadsDir, "redirect")
+	info, err := os.Stat(redirectPath)
+	if err != nil || info.IsDir() {
+		return "", false, nil
+	}
+	if info.Size() > maxRedirectBytes {
+		return "", false, fmt.Errorf("redirect file exceeds maximum size of %d bytes: %s", maxRedirectBytes, redirectPath)
+	}
+
+	data, err := os.ReadFile(redirectPath)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to read redirect file %s: %w", redirectPath, err)
+	}
+	if !utf8.Valid(data) {
+		return "", false, fmt.Errorf("redirect file must be valid UTF-8: %s", redirectPath)
+	}
+
+	target := strings.TrimSpace(string(data))
+	if target == "" {
+		return "", false, nil
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(beadsDir, target)
+	}
+	return target, true, nil
+}
+
 // resolveBeadsDB interprets a BEADS_DB value which can be either:
-//   - An absolute path to a specific file (e.g., /path/to/.beads/beads.jsonl or /path/to/.beads/beads.db)
+//   - An absolute path to a specific file (e.g., /path/to/.beads/beads.{jsonl,db,sqlite3})
 //   - An absolute path to a .beads directory
 //
 // If it points to a file, returns the parent directory.
@@ -89,7 +181,7 @@ func resolveBeadsDB(dbPath string) (string, error) {
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		// Path doesn't exist yet -- guess based on whether it looks like a file path
-		if strings.HasSuffix(dbPath, ".jsonl") || strings.HasSuffix(dbPath, ".db") {
+		if looksLikeBeadsDBFile(dbPath) {
 			return filepath.Dir(dbPath), nil
 		}
 		// Assume it's a directory
@@ -102,6 +194,15 @@ func resolveBeadsDB(dbPath string) (string, error) {
 
 	// It's a file -- return the parent directory
 	return filepath.Dir(dbPath), nil
+}
+
+func looksLikeBeadsDBFile(dbPath string) bool {
+	switch strings.ToLower(filepath.Ext(dbPath)) {
+	case ".jsonl", ".db", ".sqlite", ".sqlite3":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsBDWorkspace returns true when the given .beads directory belongs to a
@@ -553,7 +654,7 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 				continue
 			}
 
-			issue.Status = normalizeIssueStatus(issue.Status)
+			normalizeLoadedIssue(issue)
 
 			// Validate issue
 			if err := issue.Validate(); err != nil {
@@ -583,7 +684,7 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 				continue
 			}
 
-			issue.Status = normalizeIssueStatus(issue.Status)
+			normalizeLoadedIssue(&issue)
 
 			// Validate issue
 			if err := issue.Validate(); err != nil {
@@ -676,4 +777,16 @@ func normalizeIssueStatus(status model.Status) model.Status {
 		return ""
 	}
 	return model.Status(strings.ToLower(trimmed))
+}
+
+func normalizeLoadedIssue(issue *model.Issue) {
+	issue.Status = normalizeIssueStatus(issue.Status)
+	for _, dep := range issue.Dependencies {
+		if dep == nil {
+			continue
+		}
+		if dep.IssueID == "" {
+			dep.IssueID = issue.ID
+		}
+	}
 }

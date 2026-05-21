@@ -8,6 +8,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 // TestDiscoverSources_OnlySQLite tests discovery with only a SQLite source
@@ -158,6 +160,91 @@ func TestDiscoverSources_Empty(t *testing.T) {
 
 	if len(sources) != 0 {
 		t.Errorf("Expected 0 sources, got %d", len(sources))
+	}
+}
+
+func TestDiscoverSources_RespectsBeadsDBSpecificFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "selected.jsonl")
+	content := `{"id":"JSONL-1","title":"Selected JSONL","status":"open","issue_type":"task"}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	createTestSQLiteDB(t, filepath.Join(beadsDir, "beads.db"))
+	t.Setenv(loader.BeadsDBEnvVar, jsonlPath)
+
+	sources, err := DiscoverSources(DiscoveryOptions{ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("expected exactly the explicit source, got %#v", sources)
+	}
+	if sources[0].Path != jsonlPath || sources[0].Type != SourceTypeJSONLLocal {
+		t.Fatalf("expected explicit JSONL source, got %#v", sources[0])
+	}
+}
+
+func TestResolveBeadsDBPath_MissingSQLiteFileUsesParentDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, ".beads", "selected.sqlite3")
+
+	got := resolveBeadsDBPath(dbPath)
+	if got != filepath.Dir(dbPath) {
+		t.Fatalf("missing sqlite file should resolve to parent dir: got %s, want %s", got, filepath.Dir(dbPath))
+	}
+}
+
+func TestLoadIssues_RespectsBeadsDBSpecificJSONL(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "selected.jsonl")
+	content := `{"id":"JSONL-1","title":"Selected JSONL","status":"open","issue_type":"task"}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	createTestSQLiteDB(t, filepath.Join(beadsDir, "beads.db"))
+	t.Setenv(loader.BeadsDBEnvVar, jsonlPath)
+
+	issues, err := LoadIssues(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "JSONL-1" {
+		t.Fatalf("expected explicit JSONL source, got %#v", issues)
+	}
+}
+
+func TestLoadIssues_RespectsBeadsDBSpecificSQLite(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"JSONL-1","title":"Default JSONL","status":"open","issue_type":"task"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(beadsDir, "selected.db")
+	createSingleIssueSQLiteDB(t, dbPath, "SQLITE-1")
+	t.Setenv(loader.BeadsDBEnvVar, dbPath)
+
+	issues, err := LoadIssues(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "SQLITE-1" {
+		t.Fatalf("expected explicit SQLite source, got %#v", issues)
 	}
 }
 
@@ -502,6 +589,39 @@ func TestSelectBestSource_PriorityTiebreaker(t *testing.T) {
 	}
 }
 
+func TestSelectBestSource_MaxAgeDeltaUsesNewestWhenPriorityPreferred(t *testing.T) {
+	now := time.Now()
+	sources := []DataSource{
+		{
+			Type:     SourceTypeSQLite,
+			Path:     "/test/stale.db",
+			Priority: PrioritySQLite,
+			ModTime:  now.Add(-48 * time.Hour),
+			Valid:    true,
+		},
+		{
+			Type:     SourceTypeJSONLLocal,
+			Path:     "/test/fresh.jsonl",
+			Priority: PriorityJSONLLocal,
+			ModTime:  now,
+			Valid:    true,
+		},
+	}
+
+	selected, err := SelectBestSourceWithOptions(sources, SelectionOptions{
+		PreferFreshest:      false,
+		MinimumValidSources: 1,
+		MaxAgeDelta:         time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Selection failed: %v", err)
+	}
+
+	if selected.Path != "/test/fresh.jsonl" {
+		t.Fatalf("expected stale high-priority source to be filtered, got %s", selected.Path)
+	}
+}
+
 // TestSelectBestSource_AllInvalid tests that error is returned when all invalid
 func TestSelectBestSource_AllInvalid(t *testing.T) {
 	sources := []DataSource{
@@ -658,6 +778,118 @@ func TestFallbackChain_AllFail(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("Expected error when all sources fail")
+	}
+}
+
+func TestAutoRefreshManager_HandleChangeCallbackCanReadCurrentSource(t *testing.T) {
+	source := createValidJSONLSource(t)
+	manager := &AutoRefreshManager{
+		currentSource: &DataSource{
+			Type:    source.Type,
+			Path:    source.Path,
+			ModTime: source.ModTime.Add(-time.Minute),
+			Valid:   true,
+		},
+		sources: []DataSource{source},
+		opts:    DefaultSelectionOptions(),
+	}
+
+	done := make(chan struct{})
+	manager.onSourceChange = func(newSource DataSource, reason string) {
+		_ = manager.CurrentSource()
+		close(done)
+	}
+
+	go manager.handleChange(source)
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handleChange callback deadlocked while reading CurrentSource")
+	}
+}
+
+func TestAutoRefreshManager_ForceRefreshCallbackCanReadCurrentSource(t *testing.T) {
+	source := createValidJSONLSource(t)
+	manager := &AutoRefreshManager{
+		sources: []DataSource{source},
+		opts:    DefaultSelectionOptions(),
+	}
+
+	done := make(chan struct{})
+	manager.onSourceChange = func(newSource DataSource, reason string) {
+		_ = manager.CurrentSource()
+		close(done)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- manager.ForceRefresh()
+	}()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("ForceRefresh failed: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ForceRefresh deadlocked while invoking source change callback")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ForceRefresh returned without invoking source change callback")
+	}
+}
+
+func createValidJSONLSource(t *testing.T) DataSource {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	jsonlPath := filepath.Join(tmpDir, "issues.jsonl")
+	content := `{"id":"TEST-1","title":"Test Issue","status":"open"}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write JSONL source: %v", err)
+	}
+	info, err := os.Stat(jsonlPath)
+	if err != nil {
+		t.Fatalf("stat JSONL source: %v", err)
+	}
+
+	return DataSource{
+		Type:     SourceTypeJSONLLocal,
+		Path:     jsonlPath,
+		Priority: PriorityJSONLLocal,
+		ModTime:  info.ModTime(),
+		Valid:    true,
+		Size:     info.Size(),
+	}
+}
+
+func createSingleIssueSQLiteDB(t *testing.T, path, id string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			status TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec(`INSERT INTO issues (id, title, status) VALUES (?, 'Selected SQLite', 'open')`, id)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

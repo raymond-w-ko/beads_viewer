@@ -116,7 +116,7 @@ func GenerateMermaidGraph(issues []model.Issue, issueIDs map[string]bool, config
 			safeToID := getSafeID(dep.DependsOnID)
 
 			linkStyle := "-.->" // Dashed for related
-			if dep.Type == model.DepBlocks {
+			if dep.Type.IsBlocking() {
 				linkStyle = "==>" // Bold for blockers
 			}
 

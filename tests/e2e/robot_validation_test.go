@@ -112,3 +112,9 @@ func TestRobotDispatchRejectsMultiplePrimaryCommands(t *testing.T) {
 	repoDir := createSimpleRepo(t, 2)
 	assertCommandRejected(t, bv, repoDir, []string{"--robot-triage", "--robot-metrics"}, "Error: multiple primary robot commands specified:")
 }
+
+func TestRobotDispatchRejectsFileHotspotsWithAnotherPrimaryCommand(t *testing.T) {
+	bv := buildBvBinary(t)
+	repoDir := createSimpleRepo(t, 2)
+	assertCommandRejected(t, bv, repoDir, []string{"--robot-triage", "--robot-file-hotspots"}, "Error: multiple primary robot commands specified:")
+}

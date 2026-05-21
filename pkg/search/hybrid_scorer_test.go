@@ -134,3 +134,14 @@ func TestHybridScorer_Configure(t *testing.T) {
 		t.Fatalf("expected weights updated")
 	}
 }
+
+func TestNewHybridScorer_FallsBackBeforeNormalizingInvalidWeights(t *testing.T) {
+	scorer := NewHybridScorer(Weights{TextRelevance: -1, PageRank: -1}, nil).(*hybridScorer)
+	expected, err := GetPreset(PresetDefault)
+	if err != nil {
+		t.Fatalf("default preset: %v", err)
+	}
+	if scorer.weights != expected {
+		t.Fatalf("expected default weights, got %+v", scorer.weights)
+	}
+}

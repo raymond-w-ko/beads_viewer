@@ -7,11 +7,14 @@ package export
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	iofs "io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -36,30 +39,32 @@ func NewPreviewServer(bundlePath string, port int) *PreviewServer {
 
 // Start starts the preview server and blocks until stopped.
 func (p *PreviewServer) Start() error {
-	// Verify bundle path exists
-	if _, err := os.Stat(p.bundlePath); os.IsNotExist(err) {
-		return fmt.Errorf("bundle path does not exist: %s", p.bundlePath)
-	}
-
-	// Check for index.html
-	indexPath := filepath.Join(p.bundlePath, "index.html")
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return fmt.Errorf("no index.html found in bundle: %s", p.bundlePath)
+	previewFS, err := validatePreviewBundle(p.bundlePath)
+	if err != nil {
+		return err
 	}
 
 	mux := http.NewServeMux()
 
 	// Static file server with no-cache middleware
-	fs := http.FileServer(http.Dir(p.bundlePath))
-	mux.Handle("/", noCacheMiddleware(fs))
+	mux.Handle("/", noCacheMiddleware(http.FileServer(previewFS)))
 
 	// Status endpoint
 	mux.HandleFunc("/__preview__/status", p.statusHandler)
 
 	p.server = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", p.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("127.0.0.1:%d", p.port),
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	listener, err := net.Listen("tcp", p.server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", p.server.Addr, err)
+	}
+	defer listener.Close()
 
 	// Open browser after short delay
 	go func() {
@@ -75,7 +80,7 @@ func (p *PreviewServer) Start() error {
 	fmt.Printf("Serving: %s\n", p.bundlePath)
 	fmt.Println("\nPress Ctrl+C to stop")
 
-	return p.server.ListenAndServe()
+	return p.server.Serve(listener)
 }
 
 // StartWithGracefulShutdown starts the server with signal handling for clean shutdown.
@@ -90,7 +95,7 @@ func (p *PreviewServer) StartWithGracefulShutdown() error {
 
 	// Start server in goroutine
 	go func() {
-		if err := p.Start(); err != nil && err != http.ErrServerClosed {
+		if err := p.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()
@@ -132,12 +137,7 @@ func (p *PreviewServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 
-	// Check if bundle is valid
-	indexPath := filepath.Join(p.bundlePath, "index.html")
-	hasIndex := true
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		hasIndex = false
-	}
+	hasIndex := hasValidPreviewIndex(p.bundlePath)
 
 	// Get bundle info
 	var fileCount int
@@ -180,6 +180,121 @@ func noCacheMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+type safePreviewDir struct {
+	root string
+}
+
+func newSafePreviewFileSystem(bundlePath string) (http.FileSystem, error) {
+	root, err := filepath.Abs(bundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bundle path: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve bundle symlinks: %w", err)
+	}
+	return safePreviewDir{root: root}, nil
+}
+
+func validatePreviewBundle(bundlePath string) (http.FileSystem, error) {
+	if bundlePath == "" {
+		return nil, fmt.Errorf("bundle path is required")
+	}
+	bundleInfo, err := os.Stat(bundlePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("bundle path does not exist: %s", bundlePath)
+		}
+		return nil, fmt.Errorf("stat bundle path %s: %w", bundlePath, err)
+	}
+	if !bundleInfo.IsDir() {
+		return nil, fmt.Errorf("bundle path is not a directory: %s", bundlePath)
+	}
+
+	previewFS, err := newSafePreviewFileSystem(bundlePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePreviewIndex(previewFS, bundlePath); err != nil {
+		return nil, err
+	}
+
+	return previewFS, nil
+}
+
+func validatePreviewIndex(previewFS http.FileSystem, bundlePath string) error {
+	indexPath := filepath.Join(bundlePath, "index.html")
+	indexFile, err := previewFS.Open("/index.html")
+	if err != nil {
+		if errors.Is(err, iofs.ErrPermission) {
+			return fmt.Errorf("index.html escapes bundle: %s", indexPath)
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("no index.html found in bundle: %s", bundlePath)
+		}
+		return fmt.Errorf("open bundle index %s: %w", indexPath, err)
+	}
+
+	indexInfo, statErr := indexFile.Stat()
+	closeErr := indexFile.Close()
+	if statErr != nil {
+		return fmt.Errorf("stat bundle index %s: %w", indexPath, statErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close bundle index %s: %w", indexPath, closeErr)
+	}
+	if indexInfo.IsDir() {
+		return fmt.Errorf("index.html is a directory in bundle: %s", indexPath)
+	}
+
+	return nil
+}
+
+func hasValidPreviewIndex(bundlePath string) bool {
+	previewFS, err := newSafePreviewFileSystem(bundlePath)
+	if err != nil {
+		return false
+	}
+	return validatePreviewIndex(previewFS, bundlePath) == nil
+}
+
+func (d safePreviewDir) Open(name string) (http.File, error) {
+	rel := strings.TrimPrefix(path.Clean("/"+name), "/")
+	if rel == "" {
+		rel = "."
+	}
+	if !iofs.ValidPath(rel) {
+		return nil, iofs.ErrPermission
+	}
+	localRel, err := filepath.Localize(rel)
+	if err != nil {
+		return nil, iofs.ErrPermission
+	}
+
+	fullPath := filepath.Join(d.root, localRel)
+	if !pathWithinRoot(d.root, fullPath) {
+		return nil, iofs.ErrPermission
+	}
+
+	resolvedPath, err := filepath.EvalSymlinks(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	if !pathWithinRoot(d.root, resolvedPath) {
+		return nil, iofs.ErrPermission
+	}
+
+	return os.Open(resolvedPath)
+}
+
+func pathWithinRoot(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
 }
 
 // FindAvailablePort finds an available port in the given range.
@@ -242,18 +357,9 @@ func DefaultPreviewConfig() PreviewConfig {
 
 // StartPreviewWithConfig starts a preview server with the given configuration.
 func StartPreviewWithConfig(config PreviewConfig) error {
-	// Verify bundle exists
-	if config.BundlePath == "" {
-		return fmt.Errorf("bundle path is required")
-	}
-	if _, err := os.Stat(config.BundlePath); os.IsNotExist(err) {
-		return fmt.Errorf("bundle path does not exist: %s", config.BundlePath)
-	}
-
-	// Check for index.html (match PreviewServer.Start behavior)
-	indexPath := filepath.Join(config.BundlePath, "index.html")
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return fmt.Errorf("no index.html found in bundle: %s", config.BundlePath)
+	previewFS, err := validatePreviewBundle(config.BundlePath)
+	if err != nil {
+		return err
 	}
 
 	// Auto-select port if needed
@@ -268,10 +374,16 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 
 	// Create server
 	server := NewPreviewServer(config.BundlePath, port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	defer listener.Close()
 
 	// Need to initialize the server first
 	mux := http.NewServeMux()
-	fs := http.FileServer(http.Dir(config.BundlePath))
+	fileServer := http.FileServer(previewFS)
 
 	// Set up live-reload if enabled
 	var liveReloadHub *LiveReloadHub
@@ -287,27 +399,31 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 				if !config.Quiet {
 					fmt.Printf("Warning: Could not start live-reload: %v\n", err)
 				}
+				liveReloadHub.Stop()
 				liveReloadHub = nil
 			} else {
 				// Add SSE endpoint for live-reload
 				mux.HandleFunc("/__preview__/events", liveReloadHub.SSEHandler())
 				// Wrap file server with live-reload script injection
-				mux.Handle("/", liveReloadMiddleware(noCacheMiddleware(fs)))
+				mux.Handle("/", liveReloadMiddleware(noCacheMiddleware(fileServer)))
 			}
 		}
 	}
 
 	// If no live-reload, just use no-cache middleware
 	if liveReloadHub == nil {
-		mux.Handle("/", noCacheMiddleware(fs))
+		mux.Handle("/", noCacheMiddleware(fileServer))
 	}
 
 	mux.HandleFunc("/__preview__/status", server.statusHandler)
 	server.liveReloadHub = liveReloadHub
 
 	server.server = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Handle opening browser
@@ -344,7 +460,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 
 	// Start server in goroutine
 	go func() {
-		if err := server.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errChan <- err
 		}
 	}()

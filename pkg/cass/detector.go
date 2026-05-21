@@ -53,6 +53,7 @@ type Detector struct {
 	cacheTTL      time.Duration
 	healthTimeout time.Duration
 	mu            sync.RWMutex
+	checkMu       sync.Mutex
 
 	// For testing: allow overriding command execution
 	lookPath   func(string) (string, error)
@@ -100,18 +101,11 @@ func NewDetectorWithOptions(opts ...Option) *Detector {
 // If the cache is stale or unknown, returns StatusUnknown.
 // Use Check() to perform an actual detection.
 func (d *Detector) Status() Status {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.status == StatusUnknown {
+	status, ok := d.cachedStatus(time.Now())
+	if !ok {
 		return StatusUnknown
 	}
-
-	if time.Since(d.checkedAt) > d.cacheTTL {
-		return StatusUnknown
-	}
-
-	return d.status
+	return status
 }
 
 // IsHealthy returns true if cass is ready to use.
@@ -124,27 +118,27 @@ func (d *Detector) IsHealthy() bool {
 // Results are cached for cacheTTL duration.
 // This method is safe for concurrent use.
 func (d *Detector) Check() Status {
-	// Fast path: return cached result if still valid
-	d.mu.RLock()
-	if d.status != StatusUnknown && time.Since(d.checkedAt) <= d.cacheTTL {
-		status := d.status
-		d.mu.RUnlock()
+	if status, ok := d.cachedStatus(time.Now()); ok {
 		return status
 	}
-	d.mu.RUnlock()
 
-	// Slow path: perform detection
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Only one goroutine should run cass health at a time, but status readers
+	// must stay independent so UI and search paths do not block behind it.
+	d.checkMu.Lock()
+	defer d.checkMu.Unlock()
 
-	// Double-check after acquiring write lock
-	if d.status != StatusUnknown && time.Since(d.checkedAt) <= d.cacheTTL {
-		return d.status
+	if status, ok := d.cachedStatus(time.Now()); ok {
+		return status
 	}
 
-	d.status = d.detect()
+	status := d.detect()
+
+	d.mu.Lock()
+	d.status = status
 	d.checkedAt = time.Now()
-	return d.status
+	d.mu.Unlock()
+
+	return status
 }
 
 // Invalidate clears the cached status, forcing a fresh check on next Check() call.
@@ -156,19 +150,24 @@ func (d *Detector) Invalidate() {
 }
 
 // detect performs the actual detection logic.
-// Caller must hold d.mu (write lock) to safely update status with the result.
 func (d *Detector) detect() Status {
+	d.mu.RLock()
+	lookPath := d.lookPath
+	runCommand := d.runCommand
+	healthTimeout := d.healthTimeout
+	d.mu.RUnlock()
+
 	// Step 1: Check if cass binary exists in PATH
-	_, err := d.lookPath("cass")
+	_, err := lookPath("cass")
 	if err != nil {
 		return StatusNotInstalled
 	}
 
 	// Step 2: Run health check with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), d.healthTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), healthTimeout)
 	defer cancel()
 
-	exitCode, err := d.runCommand(ctx, "cass", "health")
+	exitCode, err := runCommand(ctx, "cass", "health")
 	if err != nil {
 		// Command failed to run (timeout, not found, etc.)
 		return StatusNotInstalled
@@ -211,7 +210,19 @@ func (d *Detector) CheckedAt() time.Time {
 
 // CacheValid returns true if the cached result is still valid.
 func (d *Detector) CacheValid() bool {
+	_, ok := d.cachedStatus(time.Now())
+	return ok
+}
+
+func (d *Detector) cachedStatus(now time.Time) (Status, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.status != StatusUnknown && time.Since(d.checkedAt) <= d.cacheTTL
+
+	if d.status == StatusUnknown {
+		return StatusUnknown, false
+	}
+	if now.Sub(d.checkedAt) > d.cacheTTL {
+		return StatusUnknown, false
+	}
+	return d.status, true
 }

@@ -1,6 +1,8 @@
 package export
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +10,13 @@ import (
 	"testing"
 	"time"
 )
+
+func requireCurl(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not installed")
+	}
+}
 
 func TestParseWranglerWhoami(t *testing.T) {
 	tests := []struct {
@@ -195,6 +204,21 @@ func TestSuggestProjectName(t *testing.T) {
 			bundlePath: "/path/to/my---project",
 			want:       "my-project",
 		},
+		{
+			name:       "punctuation only falls back",
+			bundlePath: "/path/to/!!!",
+			want:       "beads-viewer-pages",
+		},
+		{
+			name:       "root path falls back",
+			bundlePath: string(filepath.Separator),
+			want:       "beads-viewer-pages",
+		},
+		{
+			name:       "generic output at filesystem root falls back",
+			bundlePath: string(filepath.Separator) + "dist",
+			want:       "beads-viewer-pages",
+		},
 	}
 
 	for _, tc := range tests {
@@ -222,12 +246,18 @@ func TestGenerateHeadersFile(t *testing.T) {
 	}
 
 	content := string(data)
+	if strings.Contains(content, "\t") {
+		t.Fatal("_headers should use spaces for Cloudflare header indentation, not tabs")
+	}
 
 	// Check for expected security headers
 	expectedHeaders := []string{
 		"X-Frame-Options: DENY",
 		"X-Content-Type-Options: nosniff",
 		"Referrer-Policy: strict-origin-when-cross-origin",
+		"Cross-Origin-Opener-Policy: same-origin",
+		"Cross-Origin-Embedder-Policy: require-corp",
+		"Cross-Origin-Resource-Policy: same-origin",
 		"Content-Type: application/javascript",
 		"Content-Type: application/wasm",
 	}
@@ -330,12 +360,58 @@ func TestCreateCloudflareProject_Signature(t *testing.T) {
 	var _ func(string, string) error = CreateCloudflareProject
 }
 
-func TestVerifyCloudflareDeployment_Timeout(t *testing.T) {
-	// Test that verification handles unreachable URLs gracefully
-	// Use a non-routable IP to ensure quick timeout
-	err := VerifyCloudflareDeployment("http://192.0.2.1/", 100, 1*time.Second)
-	// Should not return error (warnings are printed but function succeeds)
-	if err != nil {
-		t.Errorf("VerifyCloudflareDeployment should not error on unreachable URL, got: %v", err)
+func TestVerifyCloudflareDeployment_IssueCountMismatchReturnsError(t *testing.T) {
+	requireCurl(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issue_count": 1}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	err := VerifyCloudflareDeployment(server.URL, 2, time.Second)
+	if err == nil {
+		t.Fatal("Expected VerifyCloudflareDeployment to fail on stale issue count")
+	}
+	if !strings.Contains(err.Error(), "issue count mismatch") {
+		t.Fatalf("Unexpected verification error: %v", err)
+	}
+}
+
+func TestVerifyCloudflareDeployment_ZeroIssueCountMismatchReturnsError(t *testing.T) {
+	requireCurl(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issue_count": 1}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	err := VerifyCloudflareDeployment(server.URL, 0, time.Second)
+	if err == nil {
+		t.Fatal("Expected VerifyCloudflareDeployment to fail when empty export verifies against stale live data")
+	}
+	if !strings.Contains(err.Error(), "issue count mismatch") {
+		t.Fatalf("Unexpected verification error: %v", err)
+	}
+}
+
+func TestVerifyCloudflareDeployment_Success(t *testing.T) {
+	requireCurl(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issue_count": 2}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	if err := VerifyCloudflareDeployment(server.URL, 2, time.Second); err != nil {
+		t.Fatalf("VerifyCloudflareDeployment returned error: %v", err)
 	}
 }

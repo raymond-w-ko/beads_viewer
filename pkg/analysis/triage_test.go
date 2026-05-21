@@ -828,6 +828,9 @@ func TestGenerateTriageReasons_EmptyContext(t *testing.T) {
 
 func TestGenerateTriageReasons_UnblockCascade(t *testing.T) {
 	ctx := TriageReasonContext{
+		Issue: &model.Issue{
+			Status: model.StatusOpen,
+		},
 		UnblocksIDs: []string{"bv-1", "bv-2", "bv-3", "bv-4", "bv-5"},
 	}
 	reasons := GenerateTriageReasons(ctx)
@@ -924,8 +927,11 @@ func TestGenerateTriageReasons_QuickWin(t *testing.T) {
 }
 
 func TestGenerateTriageReasons_ClaimStatus(t *testing.T) {
-	// Unclaimed
+	// Unclaimed — requires positive evidence the issue is Open (#149 fix).
 	ctx := TriageReasonContext{
+		Issue: &model.Issue{
+			Status: model.StatusOpen,
+		},
 		ClaimedByAgent: "",
 	}
 	reasons := GenerateTriageReasons(ctx)
@@ -938,11 +944,14 @@ func TestGenerateTriageReasons_ClaimStatus(t *testing.T) {
 		}
 	}
 	if !foundUnclaimed {
-		t.Error("expected reason about being unclaimed")
+		t.Error("expected reason about being unclaimed on Open issue")
 	}
 
-	// Claimed
+	// Open + claimed
 	ctx2 := TriageReasonContext{
+		Issue: &model.Issue{
+			Status: model.StatusOpen,
+		},
 		ClaimedByAgent: "OtherAgent",
 	}
 	reasons2 := GenerateTriageReasons(ctx2)
@@ -956,6 +965,50 @@ func TestGenerateTriageReasons_ClaimStatus(t *testing.T) {
 	}
 	if !foundClaimed {
 		t.Error("expected reason about being claimed by OtherAgent")
+	}
+
+	// Nil-issue defensive contract (#149): with no issue record we must
+	// stay silent on claim status rather than guess "unclaimed". The
+	// previous behavior happily emitted the unclaimed hint with no
+	// context, which (under stale snapshot conditions) was the most
+	// plausible source of the IN_PROGRESS + "currently unclaimed"
+	// contradiction the user reported.
+	ctxNil := TriageReasonContext{ClaimedByAgent: ""}
+	reasonsNil := GenerateTriageReasons(ctxNil)
+	for _, r := range reasonsNil.All {
+		if contains(r, "unclaimed") {
+			t.Fatalf("nil-issue context must not emit unclaimed hint; got: %v", reasonsNil.All)
+		}
+	}
+
+	// Custom non-enum status: the #149 fix tightens the unclaimed hint
+	// to require positive Open, but the "Status is X - not ready to
+	// claim" message must still fire for any non-empty unrecognized
+	// status. Silencing it would be a regression for projects that
+	// use custom Status values like "in_review" or "needs_approval".
+	ctxCustom := TriageReasonContext{
+		Issue: &model.Issue{
+			Status: model.Status("needs_approval"),
+		},
+	}
+	reasonsCustom := GenerateTriageReasons(ctxCustom)
+	foundStatusMessage := false
+	for _, r := range reasonsCustom.All {
+		if contains(r, "needs_approval") {
+			foundStatusMessage = true
+			break
+		}
+	}
+	if !foundStatusMessage {
+		t.Fatalf(
+			"custom Status value must surface as \"Status is needs_approval\" reason; got: %v",
+			reasonsCustom.All,
+		)
+	}
+	for _, r := range reasonsCustom.All {
+		if contains(r, "unclaimed") {
+			t.Fatalf("custom-status issue must not be described as unclaimed; got: %v", reasonsCustom.All)
+		}
 	}
 
 	// In progress should not be described as unclaimed.
@@ -980,6 +1033,23 @@ func TestGenerateTriageReasons_ClaimStatus(t *testing.T) {
 	}
 	if !foundInProgress {
 		t.Fatalf("expected in-progress reason, got: %v", reasons3.All)
+	}
+
+	// Blocked and assigned should never be described as unclaimed/available.
+	ctx4 := TriageReasonContext{
+		Issue: &model.Issue{
+			Status: model.StatusBlocked,
+		},
+		ClaimedByAgent: "CoralBeaver",
+	}
+	reasons4 := GenerateTriageReasons(ctx4)
+	for _, r := range reasons4.All {
+		if contains(r, "unclaimed") || contains(r, "available for work") {
+			t.Fatalf("did not expect blocked assigned issue to be described as claimable; reasons=%v", reasons4.All)
+		}
+	}
+	if !contains(reasons4.ActionHint, "CoralBeaver") {
+		t.Fatalf("expected action hint to point at assignee/blocker resolution, got %q", reasons4.ActionHint)
 	}
 }
 
@@ -1208,8 +1278,14 @@ func TestTriageGroupByTrack_SingleTrack(t *testing.T) {
 	totalRecs := 0
 	for _, g := range triage.RecommendationsByTrack {
 		totalRecs += len(g.Recommendations)
-		// Each non-empty track should have a top pick
-		if len(g.Recommendations) > 0 && g.TopPick == nil {
+		hasClaimableRec := false
+		for _, rec := range g.Recommendations {
+			if isClaimableRecommendation(rec) {
+				hasClaimableRec = true
+				break
+			}
+		}
+		if hasClaimableRec && g.TopPick == nil {
 			t.Errorf("track %s missing top pick", g.TrackID)
 		}
 	}
@@ -1371,6 +1447,9 @@ func TestTriageGroupByTrack_TopPickHasHighestScore(t *testing.T) {
 		}
 		// Top pick should have the highest score in the group
 		for _, rec := range g.Recommendations {
+			if !isClaimableRecommendation(rec) {
+				continue
+			}
 			if rec.Score > g.TopPick.Score {
 				t.Errorf("track %s: recommendation %s has higher score (%.4f) than top pick %s (%.4f)",
 					g.TrackID, rec.ID, rec.Score, g.TopPick.ID, g.TopPick.Score)
@@ -1489,6 +1568,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 		{
 			ID:          "blocked-high-score",
 			Title:       "Blocked but high score",
+			Status:      string(model.StatusOpen),
 			Score:       100.0,
 			BlockedBy:   []string{"blocker-1"},
 			UnblocksIDs: []string{},
@@ -1496,6 +1576,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 		{
 			ID:          "actionable-1",
 			Title:       "Actionable item 1",
+			Status:      string(model.StatusOpen),
 			Score:       80.0,
 			BlockedBy:   nil, // Not blocked
 			UnblocksIDs: []string{"downstream-1"},
@@ -1503,6 +1584,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 		{
 			ID:          "blocked-medium-score",
 			Title:       "Another blocked item",
+			Status:      string(model.StatusOpen),
 			Score:       70.0,
 			BlockedBy:   []string{"blocker-2", "blocker-3"},
 			UnblocksIDs: []string{},
@@ -1510,6 +1592,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 		{
 			ID:          "actionable-2",
 			Title:       "Actionable item 2",
+			Status:      string(model.StatusOpen),
 			Score:       60.0,
 			BlockedBy:   []string{}, // Empty slice = not blocked
 			UnblocksIDs: []string{},
@@ -1517,6 +1600,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 		{
 			ID:          "actionable-3",
 			Title:       "Actionable item 3",
+			Status:      string(model.StatusOpen),
 			Score:       50.0,
 			BlockedBy:   nil,
 			UnblocksIDs: []string{"downstream-2", "downstream-3"},
@@ -1624,14 +1708,64 @@ func TestComputeTriage_TopPicksReachActionableBeyondTopN(t *testing.T) {
 	}
 }
 
+func TestComputeTriage_BlockedAssignedHighPriorityNotClaimTarget(t *testing.T) {
+	now := time.Date(2026, 5, 5, 15, 30, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "blocked-owned",
+			Title:     "Blocked owned but important",
+			Status:    model.StatusBlocked,
+			Assignee:  "CoralBeaver",
+			Priority:  0,
+			IssueType: model.TypeBug,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "ready-open",
+			Title:     "Ready open work",
+			Status:    model.StatusOpen,
+			Priority:  4,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+	if len(triage.QuickRef.TopPicks) == 0 {
+		t.Fatal("expected a claimable top pick")
+	}
+	if triage.QuickRef.TopPicks[0].ID != "ready-open" {
+		t.Fatalf("expected robot top pick to skip blocked assigned work and choose ready-open, got %q", triage.QuickRef.TopPicks[0].ID)
+	}
+
+	var blockedRec *Recommendation
+	for i := range triage.Recommendations {
+		if triage.Recommendations[i].ID == "blocked-owned" {
+			blockedRec = &triage.Recommendations[i]
+			break
+		}
+	}
+	if blockedRec == nil {
+		t.Fatal("expected blocked-owned to remain present as an important recommendation")
+	}
+	if blockedRec.Action == "Start work on this issue" {
+		t.Fatalf("blocked assigned work must not get a start-work action: %#v", blockedRec)
+	}
+	for _, reason := range blockedRec.Reasons {
+		if contains(reason, "unclaimed") || contains(reason, "available for work") {
+			t.Fatalf("blocked assigned work must not be described as unclaimed/available: %v", blockedRec.Reasons)
+		}
+	}
+}
+
 // TestBuildTopPicks_LimitRespected verifies the limit is respected when filtering.
 func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	recommendations := []Recommendation{
-		{ID: "a1", Title: "Actionable 1", Score: 100.0},
-		{ID: "a2", Title: "Actionable 2", Score: 90.0},
-		{ID: "a3", Title: "Actionable 3", Score: 80.0},
-		{ID: "a4", Title: "Actionable 4", Score: 70.0},
-		{ID: "a5", Title: "Actionable 5", Score: 60.0},
+		{ID: "a1", Title: "Actionable 1", Status: string(model.StatusOpen), Score: 100.0},
+		{ID: "a2", Title: "Actionable 2", Status: string(model.StatusOpen), Score: 90.0},
+		{ID: "a3", Title: "Actionable 3", Status: string(model.StatusOpen), Score: 80.0},
+		{ID: "a4", Title: "Actionable 4", Status: string(model.StatusOpen), Score: 70.0},
+		{ID: "a5", Title: "Actionable 5", Status: string(model.StatusOpen), Score: 60.0},
 	}
 
 	// Limit of 2
@@ -1649,13 +1783,46 @@ func TestBuildTopPicks_LimitRespected(t *testing.T) {
 // TestBuildTopPicks_AllBlocked verifies empty result when all items are blocked.
 func TestBuildTopPicks_AllBlocked(t *testing.T) {
 	recommendations := []Recommendation{
-		{ID: "b1", Title: "Blocked 1", Score: 100.0, BlockedBy: []string{"x"}},
-		{ID: "b2", Title: "Blocked 2", Score: 90.0, BlockedBy: []string{"y"}},
+		{ID: "b1", Title: "Blocked 1", Status: string(model.StatusOpen), Score: 100.0, BlockedBy: []string{"x"}},
+		{ID: "b2", Title: "Blocked 2", Status: string(model.StatusOpen), Score: 90.0, BlockedBy: []string{"y"}},
 	}
 
 	picks := buildTopPicks(recommendations, 10)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
+	}
+}
+
+func TestBuildTopPicks_SkipsBlockedStatusAndAssigned(t *testing.T) {
+	recommendations := []Recommendation{
+		{
+			ID:       "blocked-status",
+			Title:    "Blocked status",
+			Status:   string(model.StatusBlocked),
+			Assignee: "CoralBeaver",
+			Score:    100.0,
+		},
+		{
+			ID:       "assigned-open",
+			Title:    "Assigned open",
+			Status:   string(model.StatusOpen),
+			Assignee: "MistyBay",
+			Score:    90.0,
+		},
+		{
+			ID:     "ready-open",
+			Title:  "Ready open",
+			Status: string(model.StatusOpen),
+			Score:  10.0,
+		},
+	}
+
+	picks := buildTopPicks(recommendations, 3)
+	if len(picks) != 1 {
+		t.Fatalf("expected only the claimable open issue, got %d picks: %#v", len(picks), picks)
+	}
+	if picks[0].ID != "ready-open" {
+		t.Fatalf("expected ready-open top pick, got %q", picks[0].ID)
 	}
 }
 

@@ -19,21 +19,23 @@ type robotSearchResult struct {
 }
 
 type robotSearchOutput struct {
-	GeneratedAt string                `json:"generated_at"`
-	DataHash    string                `json:"data_hash"`
-	Query       string                `json:"query"`
-	Provider    search.Provider       `json:"provider"`
-	Model       string                `json:"model,omitempty"`
-	Dim         int                   `json:"dim"`
-	IndexPath   string                `json:"index_path"`
-	Index       search.IndexSyncStats `json:"index"`
-	Loaded      bool                  `json:"loaded"`
-	Limit       int                   `json:"limit"`
-	Mode        search.SearchMode     `json:"mode"`
-	Preset      search.PresetName     `json:"preset,omitempty"`
-	Weights     *search.Weights       `json:"weights,omitempty"`
-	Results     []robotSearchResult   `json:"results"`
-	UsageHints  []string              `json:"usage_hints,omitempty"`
+	GeneratedAt  string                `json:"generated_at"`
+	DataHash     string                `json:"data_hash"`
+	OutputFormat string                `json:"output_format,omitempty"`
+	Version      string                `json:"version,omitempty"`
+	Query        string                `json:"query"`
+	Provider     search.Provider       `json:"provider"`
+	Model        string                `json:"model,omitempty"`
+	Dim          int                   `json:"dim"`
+	IndexPath    string                `json:"index_path"`
+	Index        search.IndexSyncStats `json:"index"`
+	Loaded       bool                  `json:"loaded"`
+	Limit        int                   `json:"limit"`
+	Mode         search.SearchMode     `json:"mode"`
+	Preset       search.PresetName     `json:"preset,omitempty"`
+	Weights      *search.Weights       `json:"weights,omitempty"`
+	Results      []robotSearchResult   `json:"results"`
+	UsageHints   []string              `json:"usage_hints,omitempty"`
 }
 
 func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {

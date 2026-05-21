@@ -11,7 +11,7 @@ import (
 
 func TestRelease_FindPlatformAsset(t *testing.T) {
 	rel := &Release{TagName: "v1.2.3"}
-	target := getAssetName(rel.TagName)
+	target := stableAssetName()
 	rel.Assets = []Asset{
 		{Name: "other.tar.gz"},
 		{Name: target, BrowserDownloadURL: "http://example.com/bv.tgz"},
@@ -23,6 +23,64 @@ func TestRelease_FindPlatformAsset(t *testing.T) {
 	}
 	if asset.Name != target {
 		t.Fatalf("expected %q, got %q", target, asset.Name)
+	}
+}
+
+func TestRelease_FindPlatformAsset_LegacyVersionedFallback(t *testing.T) {
+	rel := &Release{TagName: "v1.2.3"}
+	legacyTarget := getAssetName(rel.TagName)
+	rel.Assets = []Asset{
+		{Name: "other.tar.gz"},
+		{Name: legacyTarget, BrowserDownloadURL: "http://example.com/bv.tgz"},
+	}
+
+	asset := rel.FindPlatformAsset()
+	if asset == nil {
+		t.Fatalf("expected legacy platform asset %q", legacyTarget)
+	}
+	if asset.Name != legacyTarget {
+		t.Fatalf("expected %q, got %q", legacyTarget, asset.Name)
+	}
+}
+
+func TestRelease_FindPlatformAssetWithChecksumFallsBackToCheckedLegacyName(t *testing.T) {
+	rel := &Release{TagName: "v1.2.3"}
+	stableTarget := stableAssetName()
+	legacyTarget := getAssetName(rel.TagName)
+	rel.Assets = []Asset{
+		{Name: stableTarget, BrowserDownloadURL: "http://example.com/stable"},
+		{Name: legacyTarget, BrowserDownloadURL: "http://example.com/legacy"},
+	}
+
+	asset := rel.findPlatformAssetWithChecksum(map[string]string{
+		legacyTarget: "hash",
+	})
+	if asset == nil {
+		t.Fatalf("expected checked legacy asset %q", legacyTarget)
+	}
+	if asset.Name != legacyTarget {
+		t.Fatalf("expected %q, got %q", legacyTarget, asset.Name)
+	}
+}
+
+func TestRelease_FindPlatformAssetWithChecksumPrefersCheckedStableName(t *testing.T) {
+	rel := &Release{TagName: "v1.2.3"}
+	stableTarget := stableAssetName()
+	legacyTarget := getAssetName(rel.TagName)
+	rel.Assets = []Asset{
+		{Name: legacyTarget, BrowserDownloadURL: "http://example.com/legacy"},
+		{Name: stableTarget, BrowserDownloadURL: "http://example.com/stable"},
+	}
+
+	asset := rel.findPlatformAssetWithChecksum(map[string]string{
+		stableTarget: "hash",
+		legacyTarget: "hash",
+	})
+	if asset == nil {
+		t.Fatalf("expected checked stable asset %q", stableTarget)
+	}
+	if asset.Name != stableTarget {
+		t.Fatalf("expected %q, got %q", stableTarget, asset.Name)
 	}
 }
 
@@ -41,9 +99,18 @@ func TestRelease_FindChecksumAsset(t *testing.T) {
 
 func TestGetAssetName_UsesRuntimeAndTrimsV(t *testing.T) {
 	name := getAssetName("v9.8.7")
-	want := "bv_9.8.7_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz"
+	want := "bv_9.8.7_" + runtime.GOOS + "_" + runtime.GOARCH + platformArchiveExtension(runtime.GOOS)
 	if name != want {
 		t.Fatalf("getAssetName mismatch: got %q want %q", name, want)
+	}
+}
+
+func TestPlatformArchiveExtension(t *testing.T) {
+	if got := platformArchiveExtension("windows"); got != ".zip" {
+		t.Fatalf("windows extension=%q, want .zip", got)
+	}
+	if got := platformArchiveExtension("linux"); got != ".tar.gz" {
+		t.Fatalf("linux extension=%q, want .tar.gz", got)
 	}
 }
 
@@ -88,6 +155,45 @@ func TestParseChecksums_FilenamesWithSpaces(t *testing.T) {
 	}
 	if got := m["bv 1.0.0 windows amd64.tar.gz"]; got != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("unexpected checksum for spaced filename: %q", got)
+	}
+}
+
+func TestParseChecksums_NormalizesUppercaseAndSkipsInvalidHashes(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "checksums.txt")
+
+	content := "" +
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  bv_1.0.0_linux_amd64.tar.gz\n" +
+		"not-a-sha256  ignored.tar.gz\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write checksums: %v", err)
+	}
+
+	m, err := parseChecksums(path)
+	if err != nil {
+		t.Fatalf("parseChecksums failed: %v", err)
+	}
+	if len(m) != 1 {
+		t.Fatalf("expected one valid checksum, got %d: %#v", len(m), m)
+	}
+	if got := m["bv_1.0.0_linux_amd64.tar.gz"]; got != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("unexpected normalized checksum: %q", got)
+	}
+}
+
+func TestParseChecksums_RejectsDuplicateFilename(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "checksums.txt")
+
+	content := "" +
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bv.tar.gz\n" +
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  bv.tar.gz\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write checksums: %v", err)
+	}
+
+	if _, err := parseChecksums(path); err == nil {
+		t.Fatalf("expected duplicate checksum entry error")
 	}
 }
 

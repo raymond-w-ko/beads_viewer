@@ -223,26 +223,36 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 		if g.TrackID == "" {
 			t.Fatalf("track group missing track_id")
 		}
-		if g.TopPick == nil || g.TopPick.ID == "" {
-			t.Fatalf("track group %q missing top_pick", g.TrackID)
+		topID := ""
+		if g.TopPick != nil {
+			topID = g.TopPick.ID
 		}
 		byID[g.TrackID] = struct {
 			topID string
 			claim string
-		}{topID: g.TopPick.ID, claim: g.ClaimCommand}
+		}{topID: topID, claim: g.ClaimCommand}
 	}
 
-	for _, want := range []string{"track-A", "track-B"} {
-		g, ok := byID[want]
-		if !ok {
-			t.Fatalf("missing track group %q", want)
-		}
-		if g.topID == "" {
-			t.Fatalf("track group %q missing top_pick.id", want)
-		}
-		if g.claim == "" {
-			t.Fatalf("track group %q missing claim_command", want)
-		}
+	rootTrack, ok := byID["track-A"]
+	if !ok {
+		t.Fatalf("missing track group %q", "track-A")
+	}
+	if rootTrack.topID == "" {
+		t.Fatalf("track group %q missing top_pick.id", "track-A")
+	}
+	if rootTrack.claim == "" {
+		t.Fatalf("track group %q missing claim_command", "track-A")
+	}
+
+	blockedTrack, ok := byID["track-B"]
+	if !ok {
+		t.Fatalf("missing track group %q", "track-B")
+	}
+	if blockedTrack.topID != "" {
+		t.Fatalf("blocked track %q should not expose claimable top_pick, got %q", "track-B", blockedTrack.topID)
+	}
+	if blockedTrack.claim != "" {
+		t.Fatalf("blocked track %q should not expose claim_command, got %q", "track-B", blockedTrack.claim)
 	}
 }
 

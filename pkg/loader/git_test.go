@@ -165,11 +165,11 @@ func TestGitLoader_ResolveRevision_DateString(t *testing.T) {
 
 	loader := NewGitLoader(repoDir)
 
-	// Get author date of the first commit (HEAD~1) and ensure date resolution returns that SHA
-	dateStr := runGitOutput(t, repoDir, "log", "--format=%aI", "-n1", "HEAD~1")
+	// Get commit date of the first commit (HEAD~1) and ensure date resolution returns that SHA.
+	dateStr := runGitOutput(t, repoDir, "log", "--format=%cI", "-n1", "HEAD~1")
 	dateStr = strings.TrimSpace(dateStr)
 	if dateStr == "" {
-		t.Fatalf("expected non-empty author date")
+		t.Fatalf("expected non-empty commit date")
 	}
 
 	expectedSHA := strings.TrimSpace(runGitOutput(t, repoDir, "rev-parse", "HEAD~1"))
@@ -181,6 +181,51 @@ func TestGitLoader_ResolveRevision_DateString(t *testing.T) {
 
 	if sha != expectedSHA {
 		t.Fatalf("expected SHA %s for date %s, got %s", expectedSHA, dateStr, sha)
+	}
+}
+
+func TestGitLoader_LoadAtDateUsesCommitHistory(t *testing.T) {
+	repoDir, cleanup := setupTestGitRepo(t)
+	defer cleanup()
+
+	loader := NewGitLoader(repoDir)
+
+	headDate := strings.TrimSpace(runGitOutput(t, repoDir, "log", "--format=%cI", "-n1", "HEAD"))
+	if headDate == "" {
+		t.Fatalf("expected non-empty HEAD commit date")
+	}
+	headTime, err := time.Parse(time.RFC3339, headDate)
+	if err != nil {
+		t.Fatalf("parse HEAD commit date: %v", err)
+	}
+
+	issues, err := loader.LoadAtDate(headTime.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("LoadAtDate after HEAD commit failed: %v", err)
+	}
+
+	if len(issues) != 3 {
+		t.Fatalf("expected 3 issues after HEAD commit date, got %d", len(issues))
+	}
+}
+
+func TestGitLoader_ResolveRevision_DateBeforeHistory(t *testing.T) {
+	repoDir, cleanup := setupTestGitRepo(t)
+	defer cleanup()
+
+	loader := NewGitLoader(repoDir)
+	firstDate := strings.TrimSpace(runGitOutput(t, repoDir, "log", "--format=%cI", "-n1", "HEAD~1"))
+	if firstDate == "" {
+		t.Fatalf("expected non-empty first commit date")
+	}
+	firstTime, err := time.Parse(time.RFC3339, firstDate)
+	if err != nil {
+		t.Fatalf("parse first commit date: %v", err)
+	}
+
+	_, err = loader.ResolveRevision(firstTime.Add(-time.Hour).Format(time.RFC3339))
+	if err == nil {
+		t.Fatalf("expected error resolving date before repository history")
 	}
 }
 

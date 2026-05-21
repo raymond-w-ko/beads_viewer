@@ -2,6 +2,9 @@ package datasource
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -16,6 +19,12 @@ import (
 // Falls back to legacy JSONL-only loading via loader.LoadIssues if smart
 // detection finds no valid sources.
 func LoadIssues(repoPath string) ([]model.Issue, error) {
+	if source, ok, err := ExplicitBeadsDBSource(); err != nil {
+		return nil, err
+	} else if ok {
+		return LoadFromSource(source)
+	}
+
 	beadsDir, err := loader.GetBeadsDir(repoPath)
 	if err != nil {
 		return nil, err
@@ -44,6 +53,59 @@ func LoadIssuesFromDir(beadsDir string) ([]model.Issue, error) {
 		return nil, err
 	}
 	return loader.LoadIssuesFromFile(jsonlPath)
+}
+
+// ExplicitBeadsDBSource returns the direct source named by BEADS_DB when it
+// points at a concrete source file. Directory values return ok=false so callers
+// can use normal source discovery within that directory.
+func ExplicitBeadsDBSource() (DataSource, bool, error) {
+	return SourceFromFile(os.Getenv(loader.BeadsDBEnvVar))
+}
+
+// SourceFromFile returns a DataSource for a concrete source file path. Directory
+// paths and empty values return ok=false so callers can fall back to discovery.
+func SourceFromFile(dbPath string) (DataSource, bool, error) {
+	if strings.TrimSpace(dbPath) == "" {
+		return DataSource{}, false, nil
+	}
+
+	info, err := os.Stat(dbPath)
+	if err == nil && info.IsDir() {
+		return DataSource{}, false, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return DataSource{}, true, fmt.Errorf("stat %s: %w", dbPath, err)
+	}
+
+	sourceType, priority, ok := explicitBeadsDBFileType(dbPath)
+	if !ok {
+		if err == nil {
+			return DataSource{}, true, fmt.Errorf("unsupported BEADS_DB file type: %s", dbPath)
+		}
+		return DataSource{}, false, nil
+	}
+
+	source := DataSource{
+		Type:     sourceType,
+		Path:     dbPath,
+		Priority: priority,
+	}
+	if err == nil {
+		source.ModTime = info.ModTime()
+		source.Size = info.Size()
+	}
+	return source, true, nil
+}
+
+func explicitBeadsDBFileType(dbPath string) (SourceType, int, bool) {
+	switch strings.ToLower(filepath.Ext(dbPath)) {
+	case ".db", ".sqlite", ".sqlite3":
+		return SourceTypeSQLite, PrioritySQLite, true
+	case ".jsonl":
+		return SourceTypeJSONLLocal, PriorityJSONLLocal, true
+	default:
+		return "", 0, false
+	}
 }
 
 // loadSmart discovers sources, validates, selects the best, and loads from it.

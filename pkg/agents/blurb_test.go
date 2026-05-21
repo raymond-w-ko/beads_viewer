@@ -132,6 +132,59 @@ func TestRemoveBlurb(t *testing.T) {
 	}
 }
 
+func TestRemoveBlurbPreservesSurroundingLineBreak(t *testing.T) {
+	content := "# My AGENTS.md\n\nBefore blurb.\n\n" +
+		"<!-- bv-agent-instructions-v1 -->\nGenerated content\n<!-- end-bv-agent-instructions -->\n\n" +
+		"After blurb.\n"
+
+	result := RemoveBlurb(content)
+	expected := "# My AGENTS.md\n\nBefore blurb.\nAfter blurb.\n"
+	if result != expected {
+		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	}
+}
+
+func TestRemoveBlurbUsesEndMarkerAfterStartMarker(t *testing.T) {
+	content := "# My AGENTS.md\n\n" +
+		"Example marker that is not an injected blurb:\n" +
+		BlurbEndMarker + "\n\n" +
+		"Before blurb.\n\n" +
+		"<!-- bv-agent-instructions-v1 -->\nGenerated content\n" +
+		BlurbEndMarker + "\n\n" +
+		"After blurb.\n"
+
+	result := RemoveBlurb(content)
+	expected := "# My AGENTS.md\n\n" +
+		"Example marker that is not an injected blurb:\n" +
+		BlurbEndMarker + "\n\n" +
+		"Before blurb.\nAfter blurb.\n"
+	if result != expected {
+		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	}
+}
+
+func TestRemoveBlurbPreservesCRLFSeparator(t *testing.T) {
+	content := "# My AGENTS.md\r\n\r\nBefore blurb.\r\n\r\n" +
+		"<!-- bv-agent-instructions-v1 -->\r\nGenerated content\r\n<!-- end-bv-agent-instructions -->\r\n\r\n" +
+		"After blurb.\r\n"
+
+	result := RemoveBlurb(content)
+	expected := "# My AGENTS.md\r\n\r\nBefore blurb.\r\nAfter blurb.\r\n"
+	if result != expected {
+		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	}
+}
+
+func TestRemoveBlurbInlineMarkersDoNotAddSeparator(t *testing.T) {
+	content := "before<!-- bv-agent-instructions-v1 -->generated<!-- end-bv-agent-instructions -->after"
+
+	result := RemoveBlurb(content)
+	expected := "beforeafter"
+	if result != expected {
+		t.Fatalf("RemoveBlurb() = %q, want %q", result, expected)
+	}
+}
+
 func TestRemoveBlurbNoBlurb(t *testing.T) {
 	content := "# My AGENTS.md\n\nNo blurb here."
 	result := RemoveBlurb(content)

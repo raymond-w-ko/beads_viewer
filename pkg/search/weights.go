@@ -28,9 +28,8 @@ type Weights struct {
 // Validate checks that weights are valid (non-negative, sum to ~1.0).
 // It logs a warning when text relevance is very low.
 func (w Weights) Validate() error {
-	if w.TextRelevance < 0 || w.PageRank < 0 || w.Status < 0 ||
-		w.Impact < 0 || w.Priority < 0 || w.Recency < 0 {
-		return fmt.Errorf("weights must be non-negative")
+	if err := w.validateComponents(); err != nil {
+		return err
 	}
 
 	if w.TextRelevance < 0.1 {
@@ -38,10 +37,36 @@ func (w Weights) Validate() error {
 	}
 
 	sum := w.sum()
+	if math.IsNaN(sum) || math.IsInf(sum, 0) {
+		return fmt.Errorf("weights sum must be finite")
+	}
 	if math.Abs(sum-1.0) > weightSumTolerance {
 		return fmt.Errorf("weights must sum to 1.0, got %.3f", sum)
 	}
 
+	return nil
+}
+
+func (w Weights) validateComponents() error {
+	components := []struct {
+		name  string
+		value float64
+	}{
+		{"text", w.TextRelevance},
+		{"pagerank", w.PageRank},
+		{"status", w.Status},
+		{"impact", w.Impact},
+		{"priority", w.Priority},
+		{"recency", w.Recency},
+	}
+	for _, component := range components {
+		if math.IsNaN(component.value) || math.IsInf(component.value, 0) {
+			return fmt.Errorf("weight %q must be finite", component.name)
+		}
+		if component.value < 0 {
+			return fmt.Errorf("weights must be non-negative")
+		}
+	}
 	return nil
 }
 

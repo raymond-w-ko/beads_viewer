@@ -356,6 +356,21 @@ func TestCorrelationRobotOrphans(t *testing.T) {
 	}
 }
 
+func TestCorrelationRobotImpactNetworkMissingBeadFails(t *testing.T) {
+	bv := buildBvBinary(t)
+	repoDir := createCorrelationRepo(t)
+
+	cmd := exec.Command(bv, "robot-impact-network", "definitely-missing", "--json")
+	cmd.Dir = repoDir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected robot-impact-network to fail for missing bead, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "Bead not found in network: definitely-missing") {
+		t.Fatalf("expected missing bead error, got:\n%s", out)
+	}
+}
+
 // TestCorrelationConfidenceLevels verifies different correlation methods produce appropriate confidence.
 func TestCorrelationConfidenceLevels(t *testing.T) {
 	bv := buildBvBinary(t)

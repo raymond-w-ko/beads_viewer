@@ -139,6 +139,7 @@ func TestSaveAndLoadWizardConfig(t *testing.T) {
 		IncludeClosed:  true,
 		IncludeHistory: true,
 		Title:          "Saved Title",
+		SourcePath:     filepath.Join(tmpDir, ".beads", "selected.jsonl"),
 		DeployTarget:   "github",
 		RepoName:       "saved-repo",
 		RepoPrivate:    true,
@@ -163,6 +164,41 @@ func TestSaveAndLoadWizardConfig(t *testing.T) {
 	}
 	if loaded.DeployTarget != "github" {
 		t.Fatalf("Expected loaded DeployTarget %q, got %q", "github", loaded.DeployTarget)
+	}
+	if loaded.SourcePath != config.SourcePath {
+		t.Fatalf("Expected loaded SourcePath %q, got %q", config.SourcePath, loaded.SourcePath)
+	}
+}
+
+func TestSaveWizardConfigRejectsNil(t *testing.T) {
+	if err := SaveWizardConfig(nil); err == nil {
+		t.Fatal("Expected SaveWizardConfig to reject nil config")
+	}
+}
+
+func TestSaveWizardConfigCleansTempOnReplaceFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	configPath := WizardConfigPath()
+	if configPath == "" {
+		t.Skip("WizardConfigPath returned empty path")
+	}
+	if err := os.MkdirAll(configPath, 0755); err != nil {
+		t.Fatalf("MkdirAll destination directory: %v", err)
+	}
+
+	err := SaveWizardConfig(&WizardConfig{Title: "Cannot Replace Directory"})
+	if err == nil {
+		t.Fatal("Expected SaveWizardConfig to fail when destination is a directory")
+	}
+
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(configPath), filepath.Base(configPath)+".tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob temporary config files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("Expected failed save to clean temporary config files, found %v", matches)
 	}
 }
 

@@ -191,7 +191,22 @@ func extractSubgraph(issues []model.Issue, rootID string, maxDepth int) []model.
 		issueMap[i.ID] = i
 	}
 
-	// BFS to find reachable nodes
+	// Build reverse dependency map so focused exports include both sides of the
+	// root: the prerequisites it depends on and the downstream issues it unblocks.
+	dependentsByID := make(map[string][]string, len(issues))
+	for _, issue := range issues {
+		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
+			if _, ok := issueMap[dep.DependsOnID]; !ok {
+				continue
+			}
+			dependentsByID[dep.DependsOnID] = append(dependentsByID[dep.DependsOnID], issue.ID)
+		}
+	}
+
+	// BFS to find nodes reachable in either dependency direction.
 	visited := make(map[string]bool)
 	queue := []struct {
 		id    string
@@ -222,6 +237,14 @@ func extractSubgraph(issues []model.Issue, rootID string, maxDepth int) []model.
 					id    string
 					depth int
 				}{dep.DependsOnID, curr.depth + 1})
+			}
+		}
+		for _, dependentID := range dependentsByID[curr.id] {
+			if !visited[dependentID] {
+				queue = append(queue, struct {
+					id    string
+					depth int
+				}{dependentID, curr.depth + 1})
 			}
 		}
 	}
@@ -309,7 +332,7 @@ func generateDOT(issues []model.Issue, issueIDs map[string]bool, stats *analysis
 
 			style := "dashed"
 			color := "#999999"
-			if dep.Type == model.DepBlocks {
+			if dep.Type.IsBlocking() {
 				style = "bold"
 				color = "#E53935" // Red for blocking
 			}
@@ -469,7 +492,7 @@ func generateMermaid(issues []model.Issue, issueIDs map[string]bool) string {
 			safeToID := getSafeID(dep.DependsOnID)
 
 			linkStyle := "-.->" // Dashed for related
-			if dep.Type == model.DepBlocks {
+			if dep.Type.IsBlocking() {
 				linkStyle = "==>" // Bold for blockers
 			}
 
@@ -535,7 +558,7 @@ func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *an
 			}
 
 			edgeType := "related"
-			if dep.Type == model.DepBlocks {
+			if dep.Type.IsBlocking() {
 				edgeType = "blocks"
 			}
 

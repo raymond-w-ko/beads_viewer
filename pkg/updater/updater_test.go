@@ -33,6 +33,10 @@ func TestCompareVersions_Basic(t *testing.T) {
 		{"mixed prefix v1 has v", "v1.0.0", "1.0.0", 0},
 		{"mixed prefix v2 has v", "1.0.0", "v1.0.0", 0},
 		{"mixed prefix different versions", "v2.0.0", "1.0.0", 1},
+
+		// Input hygiene
+		{"same version with surrounding spaces", " v1.0.0 ", "v1.0.0", 0},
+		{"same version local with newline", "v1.0.0", "v1.0.0\n", 0},
 	}
 
 	for _, tt := range tests {
@@ -217,6 +221,7 @@ func TestCompareVersions_DevBuilds(t *testing.T) {
 	}{
 		// Unparseable dev versions
 		{"dev is newer than release", "v1.0.0", "dev", -1},
+		{"dev with spaces is newer than release", "v1.0.0", " dev ", -1},
 		{"nightly is newer than release", "v1.0.0", "nightly", -1},
 		{"dirty string is newer than release", "v1.0.0", "dirty", -1},
 		{"local is newer than release", "v1.0.0", "local", -1},
@@ -252,6 +257,15 @@ func TestCompareVersions_DevBuilds(t *testing.T) {
 				t.Errorf("compareVersions(%q, %q) = %d; want %d", tt.v1, tt.v2, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestIsNewerThanCurrent(t *testing.T) {
+	if !IsNewerThanCurrent("v99.0.0") {
+		t.Fatal("v99.0.0 should be newer than the test binary version")
+	}
+	if IsNewerThanCurrent("v0.0.0") {
+		t.Fatal("v0.0.0 should not be newer than the test binary version")
 	}
 }
 

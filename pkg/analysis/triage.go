@@ -66,6 +66,7 @@ type Recommendation struct {
 	Title       string         `json:"title"`
 	Type        string         `json:"type"`
 	Status      string         `json:"status"`
+	Assignee    string         `json:"assignee,omitempty"`
 	Priority    int            `json:"priority"`
 	Labels      []string       `json:"labels"`
 	Score       float64        `json:"score"`
@@ -459,17 +460,17 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// This caches actionable issues, blocker depths, etc. across all sub-functions
 	triageCtx := NewTriageContext(analyzer)
 
-	// Compute impact scores using the already-computed stats
-	impactScores := analyzer.ComputeImpactScoresFromStats(stats, now)
+	// Get unblocks map from context (bv-wjs0)
+	unblocksMap := triageCtx.UnblocksMap()
 
-	// Build unblocks map
-	unblocksMap := buildUnblocksMap(analyzer)
+	// Compute impact scores using the already-computed stats.
+	impactScores := analyzer.ComputeImpactScoresFromStats(stats, now)
 
 	// Compute counts (uses cached actionable issues)
 	counts := computeCountsWithContext(issues, triageCtx)
 
 	// Compute enhanced triage scores (bv-147)
-	triageScores := computeTriageScoresFromImpact(impactScores, unblocksMap, analyzer, DefaultTriageScoringOptions())
+	triageScores := computeTriageScoresFromImpact(impactScores, triageCtx, DefaultTriageScoringOptions())
 
 	// Build recommendations using enhanced scores (bv-148).
 	// Top picks need to search the *full* scored set, not the
@@ -609,84 +610,33 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 }
 
 // buildUnblocksMap computes what each issue unblocks
-func buildUnblocksMap(analyzer *Analyzer) map[string][]string {
-	// O(E) unblocks computation.
-	//
-	// Semantics (must match Analyzer.computeUnblocks):
-	// - Only blocking deps count (dep.Type.IsBlocking()).
-	// - Missing blockers don't block (ignore deps whose target isn't in issueMap).
-	// - Duplicate deps must not double-count (graph edges are unique).
-	// - Closing blocker B unblocks dependent D iff all other existing blocking deps of D are closed.
-	// - Closed/tombstone dependents are ignored.
-	// - Result slices are sorted for determinism.
-	if analyzer == nil || analyzer.g == nil {
-		return map[string][]string{}
-	}
+func buildUnblocksMap(ctx *TriageContext) map[string][]string {
+	unblocksMap := make(map[string][]string)
 
-	nodeCount := analyzer.g.Nodes().Len()
-	if nodeCount == 0 {
-		return map[string][]string{}
-	}
-
-	open := make([]bool, nodeCount)
-	for id, issue := range analyzer.issueMap {
-		nodeID, ok := analyzer.idToNode[id]
-		if !ok || nodeID < 0 || int(nodeID) >= nodeCount {
-			continue
-		}
-		if !isClosedLikeStatus(issue.Status) {
-			open[nodeID] = true
-		}
-	}
-
-	openBlockerCount := make([]int, nodeCount)
-	nodes := analyzer.g.Nodes()
-	for nodes.Next() {
-		u := nodes.Node().ID()
-		if u < 0 || int(u) >= nodeCount || !open[u] {
-			continue
-		}
-		blockers := analyzer.g.From(u)
-		for blockers.Next() {
-			v := blockers.Node().ID()
-			if v < 0 || int(v) >= nodeCount {
-				continue
-			}
-			if open[v] {
-				openBlockerCount[u]++
-			}
-		}
-	}
-
-	unblocksMap := make(map[string][]string, nodeCount)
-	nodes = analyzer.g.Nodes()
-	for nodes.Next() {
-		v := nodes.Node().ID()
-		if v < 0 || int(v) >= nodeCount || !open[v] {
-			continue
-		}
-		blockerID := analyzer.nodeToID[v]
-		if blockerID == "" {
+	// We only care about blocking dependencies
+	for _, issue := range ctx.analyzer.issueMap {
+		if isClosedLikeStatus(issue.Status) {
 			continue
 		}
 
-		dependents := analyzer.g.To(v)
-		var unblocks []string
-		for dependents.Next() {
-			u := dependents.Node().ID()
-			if u < 0 || int(u) >= nodeCount || !open[u] {
-				continue
-			}
-			if openBlockerCount[u] == 1 {
-				dependentID := analyzer.nodeToID[u]
-				if dependentID != "" {
-					unblocks = append(unblocks, dependentID)
-				}
-			}
+		if _, ok := unblocksMap[issue.ID]; !ok {
+			unblocksMap[issue.ID] = nil
 		}
 
+		// Get all open blockers for this issue (including parents)
+		openBlockers := ctx.getOpenBlockersInternal(issue.ID)
+
+		// If this issue is blocked by exactly ONE issue, completing that
+		// one issue will unblock this one.
+		if len(openBlockers) == 1 {
+			blockerID := openBlockers[0]
+			unblocksMap[blockerID] = append(unblocksMap[blockerID], issue.ID)
+		}
+	}
+
+	// Sort for determinism
+	for _, unblocks := range unblocksMap {
 		sort.Strings(unblocks)
-		unblocksMap[blockerID] = unblocks
 	}
 
 	return unblocksMap
@@ -787,6 +737,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Title:       score.Title,
 			Type:        string(issue.IssueType),
 			Status:      score.Status,
+			Assignee:    issue.Assignee,
 			Priority:    score.Priority,
 			Labels:      issue.Labels,
 			Score:       score.TriageScore,
@@ -995,8 +946,7 @@ func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string]
 func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
 	picks := make([]TopPick, 0, limit)
 	for _, rec := range recommendations {
-		// Skip blocked items - they can't be worked on yet
-		if len(rec.BlockedBy) > 0 {
+		if !isClaimableRecommendation(rec) {
 			continue
 		}
 		picks = append(picks, TopPick{
@@ -1012,6 +962,10 @@ func buildTopPicks(recommendations []Recommendation, limit int) []TopPick {
 	}
 
 	return picks
+}
+
+func isClaimableRecommendation(rec Recommendation) bool {
+	return rec.Status == string(model.StatusOpen) && rec.Assignee == "" && len(rec.BlockedBy) == 0
 }
 
 // buildGraphHealth constructs graph health metrics from stats
@@ -1131,14 +1085,15 @@ func ComputeTriageScoresWithOptions(issues []model.Issue, opts TriageScoringOpti
 	analyzer := NewAnalyzer(issues)
 	baseScores := analyzer.ComputeImpactScores()
 
-	// Build unblocks map for factor calculation
-	unblocksMap := buildUnblocksMap(analyzer)
+	triageCtx := NewTriageContext(analyzer)
 
-	return computeTriageScoresFromImpact(baseScores, unblocksMap, analyzer, opts)
+	return computeTriageScoresFromImpact(baseScores, triageCtx, opts)
 }
 
 // computeTriageScoresFromImpact calculates triage scores from base impact scores
-func computeTriageScoresFromImpact(baseScores []ImpactScore, unblocksMap map[string][]string, analyzer *Analyzer, opts TriageScoringOptions) []TriageScore {
+func computeTriageScoresFromImpact(baseScores []ImpactScore, triageCtx *TriageContext, opts TriageScoringOptions) []TriageScore {
+	unblocksMap := triageCtx.UnblocksMap()
+
 	// Calculate max unblocks for normalization
 	maxUnblocks := 0
 	for _, unblocks := range unblocksMap {
@@ -1147,14 +1102,10 @@ func computeTriageScoresFromImpact(baseScores []ImpactScore, unblocksMap map[str
 		}
 	}
 
-	// Precompute blocker depths once per triage run.
-	// GetBlockerDepth allocates per call; in triage scoring we call it O(N) times.
-	blockerDepths := computeBlockerDepths(analyzer, baseScores)
-
 	// Build triage scores
 	triageScores := make([]TriageScore, 0, len(baseScores))
 	for _, base := range baseScores {
-		ts := computeSingleTriageScore(base, unblocksMap, maxUnblocks, analyzer, opts, blockerDepths[base.IssueID])
+		ts := computeSingleTriageScore(base, unblocksMap, maxUnblocks, triageCtx.Analyzer(), opts, triageCtx.BlockerDepth(base.IssueID))
 		triageScores = append(triageScores, ts)
 	}
 
@@ -1233,52 +1184,6 @@ func computeSingleTriageScore(base ImpactScore, unblocksMap map[string][]string,
 		Priority:       base.Priority,
 		Status:         base.Status,
 	}
-}
-
-func computeBlockerDepths(analyzer *Analyzer, baseScores []ImpactScore) map[string]int {
-	memo := make(map[string]int, len(baseScores))
-	visited := make(map[string]bool, len(baseScores))
-
-	var dfs func(issueID string) int
-	dfs = func(issueID string) int {
-		if val, ok := memo[issueID]; ok {
-			return val
-		}
-		if visited[issueID] {
-			memo[issueID] = -1
-			return -1
-		}
-		visited[issueID] = true
-
-		blockers := analyzer.GetOpenBlockers(issueID)
-		if len(blockers) == 0 {
-			visited[issueID] = false
-			memo[issueID] = 0
-			return 0
-		}
-
-		maxChain := 0
-		for _, blockerID := range blockers {
-			depth := dfs(blockerID)
-			if depth == -1 {
-				visited[issueID] = false
-				memo[issueID] = -1
-				return -1
-			}
-			if depth+1 > maxChain {
-				maxChain = depth + 1
-			}
-		}
-
-		visited[issueID] = false
-		memo[issueID] = maxChain
-		return maxChain
-	}
-
-	for _, base := range baseScores {
-		_ = dfs(base.IssueID)
-	}
-	return memo
 }
 
 // GetBlockerDepth returns the depth of the blocker chain for an issue
@@ -1375,6 +1280,10 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 	actionHint := "Start work on this issue"
 	if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
 		actionHint = "Continue work on this issue"
+	} else if ctx.Issue != nil && ctx.Issue.Status == model.StatusBlocked {
+		actionHint = "Resolve blocked status before claiming this issue"
+	} else if ctx.Issue != nil && ctx.Issue.Status != "" && ctx.Issue.Status != model.StatusOpen {
+		actionHint = fmt.Sprintf("Wait for status %s to become open before claiming", ctx.Issue.Status)
 	}
 
 	// 1. Unblock cascade (highest priority - most actionable)
@@ -1450,7 +1359,32 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 	}
 
 	// 6. Agent claim status
-	isInProgress := ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress
+	//
+	// Defensive contract (#149): we only emit the "✅ Currently unclaimed"
+	// hint when we have actual evidence the issue is open AND unclaimed.
+	// The previous logic fell through to "unclaimed" whenever Issue was
+	// nil or Status was empty/unrecognized — that produced misleading
+	// reasons on issues we couldn't resolve through the analyzer, and
+	// (combined with stale snapshot data) was the most plausible source
+	// of the IN_PROGRESS + "currently unclaimed" contradiction the user
+	// reported.
+	hasIssueRecord := ctx.Issue != nil
+	hasRecordedStatus := hasIssueRecord && ctx.Issue.Status != ""
+	isInProgress := hasIssueRecord && ctx.Issue.Status == model.StatusInProgress
+	isBlockedStatus := hasIssueRecord && ctx.Issue.Status == model.StatusBlocked
+	isOpenStatus := hasIssueRecord && ctx.Issue.Status == model.StatusOpen
+	// isNonOpenStatus matches the pre-#149 contract: any issue record
+	// with a recorded non-empty Status that isn't Open/InProgress/Blocked
+	// gets the "Status is X - not ready to claim" message. That covers
+	// both enumerated statuses we know about (Deferred, Draft, Pinned,
+	// Hooked, Review, Closed, Tombstone) AND custom-string statuses
+	// projects may use that we don't recognize — silencing those would
+	// be a regression. The unclaimed hint stays tighter: only emitted
+	// when we positively know the issue is Open.
+	isNonOpenStatus := hasRecordedStatus &&
+		!isInProgress &&
+		!isBlockedStatus &&
+		!isOpenStatus
 	if isInProgress {
 		if ctx.ClaimedByAgent != "" {
 			reason := fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent)
@@ -1459,13 +1393,33 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 		} else {
 			reasons = append(reasons, "🚧 In progress - already being worked")
 		}
-	} else if ctx.ClaimedByAgent == "" {
+	} else if isBlockedStatus {
+		reasons = append(reasons, "⛔ Status is blocked - not ready to claim")
+		if ctx.ClaimedByAgent != "" {
+			reason := fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent)
+			reasons = append(reasons, reason)
+			actionHint = fmt.Sprintf("Contact %s or resolve blockers before claiming", ctx.ClaimedByAgent)
+		}
+	} else if isNonOpenStatus {
+		reason := fmt.Sprintf("⏸️ Status is %s - not ready to claim", ctx.Issue.Status)
+		reasons = append(reasons, reason)
+		if ctx.ClaimedByAgent != "" {
+			claimReason := fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent)
+			reasons = append(reasons, claimReason)
+			actionHint = fmt.Sprintf("Contact %s if you want to help", ctx.ClaimedByAgent)
+		}
+	} else if isOpenStatus && ctx.ClaimedByAgent == "" {
+		// Only emit the "available for work" hint when we positively know
+		// the issue is Open and has no assignee. Falling back to this
+		// branch on missing/unknown status surfaces a misleading hint.
 		reasons = append(reasons, "✅ Currently unclaimed - available for work")
-	} else {
+	} else if ctx.ClaimedByAgent != "" {
 		reason := fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent)
 		reasons = append(reasons, reason)
 		actionHint = fmt.Sprintf("Contact %s if you want to help", ctx.ClaimedByAgent)
 	}
+	// Else: no issue record or empty status with no assignee — stay
+	// silent on claim status rather than guess.
 
 	// 7. Blocked status context
 	if len(ctx.BlockedByIDs) > 0 {
@@ -1526,12 +1480,17 @@ func GenerateTriageReasonsForScore(score TriageScore, triageCtx *TriageContext) 
 
 	// Determine if this is a quick win based on factors
 	isQuickWin := score.TriageFactors.QuickWinBoost > 0.05
+	claimedByAgent := ""
+	if issue != nil {
+		claimedByAgent = issue.Assignee
+	}
 
 	ctx := TriageReasonContext{
 		Issue:           issue,
 		TriageScore:     &score,
 		UnblocksIDs:     unblocksMap[score.IssueID],
 		BlockedByIDs:    triageCtx.OpenBlockers(score.IssueID), // cached
+		ClaimedByAgent:  claimedByAgent,
 		DaysSinceUpdate: daysSinceUpdate,
 		IsQuickWin:      isQuickWin,
 		BlockerDepth:    triageCtx.BlockerDepth(score.IssueID), // cached
@@ -1635,7 +1594,7 @@ func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unbl
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
 		// Update top pick (highest score in this layer)
-		if group.TopPick == nil || rec.Score > group.TopPick.Score {
+		if isClaimableRecommendation(rec) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,
@@ -1695,7 +1654,7 @@ func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][
 		group.Recommendations = append(group.Recommendations, rec)
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
-		if group.TopPick == nil || rec.Score > group.TopPick.Score {
+		if isClaimableRecommendation(rec) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,

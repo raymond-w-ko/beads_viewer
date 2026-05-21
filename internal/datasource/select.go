@@ -107,7 +107,7 @@ func SelectBestSourceDetailed(sources []DataSource, opts SelectionOptions) (*Sel
 
 	// Apply age delta filter if specified
 	if opts.MaxAgeDelta > 0 && len(valid) > 0 {
-		newestTime := valid[0].ModTime
+		newestTime := newestModTime(valid)
 		cutoff := newestTime.Add(-opts.MaxAgeDelta)
 		var filtered []DataSource
 		for _, s := range valid {
@@ -135,6 +135,16 @@ func SelectBestSourceDetailed(sources []DataSource, opts SelectionOptions) (*Sel
 		Reason:        reason,
 		SelectionTime: time.Now(),
 	}, nil
+}
+
+func newestModTime(sources []DataSource) time.Time {
+	var newest time.Time
+	for _, source := range sources {
+		if source.ModTime.After(newest) {
+			newest = source.ModTime
+		}
+	}
+	return newest
 }
 
 // buildSelectionReason creates a human-readable explanation for the selection

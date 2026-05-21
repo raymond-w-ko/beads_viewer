@@ -3,11 +3,13 @@ package correlation
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 var defaultBeadsFiles = []string{
-	".beads/issues.jsonl",
 	".beads/beads.jsonl",
+	".beads/issues.jsonl",
 	".beads/beads.base.jsonl",
 }
 
@@ -23,6 +25,7 @@ func pickBeadsFiles(repoPath string, candidates []string) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
+	candidates = orderBeadsFilesForWorkspace(repoPath, candidates)
 
 	primary := ""
 	for _, rel := range candidates {
@@ -47,6 +50,22 @@ func pickBeadsFiles(repoPath string, candidates []string) []string {
 		out = append(out, rel)
 	}
 	return out
+}
+
+func orderBeadsFilesForWorkspace(repoPath string, candidates []string) []string {
+	if !loader.IsBDWorkspace(filepath.Join(repoPath, ".beads")) {
+		return candidates
+	}
+	return promoteBeadsFile(".beads/issues.jsonl", candidates)
+}
+
+func promoteBeadsFile(primary string, candidates []string) []string {
+	for _, rel := range candidates {
+		if rel == primary {
+			return prependBeadsFile(primary, candidates)
+		}
+	}
+	return candidates
 }
 
 func prependBeadsFile(primary string, candidates []string) []string {

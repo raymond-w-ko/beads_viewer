@@ -309,7 +309,7 @@ func getGitHead(repoPath string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// hashBeads creates a hash of bead IDs and statuses
+// hashBeads creates a hash of all bead fields that are embedded in reports.
 func hashBeads(beads []BeadInfo) string {
 	if len(beads) == 0 {
 		return hex.EncodeToString(sha256.New().Sum(nil))[:12]
@@ -317,7 +317,7 @@ func hashBeads(beads []BeadInfo) string {
 
 	entries := make([]string, 0, len(beads))
 	for _, b := range beads {
-		entries = append(entries, b.ID+"\x00"+b.Status)
+		entries = append(entries, b.ID+"\x00"+b.Title+"\x00"+b.Status)
 	}
 	sort.Strings(entries)
 
@@ -363,9 +363,10 @@ type CachedCorrelator struct {
 	mu               sync.Mutex
 }
 
-// NewCachedCorrelator creates a correlator with caching enabled
-func NewCachedCorrelator(repoPath string) *CachedCorrelator {
-	correlator := NewCorrelator(repoPath)
+// NewCachedCorrelator creates a correlator with caching enabled.
+// beadsFilePath is optional and forwarded to the underlying correlator.
+func NewCachedCorrelator(repoPath string, beadsFilePath ...string) *CachedCorrelator {
+	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &CachedCorrelator{
 		correlator:       correlator,
 		cache:            NewHistoryCache(repoPath),
@@ -374,9 +375,10 @@ func NewCachedCorrelator(repoPath string) *CachedCorrelator {
 	}
 }
 
-// NewCachedCorrelatorWithOptions creates a correlator with custom cache settings
-func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSize int) *CachedCorrelator {
-	correlator := NewCorrelator(repoPath)
+// NewCachedCorrelatorWithOptions creates a correlator with custom cache settings.
+// beadsFilePath is optional and forwarded to the underlying correlator.
+func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSize int, beadsFilePath ...string) *CachedCorrelator {
+	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &CachedCorrelator{
 		correlator:       correlator,
 		cache:            NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),

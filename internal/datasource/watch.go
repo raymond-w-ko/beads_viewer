@@ -10,16 +10,16 @@ import (
 
 // SourceWatcher monitors data sources for changes and triggers callbacks
 type SourceWatcher struct {
-	watcher     *fsnotify.Watcher
-	sources     []DataSource
-	callback    func(changed DataSource)
-	debounce    time.Duration
-	lastChange  map[string]time.Time
-	mu          sync.Mutex
-	done        chan struct{}
-	stopOnce    sync.Once
-	verbose     bool
-	logger      func(msg string)
+	watcher    *fsnotify.Watcher
+	sources    []DataSource
+	callback   func(changed DataSource)
+	debounce   time.Duration
+	lastChange map[string]time.Time
+	mu         sync.Mutex
+	done       chan struct{}
+	stopOnce   sync.Once
+	verbose    bool
+	logger     func(msg string)
 }
 
 // WatcherOptions configures the source watcher
@@ -112,21 +112,22 @@ func (sw *SourceWatcher) run() {
 				continue
 			}
 
-			// Find matching source
-			var changedSource *DataSource
+			sw.mu.Lock()
+			var changedSource DataSource
+			sourceFound := false
 			for i := range sw.sources {
 				if sw.sources[i].Path == event.Name {
-					changedSource = &sw.sources[i]
+					changedSource = sw.sources[i]
+					sourceFound = true
 					break
 				}
 			}
-
-			if changedSource == nil {
+			if !sourceFound {
+				sw.mu.Unlock()
 				continue
 			}
 
 			// Check debounce
-			sw.mu.Lock()
 			lastTime := sw.lastChange[event.Name]
 			now := time.Now()
 			if now.Sub(lastTime) < sw.debounce {
@@ -141,15 +142,29 @@ func (sw *SourceWatcher) run() {
 			}
 
 			// Refresh source info
-			if err := RefreshSourceInfo(changedSource); err != nil {
+			if err := RefreshSourceInfo(&changedSource); err != nil {
 				if sw.verbose {
 					sw.logger(fmt.Sprintf("Failed to refresh source info: %v", err))
 				}
 			}
 
+			sw.mu.Lock()
+			sourceStillWatched := false
+			for i := range sw.sources {
+				if sw.sources[i].Path == changedSource.Path {
+					sw.sources[i] = changedSource
+					sourceStillWatched = true
+					break
+				}
+			}
+			sw.mu.Unlock()
+			if !sourceStillWatched {
+				continue
+			}
+
 			// Call the callback
 			if sw.callback != nil {
-				sw.callback(*changedSource)
+				sw.callback(changedSource)
 			}
 
 		case err, ok := <-sw.watcher.Errors:
@@ -289,7 +304,6 @@ func (m *AutoRefreshManager) CurrentSource() DataSource {
 // handleChange is called when any source changes
 func (m *AutoRefreshManager) handleChange(changed DataSource) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Re-validate the changed source
 	for i := range m.sources {
@@ -304,12 +318,14 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 	// Re-select best source
 	newSelected, err := SelectBestSourceWithOptions(m.sources, m.opts)
 	if err != nil {
+		m.mu.Unlock()
 		return
 	}
 
 	// Check if selection changed
 	if m.currentSource != nil && m.currentSource.Path == newSelected.Path &&
 		m.currentSource.ModTime.Equal(newSelected.ModTime) {
+		m.mu.Unlock()
 		return
 	}
 
@@ -320,20 +336,21 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 
 	m.currentSource = &newSelected
 
-	// Notify callback
-	if m.onSourceChange != nil {
-		reason := "source updated"
-		if oldPath != newSelected.Path {
-			reason = fmt.Sprintf("switched from %s", oldPath)
-		}
-		m.onSourceChange(newSelected, reason)
+	callback := m.onSourceChange
+	reason := "source updated"
+	if oldPath != newSelected.Path {
+		reason = fmt.Sprintf("switched from %s", oldPath)
+	}
+	m.mu.Unlock()
+
+	if callback != nil {
+		callback(newSelected, reason)
 	}
 }
 
 // ForceRefresh triggers a manual refresh of all sources
 func (m *AutoRefreshManager) ForceRefresh() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Refresh and revalidate all sources
 	for i := range m.sources {
@@ -344,14 +361,19 @@ func (m *AutoRefreshManager) ForceRefresh() error {
 	// Re-select
 	newSelected, err := SelectBestSourceWithOptions(m.sources, m.opts)
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 
+	var callback func(newSource DataSource, reason string)
 	if m.currentSource == nil || m.currentSource.Path != newSelected.Path {
 		m.currentSource = &newSelected
-		if m.onSourceChange != nil {
-			m.onSourceChange(newSelected, "force refresh")
-		}
+		callback = m.onSourceChange
+	}
+	m.mu.Unlock()
+
+	if callback != nil {
+		callback(newSelected, "force refresh")
 	}
 
 	return nil

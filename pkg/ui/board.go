@@ -172,6 +172,14 @@ func sortIssuesByPriorityAndDate(issues []model.Issue) {
 // - Status mode: shows all 4 columns (even empty) for workflow visibility
 // - Priority/Type modes: hides empty columns to save space
 func (b *BoardModel) updateActiveColumns() {
+	// Save the currently focused actual column to try and restore it
+	var targetActualCol int
+	if len(b.activeColIdx) > 0 && b.focusedCol >= 0 && b.focusedCol < len(b.activeColIdx) {
+		targetActualCol = b.activeColIdx[b.focusedCol]
+	} else {
+		targetActualCol = 0
+	}
+
 	// Determine whether to show empty columns
 	showEmpty := b.shouldShowEmptyColumns()
 
@@ -185,13 +193,26 @@ func (b *BoardModel) updateActiveColumns() {
 	if len(b.activeColIdx) == 0 {
 		b.activeColIdx = []int{ColOpen, ColInProgress, ColBlocked, ColClosed}
 	}
-	// Ensure focused column is within valid range
-	if b.focusedCol >= len(b.activeColIdx) {
-		b.focusedCol = len(b.activeColIdx) - 1
+
+	// Try to restore focus to the same actual column, or the nearest one
+	newFocusedCol := 0
+	minDist := 999
+	for idx, actualCol := range b.activeColIdx {
+		if actualCol == targetActualCol {
+			newFocusedCol = idx
+			minDist = 0
+			break
+		}
+		dist := actualCol - targetActualCol
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist < minDist {
+			minDist = dist
+			newFocusedCol = idx
+		}
 	}
-	if b.focusedCol < 0 {
-		b.focusedCol = 0
-	}
+	b.focusedCol = newFocusedCol
 }
 
 // shouldShowEmptyColumns returns whether empty columns should be visible (bv-tf6j)

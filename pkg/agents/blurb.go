@@ -55,6 +55,8 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 bv --robot-triage --format toon
 ` + "```" + `
 
+Before claiming, verify current state with ` + "`" + `br show <id> --json` + "`" + ` or ` + "`" + `br ready --json` + "`" + `. ` + "`" + `recommendations` + "`" + ` can include graph-important blocked or assigned work; only ` + "`" + `quick_ref.top_picks` + "`" + ` and non-empty ` + "`" + `claim_command` + "`" + ` fields represent claimable work.
+
 #### Other bv Commands
 
 | Command | Returns |
@@ -215,18 +217,12 @@ func RemoveBlurb(content string) string {
 	if startIdx == -1 {
 		return content
 	}
-	endIdx := strings.Index(content, BlurbEndMarker)
-	if endIdx == -1 {
+	endLoc := strings.Index(content[startIdx:], BlurbEndMarker)
+	if endLoc == -1 {
 		return content
 	}
-	endIdx += len(BlurbEndMarker)
-	for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
-		endIdx++
-	}
-	for startIdx > 0 && (content[startIdx-1] == '\n' || content[startIdx-1] == '\r') {
-		startIdx--
-	}
-	return content[:startIdx] + content[endIdx:]
+	endIdx := startIdx + endLoc + len(BlurbEndMarker)
+	return removeDelimitedBlurb(content, startIdx, endIdx)
 }
 
 // RemoveLegacyBlurb removes the old-format blurb (pre-v1, no HTML markers) from content.
@@ -252,16 +248,7 @@ func RemoveLegacyBlurb(content string) string {
 			endIdx = len(content)
 		}
 	}
-	for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
-		endIdx++
-	}
-	for startIdx > 0 && (content[startIdx-1] == '\n' || content[startIdx-1] == '\r') {
-		startIdx--
-	}
-	if startIdx > 0 {
-		startIdx++
-	}
-	return content[:startIdx] + content[endIdx:]
+	return removeDelimitedBlurb(content, startIdx, endIdx)
 }
 
 // UpdateBlurb replaces an existing blurb with the current version.
@@ -269,4 +256,58 @@ func UpdateBlurb(content string) string {
 	content = RemoveLegacyBlurb(content)
 	content = RemoveBlurb(content)
 	return AppendBlurb(content)
+}
+
+func removeDelimitedBlurb(content string, startIdx, endIdx int) string {
+	prefixEnd := trimLineBreaksBefore(content, startIdx)
+	suffixStart := trimLineBreaksAfter(content, endIdx)
+	if prefixEnd > 0 && suffixStart < len(content) {
+		separator := preferredLineBreak(content[prefixEnd:startIdx] + content[endIdx:suffixStart])
+		return content[:prefixEnd] + separator + content[suffixStart:]
+	}
+	return content[:prefixEnd] + content[suffixStart:]
+}
+
+func trimLineBreaksBefore(content string, idx int) int {
+	for idx > 0 {
+		switch content[idx-1] {
+		case '\n':
+			idx--
+			if idx > 0 && content[idx-1] == '\r' {
+				idx--
+			}
+		case '\r':
+			idx--
+		default:
+			return idx
+		}
+	}
+	return idx
+}
+
+func trimLineBreaksAfter(content string, idx int) int {
+	for idx < len(content) {
+		switch content[idx] {
+		case '\r':
+			idx++
+			if idx < len(content) && content[idx] == '\n' {
+				idx++
+			}
+		case '\n':
+			idx++
+		default:
+			return idx
+		}
+	}
+	return idx
+}
+
+func preferredLineBreak(removedWhitespace string) string {
+	if !strings.ContainsAny(removedWhitespace, "\r\n") {
+		return ""
+	}
+	if strings.Contains(removedWhitespace, "\r\n") {
+		return "\r\n"
+	}
+	return "\n"
 }

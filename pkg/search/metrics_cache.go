@@ -6,7 +6,7 @@ import "time"
 type IssueMetrics struct {
 	IssueID      string    `json:"issue_id"`
 	PageRank     float64   `json:"pagerank"`      // 0.0-1.0, from graph analysis
-	Status       string    `json:"status"`        // open|in_progress|blocked|closed
+	Status       string    `json:"status"`        // model.Status value used for actionability scoring
 	Priority     int       `json:"priority"`      // 0-4 (P0=0, P4=4)
 	BlockerCount int       `json:"blocker_count"` // How many issues this blocks
 	UpdatedAt    time.Time `json:"updated_at"`    // For recency calculation

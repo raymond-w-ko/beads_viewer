@@ -45,6 +45,13 @@ func (s *StreamExtractor) SetProgressCallback(cb ProgressCallback) {
 	s.progressCB = cb
 }
 
+func (s *StreamExtractor) progressCallback(opts StreamOptions) ProgressCallback {
+	if opts.OnProgress != nil {
+		return opts.OnProgress
+	}
+	return s.progressCB
+}
+
 // StreamOptions controls streaming extraction behavior
 type StreamOptions struct {
 	Since       *time.Time // Only commits after this time
@@ -63,9 +70,11 @@ func (s *StreamExtractor) StreamEvents(opts StreamOptions) ([]BeadEvent, error) 
 		limit = DefaultHistoryLimit
 	}
 
+	onProgress := s.progressCallback(opts)
+
 	// First, count commits for progress reporting (fast)
 	totalCommits := 0
-	if opts.OnProgress != nil {
+	if onProgress != nil {
 		var err error
 		totalCommits, err = s.countCommits(opts)
 		if err != nil {
@@ -86,13 +95,17 @@ func (s *StreamExtractor) StreamEvents(opts StreamOptions) ([]BeadEvent, error) 
 	}
 
 	// Parse events as they stream in
-	events, err := s.parseStream(stdout, opts.BeadID, opts.ClosedSince, totalCommits, opts.OnProgress)
+	events, parseErr := s.parseStream(stdout, opts.BeadID, opts.ClosedSince, totalCommits, onProgress)
+	if parseErr != nil {
+		// Stop git before waiting. If parsing stopped early, git may still be
+		// blocked writing to stdout; waiting first can deadlock.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("parsing git log stream: %w", parseErr)
+	}
 
 	// Wait for command to finish
 	cmdErr := cmd.Wait()
-	if err != nil {
-		return nil, err
-	}
 	if cmdErr != nil {
 		// Check if it's just because we reached the limit
 		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
@@ -157,7 +170,7 @@ func (s *StreamExtractor) buildStreamCommand(opts StreamOptions, limit int) *exe
 	// Use primary beads file
 	args = append(args, s.primaryBeadsFile())
 
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", withNoColorGit(args)...)
 	cmd.Dir = s.repoPath
 	return cmd
 }
@@ -181,7 +194,10 @@ func (s *StreamExtractor) parseStream(r io.Reader, filterBeadID string, closedSi
 		if commitPattern.MatchString(line) {
 			// Process previous commit if exists
 			if currentCommit != nil {
-				commitEvents := s.processCommitBuffer(currentCommit, filterBeadID, closedSince)
+				commitEvents, err := s.processCommitBuffer(currentCommit, filterBeadID, closedSince)
+				if err != nil {
+					return events, err
+				}
 				events = append(events, commitEvents...)
 			}
 
@@ -209,7 +225,10 @@ func (s *StreamExtractor) parseStream(r io.Reader, filterBeadID string, closedSi
 
 	// Process final commit
 	if currentCommit != nil {
-		commitEvents := s.processCommitBuffer(currentCommit, filterBeadID, closedSince)
+		commitEvents, err := s.processCommitBuffer(currentCommit, filterBeadID, closedSince)
+		if err != nil {
+			return events, err
+		}
 		events = append(events, commitEvents...)
 	}
 
@@ -227,16 +246,16 @@ type commitBuffer struct {
 }
 
 // processCommitBuffer processes a buffered commit and extracts events
-func (s *StreamExtractor) processCommitBuffer(buf *commitBuffer, filterBeadID string, closedSince *time.Time) []BeadEvent {
+func (s *StreamExtractor) processCommitBuffer(buf *commitBuffer, filterBeadID string, closedSince *time.Time) ([]BeadEvent, error) {
 	// Parse commit info
 	info, err := parseCommitHeader(buf.headerLine)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing commit header: %w", err)
 	}
 
 	// Parse diff
 	events := s.parseBufferedDiff(buf.diffLines, info, filterBeadID, closedSince)
-	return events
+	return events, nil
 }
 
 // parseCommitHeader extracts commit metadata from the header line
@@ -356,33 +375,26 @@ func NewBatchFileStatsExtractor(repoPath string) *BatchFileStatsExtractor {
 // SetBatchSize sets the batch size for git operations
 func (b *BatchFileStatsExtractor) SetBatchSize(size int) {
 	if size > 0 {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
 		b.batchSize = size
 	}
 }
 
 // ExtractBatch extracts file changes for multiple commit SHAs in a batch
 func (b *BatchFileStatsExtractor) ExtractBatch(shas []string) (map[string][]FileChange, error) {
-	result := make(map[string][]FileChange)
-
-	// Check cache first
-	b.mu.Lock()
-	var uncached []string
-	for _, sha := range shas {
-		if files, ok := b.cache[sha]; ok {
-			result[sha] = files
-		} else {
-			uncached = append(uncached, sha)
-		}
-	}
-	b.mu.Unlock()
+	result, uncached := b.splitCached(shas)
 
 	if len(uncached) == 0 {
 		return result, nil
 	}
 
+	batchSize := b.currentBatchSize()
+
 	// Process in batches
-	for i := 0; i < len(uncached); i += b.batchSize {
-		end := i + b.batchSize
+	for i := 0; i < len(uncached); i += batchSize {
+		end := i + batchSize
 		if end > len(uncached) {
 			end = len(uncached)
 		}
@@ -394,15 +406,57 @@ func (b *BatchFileStatsExtractor) ExtractBatch(shas []string) (map[string][]File
 		}
 
 		// Merge results and update cache
-		b.mu.Lock()
-		for sha, files := range batchResult {
-			result[sha] = files
-			b.cache[sha] = files
-		}
-		b.mu.Unlock()
+		b.storeBatchResult(result, batchResult)
 	}
 
 	return result, nil
+}
+
+func (b *BatchFileStatsExtractor) currentBatchSize() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.batchSize
+}
+
+func (b *BatchFileStatsExtractor) splitCached(shas []string) (map[string][]FileChange, []string) {
+	result := make(map[string][]FileChange)
+	var uncached []string
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, sha := range shas {
+		files, ok := b.cache[sha]
+		if !ok {
+			uncached = append(uncached, sha)
+			continue
+		}
+
+		result[sha] = cloneFileChanges(files)
+	}
+
+	return result, uncached
+}
+
+func (b *BatchFileStatsExtractor) storeBatchResult(result map[string][]FileChange, batchResult map[string][]FileChange) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for sha, files := range batchResult {
+		result[sha] = cloneFileChanges(files)
+		b.cache[sha] = cloneFileChanges(files)
+	}
+}
+
+func cloneFileChanges(files []FileChange) []FileChange {
+	if len(files) == 0 {
+		return nil
+	}
+
+	copied := make([]FileChange, len(files))
+	copy(copied, files)
+	return copied
 }
 
 // extractBatchFiles extracts files for a batch of commits using a single git command
@@ -517,6 +571,7 @@ func isHexString(s string) bool {
 // ClearCache clears the file stats cache
 func (b *BatchFileStatsExtractor) ClearCache() {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.cache = make(map[string][]FileChange)
-	b.mu.Unlock()
 }

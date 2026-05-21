@@ -14,9 +14,9 @@ const (
 	EventCreated EventType = "created"
 	// EventClaimed indicates status changed to in_progress
 	EventClaimed EventType = "claimed"
-	// EventClosed indicates status changed to closed
+	// EventClosed indicates status changed to a closed-like state.
 	EventClosed EventType = "closed"
-	// EventReopened indicates status changed FROM closed to open/in_progress
+	// EventReopened indicates status changed FROM a closed-like state to open/in_progress
 	EventReopened EventType = "reopened"
 	// EventModified indicates other significant changes (title, priority, deps)
 	EventModified EventType = "modified"

@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
@@ -203,6 +205,31 @@ func WatchFileCmd(w *watcher.Watcher) tea.Cmd {
 	return func() tea.Msg {
 		<-w.Changed()
 		return FileChangedMsg{}
+	}
+}
+
+func loadIssuesForReload(path string, opts loader.ParseOptions) (loader.PooledIssues, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".db", ".sqlite", ".sqlite3":
+		source, ok, err := datasource.SourceFromFile(path)
+		if err != nil {
+			return loader.PooledIssues{}, err
+		}
+		if !ok {
+			return loader.PooledIssues{}, fmt.Errorf("unsupported SQLite source path: %s", path)
+		}
+		reader, err := datasource.NewReader(source)
+		if err != nil {
+			return loader.PooledIssues{}, err
+		}
+		defer reader.Close()
+		issues, err := reader.LoadIssuesFiltered(opts.IssueFilter)
+		if err != nil {
+			return loader.PooledIssues{}, err
+		}
+		return loader.PooledIssues{Issues: issues}, nil
+	default:
+		return loader.LoadIssuesFromFileWithOptionsPooled(path, opts)
 	}
 }
 
@@ -841,7 +868,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			Issue:      issues[i],
 			GraphScore: graphStats.GetPageRankScore(issues[i].ID),
 			Impact:     graphStats.GetCriticalPathScore(issues[i].ID),
-			RepoPrefix: ExtractRepoPrefix(issues[i].ID),
+			RepoPrefix: issueRepoKey(issues[i]),
 		}
 	}
 
@@ -1258,6 +1285,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case UpdateMsg:
+		if !updater.IsNewerThanCurrent(msg.TagName) {
+			m.updateAvailable = false
+			m.updateTag = ""
+			m.updateURL = ""
+			return m, nil
+		}
 		m.updateAvailable = true
 		m.updateTag = msg.TagName
 		m.updateURL = msg.URL
@@ -2061,7 +2094,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			loadStart = time.Now()
 		}
-		loadedIssues, err := loader.LoadIssuesFromFileWithOptionsPooled(m.beadsPath, loader.ParseOptions{
+		loadedIssues, err := loadIssuesForReload(m.beadsPath, loader.ParseOptions{
 			WarningHandler: func(msg string) {
 				reloadWarnings = append(reloadWarnings, msg)
 			},
@@ -2204,7 +2237,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Issue:      m.issues[i],
 				GraphScore: m.analysis.GetPageRankScore(m.issues[i].ID),
 				Impact:     m.analysis.GetCriticalPathScore(m.issues[i].ID),
-				RepoPrefix: ExtractRepoPrefix(m.issues[i].ID),
+				RepoPrefix: issueRepoKey(m.issues[i]),
 			}
 			item.TriageScore = m.triageScores[m.issues[i].ID]
 			if reasons, exists := m.triageReasons[m.issues[i].ID]; exists {
@@ -4324,6 +4357,11 @@ func (m Model) handleHistoryKeys(msg tea.KeyMsg) Model {
 
 // getCommitURL returns the GitHub/GitLab commit URL for a SHA (bv-xf4p)
 func (m Model) getCommitURL(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return ""
+	}
+
 	// Get git remote URL
 	cmd := exec.Command("git", "remote", "get-url", "origin")
 	cmd.Dir = m.workDir
@@ -4348,6 +4386,11 @@ func (m Model) getCommitURL(sha string) string {
 
 // gitRemoteToWebURL converts a git remote URL to a web URL (bv-xf4p)
 func gitRemoteToWebURL(remote string) string {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		return ""
+	}
+
 	// Handle SSH URLs: git@github.com:user/repo.git
 	if strings.HasPrefix(remote, "git@") {
 		// Remove git@ prefix and .git suffix
@@ -4355,16 +4398,41 @@ func gitRemoteToWebURL(remote string) string {
 		remote = strings.TrimSuffix(remote, ".git")
 		// Replace : with /
 		remote = strings.Replace(remote, ":", "/", 1)
-		return "https://" + remote
+		return normalizeGitRemoteWebURL("https://" + remote)
 	}
 
 	// Handle HTTPS URLs: https://github.com/user/repo.git
-	if strings.HasPrefix(remote, "https://") || strings.HasPrefix(remote, "http://") {
-		remote = strings.TrimSuffix(remote, ".git")
-		return remote
+	if strings.HasPrefix(remote, "https://") || strings.HasPrefix(remote, "http://") ||
+		strings.HasPrefix(remote, "ssh://") {
+		return normalizeGitRemoteWebURL(remote)
 	}
 
 	return ""
+}
+
+func normalizeGitRemoteWebURL(remote string) string {
+	u, err := url.Parse(remote)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+
+	switch u.Scheme {
+	case "https", "http":
+	case "ssh":
+		u.Scheme = "https"
+		u.User = nil
+		u.Host = u.Hostname()
+	default:
+		return ""
+	}
+
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), ".git")
+	if u.Path == "" || u.Path == "/" {
+		return ""
+	}
+	return u.String()
 }
 
 // openBrowserURL opens a URL in the default browser (bv-xf4p)
@@ -6152,7 +6220,7 @@ func (m *Model) renderFooter() string {
 			Foreground(ColorBg).
 			Bold(true).
 			Padding(0, 1)
-		updateSection = updateStyle.Render(fmt.Sprintf("⭐ %s", m.updateTag))
+		updateSection = updateStyle.Render(fmt.Sprintf("⭐ Update %s", m.updateTag))
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -6508,7 +6576,7 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 	// Workspace repo filter (nil = all repos)
 	if m.workspaceMode && m.activeRepos != nil {
-		repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+		repoKey := issueRepoKey(issue)
 		if repoKey != "" && !m.activeRepos[repoKey] {
 			return false
 		}
@@ -6556,7 +6624,7 @@ func (m *Model) filteredIssuesForActiveView() []model.Issue {
 	if recipeFilterActive {
 		for _, issue := range m.issues {
 			if m.workspaceMode && m.activeRepos != nil {
-				repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+				repoKey := issueRepoKey(issue)
 				if repoKey != "" && !m.activeRepos[repoKey] {
 					continue
 				}
@@ -6629,7 +6697,7 @@ func (m *Model) applyFilter() {
 				GraphScore: m.analysis.GetPageRankScore(issue.ID),
 				Impact:     m.analysis.GetCriticalPathScore(issue.ID),
 				DiffStatus: m.getDiffStatus(issue.ID),
-				RepoPrefix: ExtractRepoPrefix(issue.ID),
+				RepoPrefix: issueRepoKey(issue),
 			}
 			// Add triage data (bv-151)
 			item.TriageScore = m.triageScores[issue.ID]
@@ -6817,7 +6885,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 
 		// Workspace repo filter (nil = all repos)
 		if m.workspaceMode && m.activeRepos != nil {
-			repoKey := strings.ToLower(ExtractRepoPrefix(issue.ID))
+			repoKey := issueRepoKey(issue)
 			if repoKey != "" && !m.activeRepos[repoKey] {
 				include = false
 			}
@@ -6883,7 +6951,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 				GraphScore: m.analysis.GetPageRankScore(issue.ID),
 				Impact:     m.analysis.GetCriticalPathScore(issue.ID),
 				DiffStatus: m.getDiffStatus(issue.ID),
-				RepoPrefix: ExtractRepoPrefix(issue.ID),
+				RepoPrefix: issueRepoKey(issue),
 			}
 			// Add triage data (bv-151)
 			item.TriageScore = m.triageScores[issue.ID]

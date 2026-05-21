@@ -1,6 +1,9 @@
 package hooks
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +54,42 @@ timeout: invalid
 			wantErr: true,
 		},
 		{
+			name: "invalid numeric suffix",
+			yamlData: `
+name: test
+command: echo
+timeout: 30seconds
+`,
+			wantErr: true,
+		},
+		{
+			name: "negative numeric timeout",
+			yamlData: `
+name: test
+command: echo
+timeout: -1
+`,
+			wantErr: true,
+		},
+		{
+			name: "negative duration timeout",
+			yamlData: `
+name: test
+command: echo
+timeout: -1s
+`,
+			wantErr: true,
+		},
+		{
+			name: "overflow numeric timeout",
+			yamlData: `
+name: test
+command: echo
+timeout: 999999999999
+`,
+			wantErr: true,
+		},
+		{
 			name: "empty timeout",
 			yamlData: `
 name: test
@@ -72,5 +111,45 @@ command: echo
 				t.Errorf("Timeout = %v, want %v", h.Timeout, tt.wantTimeout)
 			}
 		})
+	}
+}
+
+func TestLoaderLoadResetsWarnings(t *testing.T) {
+	tmpDir := t.TempDir()
+	bvDir := filepath.Join(tmpDir, ".bv")
+	if err := os.MkdirAll(bvDir, 0755); err != nil {
+		t.Fatalf("failed to create .bv dir: %v", err)
+	}
+	configPath := filepath.Join(bvDir, "hooks.yaml")
+
+	if err := os.WriteFile(configPath, []byte(`
+hooks:
+  pre-export:
+    - command: ""
+`), 0644); err != nil {
+		t.Fatalf("failed to write invalid config: %v", err)
+	}
+
+	loader := NewLoader(WithProjectDir(tmpDir))
+	if err := loader.Load(); err != nil {
+		t.Fatalf("failed to load config with empty command: %v", err)
+	}
+	if warnings := strings.Join(loader.Warnings(), "\n"); !strings.Contains(warnings, "empty command") {
+		t.Fatalf("expected empty-command warning, got %q", warnings)
+	}
+
+	if err := os.WriteFile(configPath, []byte(`
+hooks:
+  pre-export:
+    - command: echo ok
+`), 0644); err != nil {
+		t.Fatalf("failed to write valid config: %v", err)
+	}
+
+	if err := loader.Load(); err != nil {
+		t.Fatalf("failed to reload valid config: %v", err)
+	}
+	if warnings := loader.Warnings(); len(warnings) != 0 {
+		t.Fatalf("expected warnings to reset after clean reload, got %v", warnings)
 	}
 }

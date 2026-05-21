@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 )
 
 func TestRobotRegistryValidate_RejectsModifierAlone(t *testing.T) {
@@ -305,6 +307,128 @@ func TestWriteRobotHelp_ReturnsWriterErrorAfterIntro(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "write failed after intro") {
 		t.Fatalf("expected underlying writer error, got %v", err)
+	}
+}
+
+func TestFilterOrphanReportByMinScoreRebuildsDerivedFields(t *testing.T) {
+	report := &correlation.OrphanReport{
+		Stats: correlation.OrphanReportStats{
+			CandidateCount: 2,
+			AvgSuspicion:   70,
+		},
+		Candidates: []correlation.OrphanCandidate{
+			{
+				ShortSHA:       "aaaaaaa",
+				SuspicionScore: 90,
+				ProbableBeads:  []correlation.ProbableBead{{BeadID: "bv-keep"}},
+			},
+			{
+				ShortSHA:       "bbbbbbb",
+				SuspicionScore: 20,
+				ProbableBeads:  []correlation.ProbableBead{{BeadID: "bv-drop"}},
+			},
+		},
+		ByBead: map[string][]string{
+			"bv-keep": []string{"aaaaaaa"},
+			"bv-drop": []string{"bbbbbbb"},
+		},
+	}
+
+	filterOrphanReportByMinScore(report, 50)
+
+	if len(report.Candidates) != 1 {
+		t.Fatalf("candidate count = %d, want 1", len(report.Candidates))
+	}
+	if strings.Compare(report.Candidates[0].ShortSHA, "aaaaaaa") != 0 {
+		t.Fatalf("candidate short SHA = %q, want aaaaaaa", report.Candidates[0].ShortSHA)
+	}
+	if report.Stats.CandidateCount != 1 {
+		t.Fatalf("stats candidate count = %d, want 1", report.Stats.CandidateCount)
+	}
+	if report.Stats.AvgSuspicion != 90 {
+		t.Fatalf("avg suspicion = %v, want 90", report.Stats.AvgSuspicion)
+	}
+	if got := report.ByBead["bv-keep"]; len(got) != 1 || strings.Compare(got[0], "aaaaaaa") != 0 {
+		t.Fatalf("kept by_bead entry = %#v, want aaaaaaa", got)
+	}
+	if dropped := report.ByBead["bv-drop"]; dropped != nil {
+		t.Fatalf("dropped candidate still present in by_bead: %#v", dropped)
+	}
+
+	filterOrphanReportByMinScore(report, 101)
+	if len(report.Candidates) != 0 {
+		t.Fatalf("candidate count after filtering all = %d, want 0", len(report.Candidates))
+	}
+	if report.Stats.CandidateCount != 0 {
+		t.Fatalf("stats candidate count after filtering all = %d, want 0", report.Stats.CandidateCount)
+	}
+	if report.Stats.AvgSuspicion != 0 {
+		t.Fatalf("avg suspicion after filtering all = %v, want 0", report.Stats.AvgSuspicion)
+	}
+	if len(report.ByBead) != 0 {
+		t.Fatalf("by_bead after filtering all = %#v, want empty", report.ByBead)
+	}
+}
+
+func TestParseCorrelationArgTrimsAndRejectsEmptyParts(t *testing.T) {
+	commitSHA, beadID, err := parseCorrelationArg("  abc123 : bv-1  ")
+	if err != nil {
+		t.Fatalf("parseCorrelationArg returned error: %v", err)
+	}
+	if commitSHA != "abc123" {
+		t.Fatalf("commit SHA = %q, want abc123", commitSHA)
+	}
+	if beadID != "bv-1" {
+		t.Fatalf("bead ID = %q, want bv-1", beadID)
+	}
+
+	tests := []string{
+		"",
+		"abc123",
+		":bv-1",
+		"abc123:",
+		"   :   ",
+	}
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			if _, _, err := parseCorrelationArg(input); err == nil {
+				t.Fatalf("parseCorrelationArg(%q) succeeded, want error", input)
+			}
+		})
+	}
+}
+
+func TestResolveCorrelatedCommitRejectsAmbiguousPrefix(t *testing.T) {
+	commits := []correlation.CorrelatedCommit{
+		{SHA: "abc123def456", ShortSHA: "abc123d", Confidence: 0.8},
+		{SHA: "abc123fff000", ShortSHA: "abc123f", Confidence: 0.7},
+	}
+
+	commit, err := resolveCorrelatedCommit(commits, "abc123d")
+	if err != nil {
+		t.Fatalf("resolveCorrelatedCommit returned error: %v", err)
+	}
+	if commit == nil || commit.SHA != "abc123def456" {
+		t.Fatalf("resolved commit = %#v, want abc123def456", commit)
+	}
+
+	commit, err = resolveCorrelatedCommit(commits, "ABC123F")
+	if err != nil {
+		t.Fatalf("resolveCorrelatedCommit uppercase short SHA returned error: %v", err)
+	}
+	if commit == nil || commit.SHA != "abc123fff000" {
+		t.Fatalf("uppercase resolved commit = %#v, want abc123fff000", commit)
+	}
+
+	commit, err = resolveCorrelatedCommit(commits, "abc123")
+	if err == nil {
+		t.Fatal("expected ambiguous prefix error")
+	}
+	if commit != nil {
+		t.Fatalf("commit = %#v, want nil on ambiguity", commit)
+	}
+	if !strings.Contains(err.Error(), "ambiguous commit SHA prefix") {
+		t.Fatalf("error = %q, want ambiguity message", err.Error())
 	}
 }
 

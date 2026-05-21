@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -43,13 +44,22 @@ type ReverseLookup struct {
 // NewReverseLookup creates a new reverse lookup from a history report.
 func NewReverseLookup(report *HistoryReport) *ReverseLookup {
 	rl := &ReverseLookup{
-		index:   report.CommitIndex,
-		beads:   report.Histories,
+		index:   CommitIndex{},
+		beads:   map[string]BeadHistory{},
 		details: make(map[string][]CorrelatedCommit),
+	}
+	if report == nil {
+		return rl
+	}
+	if report.CommitIndex != nil {
+		rl.index = report.CommitIndex
+	}
+	if report.Histories != nil {
+		rl.beads = report.Histories
 	}
 
 	// Build details map for quick access
-	for _, history := range report.Histories {
+	for _, history := range rl.beads {
 		for _, commit := range history.Commits {
 			rl.details[commit.SHA] = append(rl.details[commit.SHA], commit)
 		}
@@ -67,8 +77,10 @@ func NewReverseLookupWithRepo(report *HistoryReport, repoPath string) *ReverseLo
 
 // LookupByCommit finds all beads related to a commit.
 func (rl *ReverseLookup) LookupByCommit(sha string) (*CommitBeadResult, error) {
-	// Normalize SHA (handle short SHAs)
-	fullSHA := rl.normalizeSHA(sha)
+	fullSHA, err := rl.resolveSHA(sha)
+	if err != nil {
+		return nil, err
+	}
 
 	result := &CommitBeadResult{
 		CommitSHA:    fullSHA,
@@ -96,18 +108,6 @@ func (rl *ReverseLookup) LookupByCommit(sha string) (*CommitBeadResult, error) {
 
 	// Find related beads
 	beadIDs := rl.index[fullSHA]
-	if len(beadIDs) == 0 {
-		// Try prefix match for short SHAs
-		for indexSHA := range rl.index {
-			if strings.HasPrefix(indexSHA, sha) {
-				beadIDs = rl.index[indexSHA]
-				result.CommitSHA = indexSHA
-				result.ShortSHA = shortSHA(indexSHA)
-				break
-			}
-		}
-	}
-
 	if len(beadIDs) == 0 {
 		result.IsOrphan = true
 		return result, nil
@@ -147,21 +147,42 @@ func (rl *ReverseLookup) LookupByCommit(sha string) (*CommitBeadResult, error) {
 	return result, nil
 }
 
-// normalizeSHA tries to expand a short SHA to full SHA if found in index.
-func (rl *ReverseLookup) normalizeSHA(sha string) string {
-	// Already in index
-	if _, ok := rl.index[sha]; ok {
-		return sha
+// resolveSHA expands a unique short SHA prefix to the indexed full SHA.
+func (rl *ReverseLookup) resolveSHA(sha string) (string, error) {
+	sha = strings.ToLower(strings.TrimSpace(sha))
+	if sha == "" {
+		return "", fmt.Errorf("commit SHA is required")
 	}
 
-	// Try prefix match
+	if _, ok := rl.index[sha]; ok {
+		return sha, nil
+	}
+
+	matches := make([]string, 0, 1)
 	for indexSHA := range rl.index {
-		if strings.HasPrefix(indexSHA, sha) {
-			return indexSHA
+		if strings.HasPrefix(strings.ToLower(indexSHA), sha) {
+			matches = append(matches, indexSHA)
 		}
 	}
 
-	return sha
+	switch len(matches) {
+	case 0:
+		return sha, nil
+	case 1:
+		return matches[0], nil
+	default:
+		sort.Strings(matches)
+		return "", fmt.Errorf("ambiguous commit SHA prefix %q matches %d commits: %s", sha, len(matches), strings.Join(matches, ", "))
+	}
+}
+
+// normalizeSHA tries to expand a short SHA to full SHA if found in index.
+func (rl *ReverseLookup) normalizeSHA(sha string) string {
+	fullSHA, err := rl.resolveSHA(sha)
+	if err != nil {
+		return strings.TrimSpace(sha)
+	}
+	return fullSHA
 }
 
 // getCommitInfo retrieves commit info from git.

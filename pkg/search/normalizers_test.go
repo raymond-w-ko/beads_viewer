@@ -10,10 +10,17 @@ func TestNormalizeStatus(t *testing.T) {
 	cases := map[string]float64{
 		"open":        1.0,
 		"in_progress": 0.8,
+		"hooked":      0.8,
+		"review":      0.8,
+		"pinned":      0.7,
 		"blocked":     0.5,
+		"draft":       0.2,
+		"deferred":    0.2,
 		"closed":      0.1,
 		"tombstone":   0.0,
 		"unknown":     0.5,
+		" OPEN ":      1.0,
+		"Review":      0.8,
 	}
 	for status, expected := range cases {
 		if got := normalizeStatus(status); got != expected {

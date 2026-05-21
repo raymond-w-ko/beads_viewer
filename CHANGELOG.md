@@ -6,16 +6,101 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 ## [Unreleased]
 
-Post-v0.15.2 work on `main`, not yet tagged.
+---
 
-### Editor Integration
-- Smart terminal editor dispatch via `O` key for opening beads in `$EDITOR` ([550f3bd](https://github.com/Dicklesworthstone/beads_viewer/commit/550f3bd))
-- YAML frontmatter: single-pass unescape, escape all fields, fix body whitespace and labels handling ([7a481b0](https://github.com/Dicklesworthstone/beads_viewer/commit/7a481b0), [90aa46e](https://github.com/Dicklesworthstone/beads_viewer/commit/90aa46e), [c0f670b](https://github.com/Dicklesworthstone/beads_viewer/commit/c0f670b))
+## [v0.16.2] -- 2026-05-16 (Release)
+
+Patch release focused on updater correctness, release artifact reliability, and hardening fixes found during fresh-eyes review passes.
+
+### Updater & Versioning
+- Ignore update notices whose release tag is equal to or older than the running version, including tags with stray whitespace.
+- Clear stale in-session update banners when a later update check resolves to the current version.
+- Label the footer badge as `Update vX.Y.Z` so it is not confused with the running `bv --version` value.
+- Avoid redundant update checks after a recent successful check.
+- Accept stable release archive names in the updater.
+
+### Build & Release
+- Align GoReleaser archive names with README `latest/download` aliases, publish Windows as a zip archive, and update the GoReleaser config to v2 syntax.
+- Keep direct download aliases reproducible and version-aliased.
+- Keep GoReleaser snapshot builds from double-prefixing versions as `vvX.Y.Z-next`.
+
+### Tests
+- Harden background worker tests by waiting on worker state instead of fixed sleeps.
 
 ### Robustness
-- Preserve issue deep-links during cold load filter sync ([81a1983](https://github.com/Dicklesworthstone/beads_viewer/commit/81a1983))
-- Guard `truncate()` against negative/small max and nil Process check ([816f9c3](https://github.com/Dicklesworthstone/beads_viewer/commit/816f9c3))
+- Preserve completed history searches and coalesce queued background refreshes in the TUI.
+- Resolve historical `--as-of` dates from commit history and filter stale data sources by true newest time.
+- Harden correlation batch-stat locking, git stream progress callbacks, EOF handling, temporal author filters, and tombstone lifecycle classification.
+- Safely pair agent blurb removal markers.
+- Recover stale unreadable instance locks.
+
+### Search, Hooks, Analysis & Export
+- Score all bead statuses in hybrid search mode.
+- Reject malformed hook timeout values.
+- Normalize loaded feedback data for analysis.
+- Escape interactive graph HTML, validate Cloudflare project names, keep Cloudflare suggestions nonempty, and fail stale or zero-issue deployment verification.
+- Avoid shell browser launchers on Windows and strengthen GitHub deployment helper behavior before force-with-lease pushes.
+
+---
+
+## [v0.16.1] -- 2026-05-14 (Release)
+
+Patch release focused on dependency freshness, vendored reproducibility, and release metadata cleanup.
+
+### Dependencies
+- Update Go module and vendored dependencies, including `modernc.org/sqlite` 1.50.1, `fsnotify` 1.10.1, `pgregory.net/rapid` 1.3.0, `golang.org/x/*` packages, `goldmark` 1.8.2, `chroma` 2.24.1, and terminal-width/runtime helpers.
+- Verify the local `/dp/toon-go` dependency is already at the latest local commit used by `go.mod`.
+- Update Rust/WASM lockfiles and move `bv-graph-wasm` to `getrandom` 0.4 with the `wasm_js` feature.
+
+### Build & Release
+- Refresh fallback, Nix, README latest-download aliases, and changelog release metadata for `v0.16.1`.
+- Restrict ACFS notification workflow triggers to `main`.
+- Keep transient `.beads/.write.lock` files ignored and out of release commits.
+
+---
+
+## [v0.16.0] -- 2026-04-24 (Release)
+
+Release focused on robot registry hardening, scoped graph/search workflows, static export improvements, and broad robustness fixes.
+
+### Features
+- Phase-three robot registry with immutable snapshots and cache hardening.
+- `--robot-triage` scoping via `--graph-root` subgraphs.
+- Hybrid graph-aware ranking for static export search.
+- Heatmap controls, dynamic force layout, improved graph navigation, and mobile help.
+- JSONL reader and `IssueReader` interface for more flexible data loading.
+- Smart terminal editor dispatch via `O` key for opening beads in `$EDITOR` ([550f3bd](https://github.com/Dicklesworthstone/beads_viewer/commit/550f3bd))
+
+### Robustness
+- Suppress spurious robot-mode success banners that polluted JSON consumers.
+- Harden metrics cache singleflight behavior, worker snapshot publication, and concurrent status reads.
+- Guard `truncate()` against negative/small max values and nil process handles ([816f9c3](https://github.com/Dicklesworthstone/beads_viewer/commit/816f9c3))
 - Guard against negative `strings.Repeat` and normalize whitespace status ([a0a35ee](https://github.com/Dicklesworthstone/beads_viewer/commit/a0a35ee))
+- Preserve issue deep-links during cold load filter sync ([81a1983](https://github.com/Dicklesworthstone/beads_viewer/commit/81a1983))
+
+### Export & Graph
+- Include downstream dependents in root-focused graph BFS.
+- Pin graph node side panels reliably on click and add explicit open/close controls.
+- Preserve explicit pages source files and safely confine preview file serving.
+- Keep preview paths and status validation safe.
+
+### Robot Mode
+- Add agent capability manifest and executable/canonical command forms.
+- Align robot schema/envelope contracts across search, history, alerts, label, graph, burndown, forecast, diff, and recipe outputs.
+- Respect claimability in triage top picks and publish safer command examples.
+
+### Data Source & Loader
+- Load minimal SQLite schemas, honor explicit beads database files, and safely escape SQLite DSN paths.
+- Accept legacy dependency field names and UUIDv7 comment IDs.
+- Recognize SQLite database path extensions and handle canonical beads history paths.
+
+### Correlation & Search
+- Preserve explicit history paths in caches and aggregate directory file references.
+- Stop streaming git output after parse errors.
+- Harden hybrid weights, short-query boosts, and vector index access.
+
+### UI & Workflow
+- YAML frontmatter: single-pass unescape, escape all fields, fix body whitespace and labels handling ([7a481b0](https://github.com/Dicklesworthstone/beads_viewer/commit/7a481b0), [90aa46e](https://github.com/Dicklesworthstone/beads_viewer/commit/90aa46e), [c0f670b](https://github.com/Dicklesworthstone/beads_viewer/commit/c0f670b))
 
 ---
 
@@ -584,13 +669,13 @@ Major feature release adding time-travel, planning, recipes, the AI agent CLI in
 
 ## [v0.6.2] -- 2025-11-26 (Tag only)
 
-CI cleanup: remove master branch trigger after branch consolidation.
+CI cleanup: remove legacy branch trigger after branch consolidation.
 
 ---
 
 ## [v0.6.1] -- 2025-11-26 (Tag only)
 
-Finalize sync from master to main branch.
+Finalize sync from the legacy branch to `main`.
 
 ---
 
@@ -710,7 +795,10 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.2...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.2...HEAD
+[v0.16.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.1...v0.16.2
+[v0.16.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.0...v0.16.1
+[v0.16.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.2...v0.16.0
 [v0.15.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.1...v0.15.2
 [v0.15.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.0...v0.15.1
 [v0.15.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.14.4...v0.15.0

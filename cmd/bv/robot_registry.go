@@ -93,14 +93,16 @@ func (e *robotHandlerExitError) Unwrap() error {
 }
 
 type phaseOneRobotHandlerConfig struct {
-	RobotHelpFlag    *bool
-	RobotSchemaFlag  *bool
-	RobotRecipesFlag *bool
-	RobotMetricsFlag *bool
-	RobotDocsFlag    *string
-	VersionFlag      *bool
-	SchemaCommand    *string
-	RecipeLoader     func() *recipe.Loader
+	RobotHelpFlag         *bool
+	RobotCapabilitiesFlag *bool
+	RobotSchemaFlag       *bool
+	RobotRecipesFlag      *bool
+	RobotMetricsFlag      *bool
+	RobotDocsFlag         *string
+	VersionFlag           *bool
+	SchemaCommand         *string
+	RecipeLoader          func() *recipe.Loader
+	StructuredOutput      func() bool
 }
 
 type phaseTwoRobotHandlerConfig struct {
@@ -382,6 +384,8 @@ Core commands:
   --robot-next      Single top recommendation
   --robot-plan      Dependency-respecting execution tracks
   --robot-insights  Graph metrics and structural analysis
+  --robot-capabilities  Machine-readable command/contract manifest
+  --robot-schema    JSON Schema definitions for robot outputs
 
 `)
 	if err != nil {
@@ -438,6 +442,12 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 		FlagPtr:     cfg.RobotHelpFlag,
 		Description: "Show AI agent help",
 		Handler: func(ctx RobotContext) error {
+			if cfg.StructuredOutput != nil && cfg.StructuredOutput() {
+				if err := ctx.EncoderOrDefault().Encode(generateRobotDocs("guide")); err != nil {
+					return fmt.Errorf("encoding robot help: %w", err)
+				}
+				return nil
+			}
 			if err := writeRobotHelp(ctx.StdoutOrDefault()); err != nil {
 				return fmt.Errorf("writing robot help: %w", err)
 			}
@@ -453,6 +463,18 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 			_, err := fmt.Fprintf(ctx.StdoutOrDefault(), "bv %s\n", version.Version)
 			if err != nil {
 				return fmt.Errorf("writing version output: %w", err)
+			}
+			return nil
+		},
+	})
+	registry.Register(RobotCommand{
+		Name:        "robot-capabilities",
+		FlagName:    "robot-capabilities",
+		FlagPtr:     cfg.RobotCapabilitiesFlag,
+		Description: "Output machine-readable command capabilities",
+		Handler: func(ctx RobotContext) error {
+			if err := ctx.EncoderOrDefault().Encode(generateRobotCapabilities()); err != nil {
+				return fmt.Errorf("encoding robot capabilities: %w", err)
 			}
 			return nil
 		},
@@ -477,9 +499,15 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 			})
 
 			output := struct {
-				Recipes []recipe.RecipeSummary `json:"recipes"`
+				GeneratedAt  string                 `json:"generated_at"`
+				OutputFormat string                 `json:"output_format,omitempty"`
+				Version      string                 `json:"version,omitempty"`
+				Recipes      []recipe.RecipeSummary `json:"recipes"`
 			}{
-				Recipes: summaries,
+				GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+				OutputFormat: robotOutputFormat,
+				Version:      version.Version,
+				Recipes:      summaries,
 			}
 
 			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -512,12 +540,15 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 				}
 
 				fmt.Fprintf(ctx.StderrOrDefault(), "Unknown command: %s\n", commandName)
-				fmt.Fprintln(ctx.StderrOrDefault(), "Available commands:")
 				commandNames := make([]string, 0, len(schemas.Commands))
 				for name := range schemas.Commands {
 					commandNames = append(commandNames, name)
 				}
 				sort.Strings(commandNames)
+				if suggestion := suggestClosest(commandName, commandNames); suggestion != "" {
+					fmt.Fprintf(ctx.StderrOrDefault(), "Did you mean: %s\n", suggestion)
+				}
+				fmt.Fprintln(ctx.StderrOrDefault(), "Available commands:")
 				for _, name := range commandNames {
 					fmt.Fprintf(ctx.StderrOrDefault(), "  %s\n", name)
 				}
@@ -536,7 +567,19 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 		FlagPtr:     cfg.RobotMetricsFlag,
 		Description: "Output runtime performance metrics",
 		Handler: func(ctx RobotContext) error {
-			if err := ctx.EncoderOrDefault().Encode(metrics.GetAllMetrics()); err != nil {
+			snapshot := metrics.GetAllMetrics()
+			output := struct {
+				RobotEnvelope
+				Timing []metrics.TimingStats `json:"timing,omitempty"`
+				Cache  []metrics.CacheStats  `json:"cache,omitempty"`
+				Memory metrics.MemoryStats   `json:"memory"`
+			}{
+				RobotEnvelope: NewRobotEnvelope(ctx.DataHash),
+				Timing:        snapshot.Timing,
+				Cache:         snapshot.Cache,
+				Memory:        snapshot.Memory,
+			}
+			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 				return fmt.Errorf("encoding metrics: %w", err)
 			}
 			return nil
@@ -1691,14 +1734,16 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		rootIssueID = *cfg.GraphRoot
 	}
 
-	triage := analysis.ComputeTriageWithOptions(ctx.Issues, analysis.TriageOptions{
+	now := robotNow()
+	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
 		GroupByTrack:  cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
 		GroupByLabel:  cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
 		WaitForPhase2: true,
 		UseFastConfig: true,
 		History:       historyReport,
 		RootIssueID:   rootIssueID,
-	})
+	}, now)
+	stabilizeRobotTriageForPinnedClock(&triage)
 
 	var feedbackInfo *analysis.FeedbackJSON
 	if beadsDir, err := loader.GetBeadsDir(""); err == nil {
@@ -1767,7 +1812,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		Feedback    *analysis.FeedbackJSON `json:"feedback,omitempty"`
 		UsageHints  []string               `json:"usage_hints"`
 	}{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: now.Format(time.RFC3339),
 		DataHash:    ctx.DataHash,
 		AsOf:        ctx.AsOf,
 		AsOfCommit:  ctx.AsOfCommit,
@@ -1861,7 +1906,16 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		}
 	}
 
-	if err := ctx.EncoderOrDefault().Encode(report); err != nil {
+	output := struct {
+		correlation.HistoryReport
+		OutputFormat string `json:"output_format,omitempty"`
+		Version      string `json:"version,omitempty"`
+	}{
+		HistoryReport: *report,
+		OutputFormat:  robotOutputFormat,
+		Version:       version.Version,
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding history report: %w", err)
 	}
 	return nil
@@ -1916,11 +1970,55 @@ func loadCorrelationFeedbackStore(workDir string) (*correlation.FeedbackStore, e
 }
 
 func parseCorrelationArg(arg string) (string, string, error) {
-	parts := strings.SplitN(arg, ":", 2)
+	parts := strings.SplitN(strings.TrimSpace(arg), ":", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("expected format: SHA:beadID, got: %s", arg)
+		return "", "", fmt.Errorf("expected format: SHA:beadID, got: %q", arg)
 	}
-	return parts[0], parts[1], nil
+	commitSHA := strings.TrimSpace(parts[0])
+	beadID := strings.TrimSpace(parts[1])
+	if commitSHA == "" || beadID == "" {
+		return "", "", fmt.Errorf("expected non-empty SHA and bead ID in format SHA:beadID, got: %q", arg)
+	}
+	return commitSHA, beadID, nil
+}
+
+func resolveCorrelatedCommit(commits []correlation.CorrelatedCommit, sha string) (*correlation.CorrelatedCommit, error) {
+	sha = strings.ToLower(strings.TrimSpace(sha))
+	if sha == "" {
+		return nil, fmt.Errorf("commit SHA is required")
+	}
+
+	type commitMatch struct {
+		index int
+		sha   string
+	}
+	matches := make([]commitMatch, 0, 1)
+	seen := make(map[string]bool)
+	for i := range commits {
+		commitSHA := strings.ToLower(commits[i].SHA)
+		if commitSHA == sha {
+			return &commits[i], nil
+		}
+		shortSHA := strings.ToLower(commits[i].ShortSHA)
+		if (shortSHA == sha || strings.HasPrefix(commitSHA, sha)) && !seen[commitSHA] {
+			matches = append(matches, commitMatch{index: i, sha: commits[i].SHA})
+			seen[commitSHA] = true
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return nil, nil
+	case 1:
+		return &commits[matches[0].index], nil
+	default:
+		matchedSHAs := make([]string, len(matches))
+		for i, match := range matches {
+			matchedSHAs[i] = match.sha
+		}
+		sort.Strings(matchedSHAs)
+		return nil, fmt.Errorf("ambiguous commit SHA prefix %q matches %d commits: %s", sha, len(matchedSHAs), strings.Join(matchedSHAs, ", "))
+	}
 }
 
 func handleRobotCorrelationStats(ctx RobotContext) error {
@@ -1934,7 +2032,18 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 		return err
 	}
 
-	if err := ctx.EncoderOrDefault().Encode(feedbackStore.GetStats()); err != nil {
+	output := struct {
+		correlation.FeedbackStats
+		GeneratedAt  string `json:"generated_at"`
+		OutputFormat string `json:"output_format,omitempty"`
+		Version      string `json:"version,omitempty"`
+	}{
+		FeedbackStats: feedbackStore.GetStats(),
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		OutputFormat:  robotOutputFormat,
+		Version:       version.Version,
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding stats: %w", err)
 	}
 	return nil
@@ -1970,12 +2079,9 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 		return newReportedRobotHandlerExit(1)
 	}
 
-	var targetCommit *correlation.CorrelatedCommit
-	for i := range history.Commits {
-		if strings.HasPrefix(history.Commits[i].SHA, commitSHA) || history.Commits[i].ShortSHA == commitSHA {
-			targetCommit = &history.Commits[i]
-			break
-		}
+	targetCommit, err := resolveCorrelatedCommit(history.Commits, commitSHA)
+	if err != nil {
+		return err
 	}
 	if targetCommit == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
@@ -2023,16 +2129,21 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return fmt.Errorf("generating report: %w", err)
 	}
 
-	var originalConf float64
-	if history, ok := report.Histories[beadID]; ok {
-		for _, c := range history.Commits {
-			if strings.HasPrefix(c.SHA, commitSHA) || c.ShortSHA == commitSHA {
-				originalConf = c.Confidence
-				commitSHA = c.SHA
-				break
-			}
-		}
+	history, ok := report.Histories[beadID]
+	if !ok {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", beadID)
+		return newReportedRobotHandlerExit(1)
 	}
+	targetCommit, err := resolveCorrelatedCommit(history.Commits, commitSHA)
+	if err != nil {
+		return err
+	}
+	if targetCommit == nil {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
+		return newReportedRobotHandlerExit(1)
+	}
+	originalConf := targetCommit.Confidence
+	commitSHA = targetCommit.SHA
 
 	feedbackBy := "cli"
 	if cfg.CorrelationFeedbackBy != nil && strings.TrimSpace(*cfg.CorrelationFeedbackBy) != "" {
@@ -2159,22 +2270,7 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	if cfg.OrphansMinScore != nil {
 		minScore = *cfg.OrphansMinScore
 	}
-	filtered := make([]correlation.OrphanCandidate, 0, len(orphanReport.Candidates))
-	for _, candidate := range orphanReport.Candidates {
-		if candidate.SuspicionScore >= minScore {
-			filtered = append(filtered, candidate)
-		}
-	}
-	orphanReport.Candidates = filtered
-	orphanReport.Stats.CandidateCount = len(filtered)
-	orphanReport.Stats.AvgSuspicion = 0
-	if len(filtered) > 0 {
-		totalSuspicion := 0
-		for _, candidate := range filtered {
-			totalSuspicion += candidate.SuspicionScore
-		}
-		orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filtered))
-	}
+	filterOrphanReportByMinScore(orphanReport, minScore)
 
 	output := struct {
 		*correlation.OrphanReport
@@ -2189,6 +2285,31 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return fmt.Errorf("encoding orphan report: %w", err)
 	}
 	return nil
+}
+
+func filterOrphanReportByMinScore(orphanReport *correlation.OrphanReport, minScore int) {
+	filtered := make([]correlation.OrphanCandidate, 0, len(orphanReport.Candidates))
+	byBead := make(map[string][]string)
+	totalSuspicion := 0
+
+	for _, candidate := range orphanReport.Candidates {
+		if candidate.SuspicionScore < minScore {
+			continue
+		}
+		filtered = append(filtered, candidate)
+		totalSuspicion += candidate.SuspicionScore
+		for _, bead := range candidate.ProbableBeads {
+			byBead[bead.BeadID] = append(byBead[bead.BeadID], candidate.ShortSHA)
+		}
+	}
+
+	orphanReport.Candidates = filtered
+	orphanReport.ByBead = byBead
+	orphanReport.Stats.CandidateCount = len(filtered)
+	orphanReport.Stats.AvgSuspicion = 0
+	if len(filtered) > 0 {
+		orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filtered))
+	}
 }
 
 func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
@@ -2449,6 +2570,12 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	beadID := ""
 	if *cfg.RobotImpactNetworkFlag != "all" {
 		beadID = *cfg.RobotImpactNetworkFlag
+	}
+	if beadID != "" {
+		if _, ok := network.Nodes[beadID]; !ok {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found in network: %s\n", beadID)
+			return newReportedRobotHandlerExit(1)
+		}
 	}
 	depth := 1
 	if cfg.NetworkDepth != nil {

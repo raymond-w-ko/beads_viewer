@@ -449,6 +449,10 @@ func TestGraphExport_RootFilter(t *testing.T) {
 		t.Fatalf("JSON unmarshal failed: %v", err)
 	}
 
+	if result.Nodes != 3 {
+		t.Errorf("expected root-a focused graph to include root and downstream dependents, got %d nodes", result.Nodes)
+	}
+
 	// Check filter is recorded
 	if result.FiltersApplied["root"] != "root-a" {
 		t.Errorf("filters_applied.root = %q, want 'root-a'", result.FiltersApplied["root"])
@@ -474,6 +478,10 @@ func TestGraphExport_DepthFilter(t *testing.T) {
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatalf("JSON unmarshal failed: %v", err)
+	}
+
+	if result.Nodes != 2 {
+		t.Errorf("expected depth-1 root-a graph to include root and direct dependent, got %d nodes", result.Nodes)
 	}
 
 	// Check depth filter is recorded

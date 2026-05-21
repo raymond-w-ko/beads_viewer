@@ -1,3 +1,5 @@
+version: 2
+
 project_name: bv
 builds:
   - main: ./cmd/bv
@@ -17,10 +19,14 @@ builds:
         goarch: arm64
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
     name_template: >-
       {{ .ProjectName }}_
-      {{- .Version }}_
       {{- .Os }}_
       {{- .Arch }}
 
@@ -28,7 +34,7 @@ checksum:
   name_template: 'checksums.txt'
 
 snapshot:
-  name_template: "{{ .Tag }}-next"
+  version_template: "{{ .Version }}-next"
 
 changelog:
   sort: asc

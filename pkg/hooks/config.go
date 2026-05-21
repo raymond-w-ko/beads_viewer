@@ -5,8 +5,10 @@ package hooks
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,6 +100,7 @@ func NewLoader(opts ...LoaderOption) *Loader {
 
 // Load loads hook configuration from .bv/hooks.yaml
 func (l *Loader) Load() error {
+	l.warnings = nil
 	configPath := filepath.Join(l.projectDir, ".bv", "hooks.yaml")
 
 	data, err := os.ReadFile(configPath)
@@ -140,12 +143,16 @@ func normalizeHooks(hooks []Hook, phase HookPhase, warnings []string) ([]Hook, [
 		if hook.Timeout == 0 {
 			hook.Timeout = DefaultTimeout
 		}
-		if hook.OnError == "" {
-			if phase == PreExport {
-				hook.OnError = "fail" // pre-export failures cancel export by default
-			} else {
-				hook.OnError = "continue" // post-export failures don't break export by default
-			}
+		onError := strings.ToLower(strings.TrimSpace(hook.OnError))
+		switch onError {
+		case "":
+			hook.OnError = defaultOnError(phase)
+		case "fail", "continue":
+			hook.OnError = onError
+		default:
+			fallback := defaultOnError(phase)
+			warnings = append(warnings, fmt.Sprintf("%s hook %d has invalid on_error %q; using %q", phase, i+1, hook.OnError, fallback))
+			hook.OnError = fallback
 		}
 		if hook.Name == "" {
 			hook.Name = fmt.Sprintf("%s-%d", phase, i+1)
@@ -153,6 +160,13 @@ func normalizeHooks(hooks []Hook, phase HookPhase, warnings []string) ([]Hook, [
 		out = append(out, hook)
 	}
 	return out, warnings
+}
+
+func defaultOnError(phase HookPhase) string {
+	if phase == PreExport {
+		return "fail"
+	}
+	return "continue"
 }
 
 // Config returns the loaded configuration (or empty if not loaded)
@@ -223,20 +237,24 @@ func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 	h.Env = dto.Env
 	h.OnError = dto.OnError
 
-	// Parse timeout
-	if dto.Timeout != "" {
-		d, err := time.ParseDuration(dto.Timeout)
+	timeout := strings.TrimSpace(dto.Timeout)
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
 		if err == nil {
+			if d < 0 {
+				return fmt.Errorf("invalid timeout %q: must be non-negative", timeout)
+			}
 			h.Timeout = d
 		} else {
 			// Fallback: try numeric value (assumed seconds)
 			// This handles cases like "timeout: 30" which YAML decodes as string "30"
 			// but time.ParseDuration rejects (missing unit).
-			var seconds float64
-			if _, scanErr := fmt.Sscanf(dto.Timeout, "%f", &seconds); scanErr == nil {
+			const maxDurationSeconds = float64(1<<63-1) / float64(time.Second)
+			seconds, scanErr := strconv.ParseFloat(timeout, 64)
+			if scanErr == nil && seconds >= 0 && seconds <= maxDurationSeconds && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
 				h.Timeout = time.Duration(seconds * float64(time.Second))
 			} else {
-				return fmt.Errorf("invalid timeout %q: %w", dto.Timeout, err)
+				return fmt.Errorf("invalid timeout %q: %w", timeout, err)
 			}
 		}
 	}

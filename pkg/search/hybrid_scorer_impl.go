@@ -9,13 +9,12 @@ type hybridScorer struct {
 
 // NewHybridScorer creates a scorer with the given weights and metrics cache.
 func NewHybridScorer(weights Weights, cache MetricsCache) HybridScorer {
-	normalized := weights.Normalize()
+	normalized := defaultHybridWeights()
+	if err := weights.validateComponents(); err == nil {
+		normalized = weights.Normalize()
+	}
 	if err := normalized.Validate(); err != nil {
-		if preset, presetErr := GetPreset(PresetDefault); presetErr == nil {
-			normalized = preset
-		} else {
-			normalized = Weights{TextRelevance: 1.0}
-		}
+		normalized = defaultHybridWeights()
 	}
 	return &hybridScorer{
 		weights: normalized,
@@ -79,6 +78,13 @@ func (s *hybridScorer) Score(issueID string, textScore float64) (HybridScore, er
 			"recency":  recencyScore,
 		},
 	}, nil
+}
+
+func defaultHybridWeights() Weights {
+	if preset, err := GetPreset(PresetDefault); err == nil {
+		return preset
+	}
+	return Weights{TextRelevance: 1.0}
 }
 
 func (s *hybridScorer) Configure(weights Weights) error {

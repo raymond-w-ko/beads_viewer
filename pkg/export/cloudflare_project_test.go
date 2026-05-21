@@ -14,6 +14,127 @@ import (
 // TestEnsureCloudflareProject_Integration, which skips whenever wrangler is
 // not installed (i.e. always in CI).
 
+func TestCloudflareProjectNameRequired(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "exists",
+			run: func() error {
+				_, err := CloudflareProjectExists("  ")
+				return err
+			},
+		},
+		{
+			name: "create",
+			run: func() error {
+				return CreateCloudflareProject("", "main")
+			},
+		},
+		{
+			name: "ensure",
+			run: func() error {
+				return EnsureCloudflareProject("\t", "main")
+			},
+		},
+		{
+			name: "delete",
+			run: func() error {
+				return DeleteCloudflareProject(" ", true)
+			},
+		},
+		{
+			name: "deploy",
+			run: func() error {
+				_, err := DeployToCloudflarePages(CloudflareDeployConfig{
+					ProjectName: " ",
+					BundlePath:  "unused",
+				})
+				return err
+			},
+		},
+		{
+			name: "deploy with auto create",
+			run: func() error {
+				_, err := DeployToCloudflareWithAutoCreate(CloudflareDeployConfig{
+					ProjectName: "",
+					BundlePath:  "unused",
+				}, skipDeploymentIssueCountVerification)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.run()
+			if err == nil {
+				t.Fatal("expected project-name validation error")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "project name is required") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCloudflareProjectNameInvalid(t *testing.T) {
+	tests := []struct {
+		name         string
+		projectName  string
+		wantErrMatch string
+	}{
+		{
+			name:         "leading whitespace",
+			projectName:  " my-project",
+			wantErrMatch: "leading or trailing whitespace",
+		},
+		{
+			name:         "trailing whitespace",
+			projectName:  "my-project ",
+			wantErrMatch: "leading or trailing whitespace",
+		},
+		{
+			name:         "uppercase",
+			projectName:  "MyProject",
+			wantErrMatch: "lowercase letters",
+		},
+		{
+			name:         "underscore",
+			projectName:  "my_project",
+			wantErrMatch: "lowercase letters",
+		},
+		{
+			name:         "leading hyphen",
+			projectName:  "-my-project",
+			wantErrMatch: "start and end",
+		},
+		{
+			name:         "trailing hyphen",
+			projectName:  "my-project-",
+			wantErrMatch: "start and end",
+		},
+		{
+			name:         "too long",
+			projectName:  strings.Repeat("a", cloudflareProjectNameMaxLen+1),
+			wantErrMatch: "too long",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCloudflareProjectName(tc.projectName)
+			if err == nil {
+				t.Fatal("expected project-name validation error")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), tc.wantErrMatch) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErrMatch)
+			}
+		})
+	}
+}
+
 func TestCloudflareProjectExists_WranglerStub(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script stubs not supported on windows in this test")
@@ -85,8 +206,11 @@ exit %d
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if exists != tc.wantExists {
-				t.Fatalf("exists = %v, want %v", exists, tc.wantExists)
+			switch {
+			case exists && !tc.wantExists:
+				t.Fatalf("exists = true, want false")
+			case !exists && tc.wantExists:
+				t.Fatalf("exists = false, want true")
 			}
 		})
 	}

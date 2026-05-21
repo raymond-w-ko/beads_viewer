@@ -66,6 +66,27 @@ func TestVectorIndex_SearchTopK_OrderAndTieBreak(t *testing.T) {
 	}
 }
 
+func TestVectorIndex_GetReturnsCopy(t *testing.T) {
+	idx := NewVectorIndex(2)
+	if err := idx.Upsert("A", ComputeContentHash("a"), []float32{1, 0}); err != nil {
+		t.Fatalf("Upsert failed: %v", err)
+	}
+
+	entry, ok := idx.Get("A")
+	if !ok {
+		t.Fatalf("Expected entry A")
+	}
+	entry.Vector[0] = 99
+
+	entryAgain, ok := idx.Get("A")
+	if !ok {
+		t.Fatalf("Expected entry A")
+	}
+	if entryAgain.Vector[0] != 1 {
+		t.Fatalf("Get exposed internal vector storage: got %f", entryAgain.Vector[0])
+	}
+}
+
 func TestVectorIndex_Errors(t *testing.T) {
 	idx := NewVectorIndex(3)
 

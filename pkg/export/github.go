@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+const skipDeploymentIssueCountVerification = -1
+
 // GitHubDeployConfig configures GitHub Pages deployment.
 type GitHubDeployConfig struct {
 	// RepoName is the desired repository name (without owner)
@@ -238,14 +240,37 @@ func RepoHasContent(repoFullName string) (bool, error) {
 	cmd := exec.Command("gh", "api",
 		fmt.Sprintf("repos/%s/contents", repoFullName),
 		"-q", "length")
-	output, err := cmd.Output()
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// If 404 or empty, no content
-		return false, nil
+		outputText := strings.TrimSpace(string(output))
+		if repoContentsErrorIndicatesEmpty(outputText) {
+			return false, nil
+		}
+		if outputText == "" {
+			return false, fmt.Errorf("repo contents query failed: %w", err)
+		}
+		return false, fmt.Errorf("repo contents query failed: %w: %s", err, outputText)
 	}
 
 	length := strings.TrimSpace(string(output))
-	return length != "" && length != "0", nil
+	return repoContentsLengthIndicatesContent(length), nil
+}
+
+func repoContentsLengthIndicatesContent(length string) bool {
+	switch length {
+	case "", "0":
+		return false
+	default:
+		return true
+	}
+}
+
+func repoContentsErrorIndicatesEmpty(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "404") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "repository is empty") ||
+		strings.Contains(lower, "this repository is empty")
 }
 
 // InitAndPush initializes a git repository and pushes to GitHub.
@@ -286,18 +311,23 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 
 	for _, c := range commands {
 		fmt.Printf("  -> %s...\n", c.desc)
+		commandName := firstArg(c.args)
 		cmd := exec.Command("git", c.args...)
 		cmd.Dir = bundlePath
 		if output, err := cmd.CombinedOutput(); err != nil {
-			// Skip errors for branch -M if already on main
-			if c.args[0] == "branch" && strings.Contains(string(output), "already") {
-				continue
+			switch commandName {
+			case "branch":
+				// Skip errors for branch -M if already on main
+				if strings.Contains(string(output), "already") {
+					continue
+				}
+			case "commit":
+				// Skip commit error if nothing to commit
+				if strings.Contains(string(output), "nothing to commit") {
+					continue
+				}
 			}
-			// Skip commit error if nothing to commit
-			if c.args[0] == "commit" && strings.Contains(string(output), "nothing to commit") {
-				continue
-			}
-			return fmt.Errorf("%s failed: %s", c.args[0], strings.TrimSpace(string(output)))
+			return fmt.Errorf("%s failed: %s", commandName, strings.TrimSpace(string(output)))
 		}
 	}
 
@@ -306,7 +336,14 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 	configCmd.Dir = bundlePath
 	_ = configCmd.Run() // Ignore errors - this is best-effort
 
-	// Push with force-with-lease for safety
+	// Push with force-with-lease for safety.
+	// Fetch first so the lease is tied to the remote main ref we observed during this deploy.
+	if hasContent {
+		if err := fetchRemoteBranch(bundlePath, "main"); err != nil {
+			return fmt.Errorf("preparing force-with-lease: %w", err)
+		}
+	}
+
 	fmt.Println("  -> Pushing to GitHub...")
 	pushArgs := []string{"push", "-u", "origin", "main"}
 	if hasContent {
@@ -317,23 +354,34 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 	pushCmd := exec.Command("git", pushArgs...)
 	pushCmd.Dir = bundlePath
 	if output, err := pushCmd.CombinedOutput(); err != nil {
-		// If force-with-lease fails, try regular force
-		// This handles: "cannot be resolved", "stale info", and other lease failures
-		outputStr := string(output)
-		if strings.Contains(outputStr, "cannot be resolved") ||
-			strings.Contains(outputStr, "stale info") ||
-			strings.Contains(outputStr, "force-with-lease") {
-			pushCmd = exec.Command("git", "push", "-u", "origin", "main", "--force")
-			pushCmd.Dir = bundlePath
-			if output, err := pushCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("push failed: %s", strings.TrimSpace(string(output)))
-			}
-		} else {
-			return fmt.Errorf("push failed: %s", strings.TrimSpace(string(output)))
-		}
+		return gitCommandOutputError("push", output, err)
 	}
 
 	return nil
+}
+
+func fetchRemoteBranch(bundlePath, branch string) error {
+	cmd := exec.Command("git", "fetch", "--depth=1", "origin", branch)
+	cmd.Dir = bundlePath
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return gitCommandOutputError(fmt.Sprintf("git fetch origin %s", branch), output, err)
+	}
+	return nil
+}
+
+func gitCommandOutputError(context string, output []byte, err error) error {
+	msg := strings.TrimSpace(string(output))
+	if msg == "" {
+		return fmt.Errorf("%s failed: %w", context, err)
+	}
+	return fmt.Errorf("%s failed: %w: %s", context, err, msg)
+}
+
+func firstArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
 }
 
 // EnableGitHubPages enables GitHub Pages for a repository.
@@ -460,7 +508,10 @@ func DeployToGitHubPages(config GitHubDeployConfig) (*GitHubDeployResult, error)
 		fmt.Printf("\nUsing existing repository: %s\n", repoFullName)
 
 		// Check for existing content
-		hasContent, _ := RepoHasContent(repoFullName)
+		hasContent, err := RepoHasContent(repoFullName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check repository content: %w", err)
+		}
 		if hasContent && !config.ForceOverwrite && !config.SkipConfirmation {
 			fmt.Println("\nRepository has existing content!")
 			fmt.Println("Pushing will overwrite all existing files.")
@@ -599,27 +650,36 @@ func OpenInBrowser(url string) error {
 		return nil
 	}
 
-	var cmd *exec.Cmd
+	return startBrowserURL(url)
+}
 
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	default:
-		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+func startBrowserURL(url string) error {
+	name, args, err := browserOpenCommandForGOOS(runtime.GOOS, url)
+	if err != nil {
+		return err
 	}
 
-	return cmd.Start()
+	return exec.Command(name, args...).Start()
+}
+
+func browserOpenCommandForGOOS(goos, url string) (string, []string, error) {
+	switch goos {
+	case "darwin":
+		return "open", []string{url}, nil
+	case "linux":
+		return "xdg-open", []string{url}, nil
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported platform: %s", goos)
+	}
 }
 
 // SuggestRepoName generates a suggested repository name from the bundle path.
 func SuggestRepoName(bundlePath string) string {
 	// Use the directory name
 	name := filepath.Base(bundlePath)
-	if name == "." || name == "/" || name == "" {
+	if isEmptyPathBase(name) {
 		// Get parent dir name
 		abs, err := filepath.Abs(bundlePath)
 		if err == nil {
@@ -628,11 +688,11 @@ func SuggestRepoName(bundlePath string) string {
 	}
 
 	// If it's bv-pages or similar, use parent project name
-	if name == "bv-pages" || name == "pages" || name == "docs" {
+	if isGenericPagesDir(name) {
 		abs, err := filepath.Abs(bundlePath)
 		if err == nil {
 			parent := filepath.Base(filepath.Dir(abs))
-			if parent != "" && parent != "." && parent != "/" {
+			if !isEmptyPathBase(parent) {
 				name = parent + "-pages"
 			}
 		}
@@ -643,6 +703,24 @@ func SuggestRepoName(bundlePath string) string {
 	name = strings.ToLower(name)
 
 	return name
+}
+
+func isEmptyPathBase(name string) bool {
+	switch name {
+	case ".", "/", "":
+		return true
+	default:
+		return false
+	}
+}
+
+func isGenericPagesDir(name string) bool {
+	switch name {
+	case "bv-pages", "pages", "docs":
+		return true
+	default:
+		return false
+	}
 }
 
 // GitHubActionsWorkflowContent returns the content for a static site deployment workflow.
@@ -702,10 +780,10 @@ func WriteGitHubActionsWorkflow(bundlePath string) error {
 
 // GitHubActionsStatus represents the status of GitHub Actions for a repository.
 type GitHubActionsStatus struct {
-	WorkflowRunning  bool
-	WorkflowQueued   bool
-	LastRunStatus    string
-	LastRunCreatedAt string
+	WorkflowRunning     bool
+	WorkflowQueued      bool
+	LastRunStatus       string
+	LastRunCreatedAt    string
 	PossiblyRateLimited bool
 }
 
@@ -726,9 +804,9 @@ func CheckGitHubActionsStatus(repoFullName string) (*GitHubActionsStatus, error)
 
 	// Parse the JSON output
 	var run struct {
-		Status    string `json:"status"`
+		Status     string `json:"status"`
 		Conclusion string `json:"conclusion"`
-		CreatedAt string `json:"created_at"`
+		CreatedAt  string `json:"created_at"`
 	}
 	if err := json.Unmarshal(output, &run); err != nil {
 		return status, nil // Can't parse, assume OK
@@ -775,46 +853,47 @@ func SwitchToLegacyDeployment(repoFullName string) error {
 	return nil
 }
 
-// PushToGHPagesBranch creates and pushes to the gh-pages branch for legacy deployment.
+// PushToGHPagesBranch pushes the current bundle commit to the gh-pages branch for legacy deployment.
 func PushToGHPagesBranch(bundlePath string, repoFullName string) error {
-	fmt.Println("  -> Creating gh-pages branch...")
+	fmt.Println("  -> Preparing gh-pages branch...")
 
-	// Create orphan gh-pages branch
 	commands := []struct {
 		args []string
 		desc string
 	}{
-		{[]string{"checkout", "--orphan", "gh-pages"}, "Creating gh-pages branch"},
 		{[]string{"add", "."}, "Staging files"},
 		{[]string{"commit", "-m", "Deploy via legacy gh-pages branch"}, "Creating commit"},
 	}
 
 	for _, c := range commands {
+		commandName := firstArg(c.args)
 		cmd := exec.Command("git", c.args...)
 		cmd.Dir = bundlePath
 		if output, err := cmd.CombinedOutput(); err != nil {
-			// Skip if branch already exists
-			if strings.Contains(string(output), "already exists") {
-				// Checkout existing branch and force update
-				checkoutCmd := exec.Command("git", "checkout", "gh-pages")
-				checkoutCmd.Dir = bundlePath
-				checkoutCmd.Run()
-				continue
+			switch commandName {
+			case "commit":
+				// Skip commit error if nothing to commit
+				if strings.Contains(string(output), "nothing to commit") {
+					continue
+				}
 			}
-			// Skip commit error if nothing to commit
-			if c.args[0] == "commit" && strings.Contains(string(output), "nothing to commit") {
-				continue
-			}
-			return fmt.Errorf("%s failed: %s", c.args[0], strings.TrimSpace(string(output)))
+			return fmt.Errorf("%s failed: %s", commandName, strings.TrimSpace(string(output)))
 		}
 	}
 
-	// Push gh-pages branch
+	// Push the current export commit to gh-pages. Do not check out an existing
+	// gh-pages branch here: that would replace the freshly exported bundle with
+	// the old branch contents before staging and can redeploy stale pages.
 	fmt.Println("  -> Pushing gh-pages branch...")
-	pushCmd := exec.Command("git", "push", "-u", "origin", "gh-pages", "--force")
+	pushArgs := []string{"push", "-u", "origin", "HEAD:gh-pages"}
+	if err := fetchRemoteBranch(bundlePath, "gh-pages"); err == nil {
+		pushArgs = append(pushArgs, "--force-with-lease")
+	}
+
+	pushCmd := exec.Command("git", pushArgs...)
 	pushCmd.Dir = bundlePath
 	if output, err := pushCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("push gh-pages failed: %s", strings.TrimSpace(string(output)))
+		return gitCommandOutputError("push gh-pages", output, err)
 	}
 
 	return nil
@@ -853,12 +932,11 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 			continue
 		}
 
-		// Check issue count matches expected
-		if expectedIssueCount > 0 && meta.IssueCount != expectedIssueCount {
-			// Data mismatch - might be stale cache
-			fmt.Printf("  ⚠ Warning: Live site shows %d issues, expected %d (CDN may be caching stale data)\n",
+		// Check issue count matches expected. Zero is a valid expected
+		// count for empty exports; negative disables count comparison.
+		if expectedIssueCount >= 0 && meta.IssueCount != expectedIssueCount {
+			return fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
 				meta.IssueCount, expectedIssueCount)
-			return nil // Not a fatal error, just a warning
 		}
 
 		fmt.Printf("  ✓ Deployment verified: %d issues live\n", meta.IssueCount)
@@ -866,9 +944,9 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 	}
 
 	if lastErr != nil {
-		fmt.Printf("  ⚠ Could not verify deployment (site may still be building): %v\n", lastErr)
+		return fmt.Errorf("deployment verification failed for %s: %w", metaURL, lastErr)
 	}
-	return nil // Don't fail on verification timeout
+	return fmt.Errorf("deployment verification timed out for %s", metaURL)
 }
 
 // DeployToGitHubPagesWithFallback performs deployment with automatic fallback to legacy mode
@@ -903,9 +981,12 @@ func DeployToGitHubPagesWithFallback(config GitHubDeployConfig, expectedIssueCou
 		}
 	}
 
-	// Verify deployment if we have expected issue count
-	if expectedIssueCount > 0 {
-		VerifyGitHubPagesDeployment(result.PagesURL, expectedIssueCount, 90*time.Second)
+	// Verify deployment if we have an expected issue count. Zero is valid for
+	// empty exports; a negative sentinel means the caller opted out.
+	if expectedIssueCount >= 0 {
+		if err := VerifyGitHubPagesDeployment(result.PagesURL, expectedIssueCount, 90*time.Second); err != nil {
+			return nil, fmt.Errorf("verify github pages deployment: %w", err)
+		}
 	}
 
 	return result, nil

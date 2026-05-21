@@ -113,8 +113,8 @@ func SyncVectorIndex(ctx context.Context, idx *VectorIndex, embedder Embedder, d
 	for _, id := range ids {
 		text := docs[id]
 		ch := ComputeContentHash(text)
-		existing, ok := idx.Get(id)
-		if ok && existing.ContentHash == ch {
+		existingHash, ok := idx.contentHash(id)
+		if ok && existingHash == ch {
 			stats.Skipped++
 			continue
 		}

@@ -102,6 +102,30 @@ func testTheme() Theme {
 	return DefaultTheme(lipgloss.NewRenderer(nil))
 }
 
+func intsDiffer(got, want int) bool {
+	return got != want
+}
+
+func stringsDiffer(got, want string) bool {
+	return strings.Compare(got, want) != 0
+}
+
+func sameTimelineEntryType(got, want timelineEntryType) bool {
+	return got == want
+}
+
+func fileTreeNodeIsNamed(node *FileTreeNode, name string) bool {
+	return node != nil && strings.Compare(node.Name, name) == 0
+}
+
+func fileTreeNodeIsDirNamed(node *FileTreeNode, name string) bool {
+	return fileTreeNodeIsNamed(node, name) && node.IsDir
+}
+
+func fileTreeNodeIsFileNamed(node *FileTreeNode, name string) bool {
+	return fileTreeNodeIsNamed(node, name) && !node.IsDir
+}
+
 func TestNewHistoryModel(t *testing.T) {
 	report := createTestHistoryReport()
 	theme := testTheme()
@@ -835,6 +859,37 @@ func TestHistoryModel_GetFilteredCommitList(t *testing.T) {
 	}
 }
 
+func TestHistoryModel_ToggleViewModePreservesFinishedSearch(t *testing.T) {
+	report := createTestHistoryReport()
+	theme := testTheme()
+	h := NewHistoryModel(report, theme)
+
+	h.StartSearch()
+	h.searchInput.SetValue("indexes")
+	h.applySearchFilter()
+	h.FinishSearch()
+
+	if h.IsSearchActive() {
+		t.Fatal("search should be inactive after FinishSearch()")
+	}
+	if got := h.beadIDs; len(got) != 1 || got[0] != "bv-3" {
+		t.Fatalf("filtered bead IDs before mode toggle = %v, want [bv-3]", got)
+	}
+	if filterLine := h.renderFilterLine(); !strings.Contains(filterLine, "\"indexes\"") {
+		t.Fatalf("filter line after finished search = %q, want query badge", filterLine)
+	}
+
+	h.ToggleViewMode()
+
+	filteredCommits := h.GetFilteredCommitList()
+	if len(filteredCommits) != 1 {
+		t.Fatalf("filtered commits after finished-search mode toggle = %d, want 1", len(filteredCommits))
+	}
+	if filteredCommits[0].Message != "refactor: db indexes" {
+		t.Fatalf("filtered commit after mode toggle = %q, want %q", filteredCommits[0].Message, "refactor: db indexes")
+	}
+}
+
 // =============================================================================
 // LAYOUT CALCULATION TESTS (bv-xrfh)
 // =============================================================================
@@ -883,10 +938,16 @@ func TestHistoryModel_PaneCount(t *testing.T) {
 		t.Errorf("paneCount() at standard width = %d, want 3", h.paneCount())
 	}
 
-	// Wide width = 3 panes
+	// Wide non-git history view = 4 panes
 	h.SetSize(160, 40)
+	if h.paneCount() != 4 {
+		t.Errorf("paneCount() at wide width = %d, want 4", h.paneCount())
+	}
+
+	// Wide git view keeps the 3-pane commit layout
+	h.viewMode = historyModeGit
 	if h.paneCount() != 3 {
-		t.Errorf("paneCount() at wide width = %d, want 3", h.paneCount())
+		t.Errorf("paneCount() at wide width in git mode = %d, want 3", h.paneCount())
 	}
 }
 
@@ -922,6 +983,38 @@ func TestHistoryModel_ToggleFocusThreePane(t *testing.T) {
 	}
 }
 
+func TestHistoryModel_ToggleFocusFourPane(t *testing.T) {
+	report := createTestHistoryReport()
+	theme := testTheme()
+	h := NewHistoryModel(report, theme)
+
+	h.SetSize(160, 40)
+
+	if h.focused != historyFocusList {
+		t.Errorf("initial focus = %d, want historyFocusList", h.focused)
+	}
+
+	h.ToggleFocus()
+	if h.focused != historyFocusTimeline {
+		t.Errorf("focus after first toggle = %d, want historyFocusTimeline", h.focused)
+	}
+
+	h.ToggleFocus()
+	if h.focused != historyFocusMiddle {
+		t.Errorf("focus after second toggle = %d, want historyFocusMiddle", h.focused)
+	}
+
+	h.ToggleFocus()
+	if h.focused != historyFocusDetail {
+		t.Errorf("focus after third toggle = %d, want historyFocusDetail", h.focused)
+	}
+
+	h.ToggleFocus()
+	if h.focused != historyFocusList {
+		t.Errorf("focus after fourth toggle = %d, want historyFocusList", h.focused)
+	}
+}
+
 func TestHistoryModel_ListHeight(t *testing.T) {
 	report := createTestHistoryReport()
 	theme := testTheme()
@@ -929,7 +1022,7 @@ func TestHistoryModel_ListHeight(t *testing.T) {
 
 	h.SetSize(100, 40)
 	expected := 40 - 3 // height - header reserve
-	if h.listHeight() != expected {
+	if intsDiffer(h.listHeight(), expected) {
 		t.Errorf("listHeight() = %d, want %d", h.listHeight(), expected)
 	}
 }
@@ -1487,10 +1580,10 @@ func TestBuildTimeline(t *testing.T) {
 			commitCount := 0
 			foundEvents := make(map[string]bool)
 			for _, e := range entries {
-				if e.EntryType == timelineEntryEvent {
+				if sameTimelineEntryType(e.EntryType, timelineEntryEvent) {
 					eventCount++
 					foundEvents[e.EventType] = true
-				} else if e.EntryType == timelineEntryCommit {
+				} else if sameTimelineEntryType(e.EntryType, timelineEntryCommit) {
 					commitCount++
 				}
 			}
@@ -1721,10 +1814,10 @@ func TestBuildTimelineSessionOrderingOnTimeTie(t *testing.T) {
 	// Find the commit and session with same timestamp
 	var commitIdx, sessionIdx int
 	for i, e := range entries {
-		if e.EntryType == timelineEntryCommit && e.Timestamp.Equal(sameTime) {
+		if sameTimelineEntryType(e.EntryType, timelineEntryCommit) && e.Timestamp.Equal(sameTime) {
 			commitIdx = i
 		}
-		if e.EntryType == timelineEntrySession && e.Timestamp.Equal(sameTime) {
+		if sameTimelineEntryType(e.EntryType, timelineEntrySession) && e.Timestamp.Equal(sameTime) {
 			sessionIdx = i
 		}
 	}
@@ -1776,7 +1869,7 @@ func TestBuildTimelineWithoutSessions(t *testing.T) {
 
 	// No session entries
 	for _, e := range entries {
-		if e.EntryType == timelineEntrySession {
+		if sameTimelineEntryType(e.EntryType, timelineEntrySession) {
 			t.Error("Should not have session entries when none cached")
 		}
 	}
@@ -2235,10 +2328,10 @@ func TestFileTree_BuildsCorrectStructure(t *testing.T) {
 	// Check for expected structure: pkg/ and README.md
 	var foundPkg, foundReadme bool
 	for _, node := range h.fileTree {
-		if node.Name == "pkg" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "pkg") {
 			foundPkg = true
 		}
-		if node.Name == "README.md" && !node.IsDir {
+		if fileTreeNodeIsFileNamed(node, "README.md") {
 			foundReadme = true
 		}
 	}
@@ -2253,6 +2346,75 @@ func TestFileTree_BuildsCorrectStructure(t *testing.T) {
 	// Directories should be sorted before files
 	if len(h.fileTree) >= 2 && !h.fileTree[0].IsDir && h.fileTree[len(h.fileTree)-1].IsDir {
 		t.Error("Directories should come before files in tree")
+	}
+}
+
+func TestFileTree_DirectoryChangeCounts(t *testing.T) {
+	report := createTestHistoryReportWithFiles()
+	theme := testTheme()
+	h := NewHistoryModel(report, theme)
+	h.SetSize(160, 40)
+
+	h.ToggleFileTree()
+
+	findNode := func(path string) *FileTreeNode {
+		var walk func(nodes []*FileTreeNode) *FileTreeNode
+		walk = func(nodes []*FileTreeNode) *FileTreeNode {
+			for _, node := range nodes {
+				if strings.Compare(node.Path, path) == 0 {
+					return node
+				}
+				if found := walk(node.Children); found != nil {
+					return found
+				}
+			}
+			return nil
+		}
+		return walk(h.fileTree)
+	}
+
+	tests := []struct {
+		path string
+		want int
+	}{
+		{"pkg", 4},
+		{"pkg/auth", 3},
+		{"pkg/auth/token.go", 2},
+		{"pkg/db", 1},
+		{"README.md", 1},
+	}
+
+	for _, tc := range tests {
+		node := findNode(tc.path)
+		if node == nil {
+			t.Fatalf("expected file tree node %q", tc.path)
+		}
+		if node.ChangeCount < tc.want || node.ChangeCount > tc.want {
+			t.Errorf("node %q ChangeCount = %d, want %d", tc.path, node.ChangeCount, tc.want)
+		}
+	}
+}
+
+func TestFileTreePathPrefixes(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{name: "file in nested directory", path: "pkg/auth/token.go", want: []string{"pkg", "pkg/auth", "pkg/auth/token.go"}},
+		{name: "root file", path: "README.md", want: []string{"README.md"}},
+		{name: "leading and repeated separators", path: "/pkg//auth/token.go", want: []string{"pkg", "pkg/auth", "pkg/auth/token.go"}},
+		{name: "empty", path: "", want: nil},
+		{name: "only separators", path: "///", want: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fileTreePathPrefixes(tc.path)
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("fileTreePathPrefixes(%q) = %#v, want %#v", tc.path, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -2316,7 +2478,7 @@ func TestFileTree_ExpandCollapse(t *testing.T) {
 	// Find pkg directory (should be first since dirs come before files)
 	var pkgIdx int
 	for i, node := range h.flatFileList {
-		if node.Name == "pkg" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "pkg") {
 			pkgIdx = i
 			break
 		}
@@ -2371,7 +2533,7 @@ func TestFileTree_CollapseNode(t *testing.T) {
 	// Find and expand pkg directory
 	var pkgIdx int
 	for i, node := range h.flatFileList {
-		if node.Name == "pkg" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "pkg") {
 			pkgIdx = i
 			break
 		}
@@ -2400,7 +2562,7 @@ func TestFileTree_SelectFile(t *testing.T) {
 
 	// Expand to reach a file
 	for i, node := range h.flatFileList {
-		if node.Name == "pkg" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "pkg") {
 			h.selectedFileIdx = i
 			h.ToggleExpandFile()
 			break
@@ -2409,7 +2571,7 @@ func TestFileTree_SelectFile(t *testing.T) {
 
 	// Find auth directory and expand it
 	for i, node := range h.flatFileList {
-		if node.Name == "auth" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "auth") {
 			h.selectedFileIdx = i
 			h.ToggleExpandFile()
 			break
@@ -2440,7 +2602,7 @@ func TestFileTree_SelectFile(t *testing.T) {
 
 	// Select file to set filter
 	h.SelectFile()
-	if h.GetFileFilter() != filePath {
+	if stringsDiffer(h.GetFileFilter(), filePath) {
 		t.Errorf("Filter should be %q, got %q", filePath, h.GetFileFilter())
 	}
 
@@ -2660,10 +2822,10 @@ func TestFileTree_MultipleFilesPerCommit(t *testing.T) {
 	// Look for token.go and session.go
 	var foundToken, foundSession bool
 	for _, node := range h.flatFileList {
-		if node.Name == "token.go" {
+		if fileTreeNodeIsNamed(node, "token.go") {
 			foundToken = true
 		}
-		if node.Name == "session.go" {
+		if fileTreeNodeIsNamed(node, "session.go") {
 			foundSession = true
 		}
 	}
@@ -2705,7 +2867,7 @@ func TestFileTree_CommitsGroupedByPath(t *testing.T) {
 
 	// Find and select token.go
 	for i, node := range h.flatFileList {
-		if node.Name == "token.go" && !node.IsDir {
+		if fileTreeNodeIsFileNamed(node, "token.go") {
 			h.selectedFileIdx = i
 			h.SelectFile()
 			break
@@ -2734,7 +2896,7 @@ func TestFileTree_DirectoryContainsChildFiles(t *testing.T) {
 	// Find pkg directory
 	var pkgIdx int
 	for i, node := range h.flatFileList {
-		if node.Name == "pkg" && node.IsDir {
+		if fileTreeNodeIsDirNamed(node, "pkg") {
 			pkgIdx = i
 			break
 		}

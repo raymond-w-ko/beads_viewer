@@ -325,13 +325,107 @@ func TestExportGraph_SubgraphRoot(t *testing.T) {
 		t.Fatalf("ExportGraph failed: %v", err)
 	}
 
-	// bv-2 depends on bv-1, so subgraph from bv-2 should include bv-1 and bv-2
-	if result.Nodes != 2 {
-		t.Errorf("Expected 2 nodes in subgraph from bv-2, got %d", result.Nodes)
+	// bv-2 depends on bv-1 and unblocks bv-3, so the focused subgraph
+	// includes both dependency directions.
+	if result.Nodes != 3 {
+		t.Errorf("Expected 3 nodes in subgraph from bv-2, got %d", result.Nodes)
 	}
 
 	if result.FiltersApplied["root"] != "bv-2" {
 		t.Errorf("Expected root filter 'bv-2', got %s", result.FiltersApplied["root"])
+	}
+}
+
+func TestExportGraph_SubgraphRootIncludesDependents(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root-a", Title: "Root Issue", Status: model.StatusOpen},
+		{ID: "child-b", Title: "Child Issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "child-b", DependsOnID: "root-a", Type: model.DepBlocks},
+			},
+		},
+		{ID: "leaf-c", Title: "Leaf Issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "leaf-c", DependsOnID: "child-b", Type: model.DepBlocks},
+			},
+		},
+		{ID: "independent-d", Title: "Unrelated Issue", Status: model.StatusOpen},
+	}
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+
+	result, err := ExportGraph(issues, &stats, GraphExportConfig{
+		Format: GraphFormatJSON,
+		Root:   "root-a",
+	})
+	if err != nil {
+		t.Fatalf("ExportGraph failed: %v", err)
+	}
+	if result.Nodes != 3 {
+		t.Fatalf("expected root subgraph to include root and dependents, got %d nodes", result.Nodes)
+	}
+
+	got := make(map[string]bool)
+	for _, node := range result.Adjacency.Nodes {
+		got[node.ID] = true
+	}
+	for _, want := range []string{"root-a", "child-b", "leaf-c"} {
+		if !got[want] {
+			t.Fatalf("focused graph missing %s; nodes=%v", want, got)
+		}
+	}
+	if got["independent-d"] {
+		t.Fatalf("focused graph should not include independent issue; nodes=%v", got)
+	}
+}
+
+func TestExportGraph_SubgraphDepthLimitsBothDirections(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root-a", Title: "Root Issue", Status: model.StatusOpen},
+		{ID: "child-b", Title: "Child Issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "child-b", DependsOnID: "root-a", Type: model.DepBlocks},
+			},
+		},
+		{ID: "leaf-c", Title: "Leaf Issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "leaf-c", DependsOnID: "child-b", Type: model.DepBlocks},
+			},
+		},
+		{ID: "sibling-d", Title: "Sibling Issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "sibling-d", DependsOnID: "root-a", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+
+	result, err := ExportGraph(issues, &stats, GraphExportConfig{
+		Format: GraphFormatJSON,
+		Root:   "root-a",
+		Depth:  1,
+	})
+	if err != nil {
+		t.Fatalf("ExportGraph failed: %v", err)
+	}
+	if result.Nodes != 3 {
+		t.Fatalf("expected depth-1 root subgraph to include root and direct dependents, got %d nodes", result.Nodes)
+	}
+
+	got := make(map[string]bool)
+	for _, node := range result.Adjacency.Nodes {
+		got[node.ID] = true
+	}
+	for _, want := range []string{"root-a", "child-b", "sibling-d"} {
+		if !got[want] {
+			t.Fatalf("depth-limited focused graph missing %s; nodes=%v", want, got)
+		}
+	}
+	if got["leaf-c"] {
+		t.Fatalf("depth-limited focused graph should not include depth-2 leaf; nodes=%v", got)
 	}
 }
 

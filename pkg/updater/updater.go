@@ -2,6 +2,8 @@ package updater
 
 import (
 	"archive/tar"
+	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,7 +27,14 @@ const (
 	repoOwner = "Dicklesworthstone"
 	repoName  = "beads_viewer"
 	baseURL   = "https://api.github.com/repos/" + repoOwner + "/" + repoName
+
+	maxReleaseMetadataBytes = 1 << 20
+	maxDownloadBytes        = 512 << 20
 )
+
+// maxExtractedBinaryBytes is a variable so tests can shrink the limit without
+// constructing large archives. Production keeps it aligned with maxDownloadBytes.
+var maxExtractedBinaryBytes int64 = maxDownloadBytes
 
 // githubToken returns a GitHub personal access token from the environment,
 // checking GITHUB_TOKEN first, then GH_TOKEN. Returns empty string if
@@ -55,6 +64,37 @@ func setGitHubAuth(req *http.Request) {
 	if tok := githubToken(); tok != "" && isGitHubHost(req.URL) {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
+}
+
+func safeAssetName(name string) (string, error) {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return "", fmt.Errorf("unsafe release asset name %q", name)
+	}
+	return name, nil
+}
+
+func decodeReleaseMetadata(body io.Reader) (Release, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxReleaseMetadataBytes+1))
+	if err != nil {
+		return Release{}, err
+	}
+	if int64(len(data)) > maxReleaseMetadataBytes {
+		return Release{}, fmt.Errorf("release metadata exceeds %d bytes", maxReleaseMetadataBytes)
+	}
+
+	var rel Release
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&rel); err != nil {
+		return Release{}, err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Release{}, fmt.Errorf("release metadata contains multiple JSON values")
+		}
+		return Release{}, fmt.Errorf("release metadata has trailing data: %w", err)
+	}
+	return rel, nil
 }
 
 // Release represents a GitHub release
@@ -117,8 +157,8 @@ func checkForUpdates(client *http.Client, url string) (string, string, error) {
 		return "", "", fmt.Errorf("github api returned status: %s", resp.Status)
 	}
 
-	var rel Release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	rel, err := decodeReleaseMetadata(resp.Body)
+	if err != nil {
 		return "", "", err
 	}
 
@@ -129,6 +169,11 @@ func checkForUpdates(client *http.Client, url string) (string, string, error) {
 	}
 
 	return "", "", nil
+}
+
+// IsNewerThanCurrent reports whether candidate is newer than this binary's version.
+func IsNewerThanCurrent(candidate string) bool {
+	return compareVersions(candidate, version.Version) > 0
 }
 
 // compareVersions compares semver-ish strings with optional leading 'v' and optional pre-release
@@ -149,7 +194,7 @@ func compareVersions(v1, v2 string) int {
 
 	// isDevLabel returns true if the prerelease label indicates a development build
 	isDevLabel := func(label string) bool {
-		label = strings.ToLower(label)
+		label = strings.ToLower(strings.TrimSpace(label))
 		return strings.Contains(label, "dev") ||
 			strings.Contains(label, "dirty") ||
 			strings.Contains(label, "nightly") ||
@@ -159,12 +204,13 @@ func compareVersions(v1, v2 string) int {
 	}
 
 	parse := func(v string) *parsed {
+		v = strings.TrimSpace(v)
 		v = strings.TrimPrefix(v, "v")
 		prerelease := false
 		preLabel := ""
 		if idx := strings.Index(v, "-"); idx != -1 {
 			prerelease = true
-			preLabel = v[idx+1:]
+			preLabel = strings.TrimSpace(v[idx+1:])
 			v = v[:idx] // compare only main version numbers
 		}
 		parts := strings.Split(v, ".")
@@ -200,7 +246,7 @@ func compareVersions(v1, v2 string) int {
 	// If local version (v2) is a development build (unparseable), consider it newer
 	// than any release to prevent downgrade prompts.
 	isDev := func(v string) bool {
-		v = strings.ToLower(v)
+		v = strings.ToLower(strings.TrimSpace(v))
 		return strings.Contains(v, "dev") ||
 			strings.Contains(v, "dirty") ||
 			strings.Contains(v, "nightly") ||
@@ -334,8 +380,8 @@ func compareVersions(v1, v2 string) int {
 
 	// Fallback: both are non-semver (e.g. "dev" vs "dirty").
 	// Use lexicographic sort just to be deterministic.
-	v1 = strings.TrimPrefix(v1, "v")
-	v2 = strings.TrimPrefix(v2, "v")
+	v1 = strings.TrimPrefix(strings.TrimSpace(v1), "v")
+	v2 = strings.TrimPrefix(strings.TrimSpace(v2), "v")
 	if v1 > v2 {
 		return 1
 	} else if v1 < v2 {
@@ -367,28 +413,67 @@ func GetLatestRelease() (*Release, error) {
 		return nil, fmt.Errorf("github api returned status: %s", resp.Status)
 	}
 
-	var rel Release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	rel, err := decodeReleaseMetadata(resp.Body)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse release info: %w", err)
 	}
 
 	return &rel, nil
 }
 
-// getAssetName returns the expected asset name for the current platform
-func getAssetName(version string) string {
-	ver := strings.TrimPrefix(version, "v")
+func platformArchiveExtension(goos string) string {
+	if goos == "windows" {
+		return ".zip"
+	}
+	return ".tar.gz"
+}
+
+func stableAssetName() string {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
-	return fmt.Sprintf("bv_%s_%s_%s.tar.gz", ver, goos, goarch)
+	return fmt.Sprintf("bv_%s_%s%s", goos, goarch, platformArchiveExtension(goos))
+}
+
+// getAssetName returns the legacy versioned asset name for older releases.
+func getAssetName(version string) string {
+	ver := strings.TrimPrefix(version, "v")
+	return fmt.Sprintf("bv_%s_%s_%s%s", ver, runtime.GOOS, runtime.GOARCH, platformArchiveExtension(runtime.GOOS))
+}
+
+func platformAssetNames(version string) []string {
+	ver := strings.TrimPrefix(version, "v")
+
+	names := []string{stableAssetName()}
+	if ver != "" {
+		names = append(names, getAssetName(version))
+		if runtime.GOOS == "windows" {
+			names = append(names, fmt.Sprintf("bv_%s_%s_%s.tar.gz", ver, runtime.GOOS, runtime.GOARCH))
+		}
+	}
+	return names
 }
 
 // FindPlatformAsset finds the appropriate asset for the current OS/arch
 func (r *Release) FindPlatformAsset() *Asset {
-	targetName := getAssetName(r.TagName)
-	for i := range r.Assets {
-		if r.Assets[i].Name == targetName {
-			return &r.Assets[i]
+	for _, targetName := range platformAssetNames(r.TagName) {
+		for i := range r.Assets {
+			if r.Assets[i].Name == targetName {
+				return &r.Assets[i]
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Release) findPlatformAssetWithChecksum(checksums map[string]string) *Asset {
+	for _, targetName := range platformAssetNames(r.TagName) {
+		if _, ok := checksums[targetName]; !ok {
+			continue
+		}
+		for i := range r.Assets {
+			if r.Assets[i].Name == targetName {
+				return &r.Assets[i]
+			}
 		}
 	}
 	return nil
@@ -409,6 +494,13 @@ func (r *Release) FindChecksumAsset() *Asset {
 // If expectedSize is > 0, the download is size-verified against the HTTP Content-Length
 // (when present) and the number of bytes written.
 func downloadFile(url, destPath string, expectedSize int64) error {
+	if expectedSize < 0 {
+		return fmt.Errorf("download size cannot be negative: %d", expectedSize)
+	}
+	if expectedSize > maxDownloadBytes {
+		return fmt.Errorf("download size %d exceeds maximum %d", expectedSize, maxDownloadBytes)
+	}
+
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -455,17 +547,12 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 	}
 
 	// Cap download size to prevent unbounded disk writes from malicious/corrupted responses.
-	// Allow 10% overhead for encoding variance; minimum 100MB for safety.
-	var reader io.Reader = resp.Body
+	var limit int64 = maxDownloadBytes + 1
 	if expectedSize > 0 {
-		maxSize := expectedSize + expectedSize/10
-		if maxSize < 100*1024*1024 {
-			maxSize = 100 * 1024 * 1024
-		}
-		reader = io.LimitReader(resp.Body, maxSize)
+		limit = expectedSize + 1
 	}
 
-	n, err := io.Copy(out, reader)
+	n, err := io.Copy(out, io.LimitReader(resp.Body, limit))
 	if closeErr := out.Close(); err == nil {
 		err = closeErr
 	}
@@ -475,6 +562,9 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 
 	if expectedSize > 0 && n != expectedSize {
 		return fmt.Errorf("downloaded size mismatch: expected %d, got %d", expectedSize, n)
+	}
+	if expectedSize == 0 && n > maxDownloadBytes {
+		return fmt.Errorf("download exceeded maximum size %d", maxDownloadBytes)
 	}
 
 	return nil
@@ -501,16 +591,26 @@ func parseChecksums(checksumPath string) (map[string]string, error) {
 			continue
 		}
 
-		hash := parts[0]
-		if len(line) < len(hash) || !strings.HasPrefix(line, hash) {
+		rawHash := parts[0]
+		hash := strings.ToLower(rawHash)
+		if len(hash) != sha256.Size*2 {
+			continue
+		}
+		if _, err := hex.DecodeString(hash); err != nil {
+			continue
+		}
+		if len(line) < len(rawHash) || !strings.HasPrefix(line, rawHash) {
 			continue
 		}
 
-		filename := strings.TrimSpace(line[len(hash):])
+		filename := strings.TrimSpace(line[len(rawHash):])
 		if filename == "" {
 			continue
 		}
 
+		if _, exists := checksums[filename]; exists {
+			return nil, fmt.Errorf("duplicate checksum entry for %s", filename)
+		}
 		checksums[filename] = hash
 	}
 	return checksums, nil
@@ -518,6 +618,14 @@ func parseChecksums(checksumPath string) (map[string]string, error) {
 
 // verifyChecksum verifies the SHA256 checksum of a file
 func verifyChecksum(filePath, expectedHash string) error {
+	expectedHash = strings.ToLower(strings.TrimSpace(expectedHash))
+	if len(expectedHash) != sha256.Size*2 {
+		return fmt.Errorf("invalid sha256 checksum length: got %d, want %d", len(expectedHash), sha256.Size*2)
+	}
+	if _, err := hex.DecodeString(expectedHash); err != nil {
+		return fmt.Errorf("invalid sha256 checksum %q: %w", expectedHash, err)
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -536,8 +644,15 @@ func verifyChecksum(filePath, expectedHash string) error {
 	return nil
 }
 
-// extractBinary extracts the bv binary from a .tar.gz archive
+// extractBinary extracts the bv binary from a .tar.gz or .zip archive.
 func extractBinary(archivePath, destPath string) error {
+	if strings.EqualFold(filepath.Ext(archivePath), ".zip") {
+		return extractBinaryFromZip(archivePath, destPath)
+	}
+	return extractBinaryFromTarGz(archivePath, destPath)
+}
+
+func extractBinaryFromTarGz(archivePath, destPath string) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -563,23 +678,84 @@ func extractBinary(archivePath, destPath string) error {
 		// Look for the bv binary (might be ./bv, bv, or just bv)
 		name := filepath.Base(header.Name)
 		if name == "bv" || name == "bv.exe" {
-			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				return fmt.Errorf("failed to create binary: %w", err)
+			if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+				continue
 			}
-
-			_, copyErr := io.Copy(out, tr)
-			closeErr := out.Close()
-			if copyErr != nil {
-				return fmt.Errorf("failed to extract binary: %w", copyErr)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("failed to flush extracted binary: %w", closeErr)
-			}
-			return nil
+			return copyExtractedBinary(tr, destPath, header.Size)
 		}
 	}
 	return fmt.Errorf("binary not found in archive")
+}
+
+func extractBinaryFromZip(archivePath, destPath string) error {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip archive: %w", err)
+	}
+	defer zr.Close()
+
+	for _, file := range zr.File {
+		name := filepath.Base(file.Name)
+		if name != "bv" && name != "bv.exe" {
+			continue
+		}
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		if maxExtractedBinaryBytes < 0 {
+			return fmt.Errorf("extracted binary size limit cannot be negative: %d", maxExtractedBinaryBytes)
+		}
+		if file.UncompressedSize64 > uint64(maxExtractedBinaryBytes) {
+			return fmt.Errorf("extracted binary size %d exceeds maximum %d", file.UncompressedSize64, maxExtractedBinaryBytes)
+		}
+
+		src, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open zipped binary: %w", err)
+		}
+
+		copyErr := copyExtractedBinary(src, destPath, int64(file.UncompressedSize64))
+		srcCloseErr := src.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if srcCloseErr != nil {
+			return fmt.Errorf("failed to close zipped binary: %w", srcCloseErr)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("binary not found in archive")
+}
+
+func copyExtractedBinary(src io.Reader, destPath string, declaredSize int64) error {
+	if maxExtractedBinaryBytes < 0 {
+		return fmt.Errorf("extracted binary size limit cannot be negative: %d", maxExtractedBinaryBytes)
+	}
+	if declaredSize < 0 {
+		return fmt.Errorf("extracted binary size cannot be negative: %d", declaredSize)
+	}
+	if declaredSize > maxExtractedBinaryBytes {
+		return fmt.Errorf("extracted binary size %d exceeds maximum %d", declaredSize, maxExtractedBinaryBytes)
+	}
+
+	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create binary: %w", err)
+	}
+
+	n, copyErr := io.Copy(out, io.LimitReader(src, maxExtractedBinaryBytes+1))
+	closeErr := out.Close()
+	if copyErr != nil {
+		return fmt.Errorf("failed to extract binary: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to flush extracted binary: %w", closeErr)
+	}
+	if n > maxExtractedBinaryBytes {
+		return fmt.Errorf("extracted binary exceeds maximum size %d", maxExtractedBinaryBytes)
+	}
+	return nil
 }
 
 // GetCurrentBinaryPath returns the path to the currently running binary
@@ -641,14 +817,7 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Download archive
-	archivePath := filepath.Join(tmpDir, asset.Name)
-	fmt.Printf("Downloading %s...\n", release.TagName)
-	if err := downloadFile(asset.BrowserDownloadURL, archivePath, asset.Size); err != nil {
-		return nil, fmt.Errorf("download failed: %w", err)
-	}
-
-	// Download and verify checksum
+	var checksums map[string]string
 	checksumAsset := release.FindChecksumAsset()
 	if checksumAsset != nil {
 		checksumPath := filepath.Join(tmpDir, "checksums.txt")
@@ -656,11 +825,29 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 			return nil, fmt.Errorf("checksum download failed: %w", err)
 		}
 
-		checksums, err := parseChecksums(checksumPath)
+		var err error
+		checksums, err = parseChecksums(checksumPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse checksums: %w", err)
 		}
 
+		if checkedAsset := release.findPlatformAssetWithChecksum(checksums); checkedAsset != nil {
+			asset = checkedAsset
+		}
+	}
+
+	// Download archive
+	assetName, err := safeAssetName(asset.Name)
+	if err != nil {
+		return nil, err
+	}
+	archivePath := filepath.Join(tmpDir, assetName)
+	fmt.Printf("Downloading %s...\n", release.TagName)
+	if err := downloadFile(asset.BrowserDownloadURL, archivePath, asset.Size); err != nil {
+		return nil, fmt.Errorf("download failed: %w", err)
+	}
+
+	if checksumAsset != nil {
 		expectedHash, ok := checksums[asset.Name]
 		if !ok {
 			return nil, fmt.Errorf("no checksum found for %s", asset.Name)
@@ -691,7 +878,16 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	// Create backup of current binary
 	backupPath := GetBackupPath(binaryPath)
 	fmt.Printf("Backing up current binary to %s...\n", backupPath)
-	if err := copyFile(binaryPath, backupPath); err != nil {
+
+	// Move the current binary out of the way. This avoids ETXTBSY on Linux
+	// and "file in use" errors on Windows when writing the new binary.
+	// If a backup already exists and rename cannot replace it, fall back to
+	// copyFile so the previous backup is not removed before a fresh backup
+	// is successfully written.
+	movedForBackup := false
+	if err := os.Rename(binaryPath, backupPath); err == nil {
+		movedForBackup = true
+	} else if err := copyFile(binaryPath, backupPath); err != nil {
 		return nil, fmt.Errorf("backup failed: %w", err)
 	}
 	result.BackupPath = backupPath
@@ -699,11 +895,19 @@ func PerformUpdate(release *Release, skipConfirm bool) (*UpdateResult, error) {
 	// Replace binary
 	fmt.Println("Installing new version...")
 	if err := os.Rename(newBinaryPath, binaryPath); err != nil {
+		// If binaryPath still exists (copy fallback above), try to remove it first
+		if !movedForBackup {
+			_ = os.Remove(binaryPath)
+		}
 		// On some systems, rename across filesystems doesn't work
 		if err := copyFile(newBinaryPath, binaryPath); err != nil {
 			// Restore from backup
-			if restoreErr := copyFile(backupPath, binaryPath); restoreErr != nil {
-				return nil, fmt.Errorf("installation failed: %w (restore also failed: %v; manual recovery: cp %s %s)", err, restoreErr, backupPath, binaryPath)
+			restoreErr := os.Rename(backupPath, binaryPath)
+			if restoreErr != nil {
+				restoreErr = copyFile(backupPath, binaryPath)
+			}
+			if restoreErr != nil {
+				return nil, fmt.Errorf("installation failed: %w (restore also failed: %v; manual recovery: mv %s %s)", err, restoreErr, backupPath, binaryPath)
 			}
 			return nil, fmt.Errorf("installation failed (restored from backup): %w", err)
 		}
@@ -764,8 +968,31 @@ func Rollback() error {
 	}
 
 	fmt.Printf("Rolling back from backup at %s...\n", backupPath)
-	if err := copyFile(backupPath, binaryPath); err != nil {
-		return fmt.Errorf("rollback failed: %w", err)
+
+	// Move the currently running binary out of the way to avoid ETXTBSY / file-in-use
+	badPath := binaryPath + ".bad"
+	_ = os.Remove(badPath)
+	movedToBad := false
+	if err := os.Rename(binaryPath, badPath); err == nil {
+		movedToBad = true
+	}
+
+	if err := os.Rename(backupPath, binaryPath); err != nil {
+		if !movedToBad {
+			_ = os.Remove(binaryPath)
+		}
+		if copyErr := copyFile(backupPath, binaryPath); copyErr != nil {
+			// Try to restore the bad binary if rollback completely failed
+			if movedToBad {
+				_ = os.Rename(badPath, binaryPath)
+			}
+			return fmt.Errorf("rollback failed: %w", copyErr)
+		}
+	}
+
+	// Clean up the bad binary if we successfully renamed it out of the way
+	if movedToBad {
+		_ = os.Remove(badPath) // May fail on Windows if it's currently executing, but that's fine
 	}
 
 	fmt.Println("Rollback complete")

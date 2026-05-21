@@ -17,9 +17,10 @@ import (
 type historyFocus int
 
 const (
-	historyFocusList   historyFocus = iota // Left pane (beads or commits)
-	historyFocusMiddle                     // Middle pane for 3-pane layout (bv-xrfh)
-	historyFocusDetail                     // Right pane (details)
+	historyFocusList     historyFocus = iota // Left pane (beads or commits)
+	historyFocusTimeline                     // Timeline pane for 4-pane layout
+	historyFocusMiddle                       // Middle pane for 3/4-pane layout (bv-xrfh)
+	historyFocusDetail                       // Right pane (details)
 )
 
 // historyLayout tracks the responsive layout mode (bv-xrfh)
@@ -344,6 +345,15 @@ func (h *HistoryModel) rebuildFilteredList() {
 func (h *HistoryModel) SetSize(width, height int) {
 	h.width = width
 	h.height = height
+
+	// Adjust focus if pane is lost due to resize
+	panes := h.paneCount()
+	if panes < 4 && h.focused == historyFocusTimeline {
+		h.focused = historyFocusList
+	}
+	if panes < 3 && h.focused == historyFocusMiddle {
+		h.focused = historyFocusList
+	}
 }
 
 // SetAuthorFilter sets the author filter and rebuilds the list
@@ -368,12 +378,20 @@ func (h *HistoryModel) buildFileTree() {
 		return
 	}
 
-	// Count changes per file path
+	// Count correlated commit appearances per file and ancestor directory path.
+	// A commit that touches multiple files in the same directory should increment
+	// that directory once, not once per file.
 	fileChanges := make(map[string]int)
 	for _, hist := range h.report.Histories {
 		for _, commit := range hist.Commits {
+			pathsInCommit := make(map[string]struct{})
 			for _, file := range commit.Files {
-				fileChanges[file.Path]++
+				for _, path := range fileTreePathPrefixes(file.Path) {
+					pathsInCommit[path] = struct{}{}
+				}
+			}
+			for path := range pathsInCommit {
+				fileChanges[path]++
 			}
 		}
 	}
@@ -399,6 +417,8 @@ func (h *HistoryModel) buildFileTree() {
 					Expanded:    false,
 					Level:       i,
 				}
+			} else if !isLast {
+				root[fullPath].IsDir = true
 			}
 
 			if isLast {
@@ -436,6 +456,30 @@ func (h *HistoryModel) buildFileTree() {
 	})
 
 	h.rebuildFlatFileList()
+}
+
+func fileTreePathPrefixes(path string) []string {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return nil
+	}
+
+	parts := strings.Split(path, "/")
+	nonEmptyParts := parts[:0]
+	for _, part := range parts {
+		if part != "" {
+			nonEmptyParts = append(nonEmptyParts, part)
+		}
+	}
+	if len(nonEmptyParts) == 0 {
+		return nil
+	}
+
+	prefixes := make([]string, 0, len(nonEmptyParts))
+	for i := range nonEmptyParts {
+		prefixes = append(prefixes, strings.Join(nonEmptyParts[:i+1], "/"))
+	}
+	return prefixes
 }
 
 // sortTreeNode recursively sorts a tree node's children
@@ -585,6 +629,10 @@ func (h *HistoryModel) MoveUp() {
 			h.middleScrollOffset = 0 // Reset middle scroll when changing bead (bv-xrfh)
 			h.ensureBeadVisible()
 		}
+	} else if h.focused == historyFocusTimeline {
+		if h.timelineScrollOffset > 0 {
+			h.timelineScrollOffset--
+		}
 	} else {
 		// In middle or detail pane, move to previous commit
 		if h.selectedCommit > 0 {
@@ -606,6 +654,24 @@ func (h *HistoryModel) MoveDown() {
 			h.middleScrollOffset = 0 // Reset middle scroll when changing bead (bv-xrfh)
 			h.ensureBeadVisible()
 		}
+	} else if h.focused == historyFocusTimeline {
+		if h.report != nil && h.selectedBead < len(h.beadIDs) {
+			beadID := h.beadIDs[h.selectedBead]
+			if hist, ok := h.report.Histories[beadID]; ok {
+				entries := h.buildTimeline(hist)
+				maxVisible := h.height - 8
+				if maxVisible < 3 {
+					maxVisible = 3
+				}
+				maxScroll := len(entries) - maxVisible
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				if h.timelineScrollOffset < maxScroll {
+					h.timelineScrollOffset++
+				}
+			}
+		}
 	} else {
 		// In middle or detail pane, move to next commit
 		if h.selectedBead < len(h.histories) {
@@ -624,7 +690,19 @@ func (h *HistoryModel) MoveDown() {
 // ToggleFocus cycles through panes based on current layout (bv-xrfh)
 func (h *HistoryModel) ToggleFocus() {
 	panes := h.paneCount()
-	if panes == 3 {
+	if panes == 4 {
+		// Four-pane: List -> Timeline -> Middle -> Detail -> List
+		switch h.focused {
+		case historyFocusList:
+			h.focused = historyFocusTimeline
+		case historyFocusTimeline:
+			h.focused = historyFocusMiddle
+		case historyFocusMiddle:
+			h.focused = historyFocusDetail
+		default:
+			h.focused = historyFocusList
+		}
+	} else if panes == 3 {
 		// Three-pane: List -> Middle -> Detail -> List
 		switch h.focused {
 		case historyFocusList:
@@ -984,8 +1062,9 @@ func (h *HistoryModel) ToggleViewMode() {
 		h.selectedCommit = 0
 		h.scrollOffset = 0
 	}
-	// Re-apply search filter if active (bv-nkrj fix: filter persists across mode toggle)
-	if h.searchActive && h.searchInput.Value() != "" {
+	// Re-apply preserved search query after mode changes, even after the input
+	// has been submitted and blurred.
+	if strings.TrimSpace(h.searchInput.Value()) != "" {
 		h.applySearchFilter()
 	}
 }
@@ -1002,33 +1081,23 @@ func (h *HistoryModel) buildCommitList() {
 		return
 	}
 
-	seen := make(map[string]bool)
+	entryIndexBySHA := make(map[string]int)
+	beadIDsBySHA := make(map[string]map[string]struct{})
 	var entries []CommitListEntry
 
 	// Collect all commits from all bead histories
 	for beadID, hist := range h.report.Histories {
 		for _, commit := range hist.Commits {
-			if seen[commit.SHA] {
-				// Already have this commit, just add the bead ID
-				for i := range entries {
-					if entries[i].SHA == commit.SHA {
-						// Check if bead already in list
-						found := false
-						for _, bid := range entries[i].BeadIDs {
-							if bid == beadID {
-								found = true
-								break
-							}
-						}
-						if !found {
-							entries[i].BeadIDs = append(entries[i].BeadIDs, beadID)
-						}
-						break
-					}
+			if entryIndex, ok := entryIndexBySHA[commit.SHA]; ok {
+				if _, ok := beadIDsBySHA[commit.SHA][beadID]; !ok {
+					beadIDsBySHA[commit.SHA][beadID] = struct{}{}
+					entries[entryIndex].BeadIDs = append(entries[entryIndex].BeadIDs, beadID)
 				}
 				continue
 			}
-			seen[commit.SHA] = true
+
+			entryIndexBySHA[commit.SHA] = len(entries)
+			beadIDsBySHA[commit.SHA] = map[string]struct{}{beadID: {}}
 
 			entries = append(entries, CommitListEntry{
 				SHA:       commit.SHA,
@@ -1042,10 +1111,19 @@ func (h *HistoryModel) buildCommitList() {
 		}
 	}
 
+	for i := range entries {
+		sort.Strings(entries[i].BeadIDs)
+	}
+
 	// Sort by timestamp descending (most recent first)
 	// Note: We parse from formatted string since we stored it that way
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Timestamp > entries[j].Timestamp
+		timestampOrder := strings.Compare(entries[i].Timestamp, entries[j].Timestamp)
+		if timestampOrder == 0 {
+			// Deterministic fallback for commits in same minute
+			return entries[i].SHA > entries[j].SHA
+		}
+		return timestampOrder > 0
 	})
 
 	h.commitList = entries
@@ -1249,7 +1327,11 @@ func (h *HistoryModel) determineLayout() historyLayout {
 
 // paneCount returns the number of visible panes for the current layout (bv-xrfh)
 func (h *HistoryModel) paneCount() int {
-	switch h.determineLayout() {
+	layout := h.determineLayout()
+	if layout == layoutWide && h.viewMode != historyModeGit {
+		return 4
+	}
+	switch layout {
 	case layoutNarrow:
 		return 2
 	case layoutStandard, layoutWide:
@@ -1487,6 +1569,9 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 
 	// Panel border style
 	borderColor := t.Border
+	if h.focused == historyFocusTimeline {
+		borderColor = t.Primary
+	}
 	panelStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
@@ -1972,8 +2057,8 @@ func (h *HistoryModel) renderFilterLine() string {
 	if h.minConfidence > 0 {
 		activeFilters = append(activeFilters, fmt.Sprintf("≥%.0f%% conf", h.minConfidence*100))
 	}
-	if h.searchActive && h.searchInput.Value() != "" {
-		activeFilters = append(activeFilters, fmt.Sprintf("\"%s\"", h.searchInput.Value()))
+	if query := strings.TrimSpace(h.searchInput.Value()); query != "" {
+		activeFilters = append(activeFilters, fmt.Sprintf("\"%s\"", query))
 	}
 
 	// Show filter status

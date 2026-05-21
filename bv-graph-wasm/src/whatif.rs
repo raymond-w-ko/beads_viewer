@@ -183,11 +183,13 @@ pub fn top_what_if(graph: &DiGraph, closed_set: &[bool], limit: usize) -> Vec<To
         .filter(|e| e.result.transitive_unblocks > 0)
         .collect();
 
-    // Sort by transitive impact (descending)
+    // Sort by transitive impact (descending), then direct, then node ID for determinism
     results.sort_by(|a, b| {
         b.result
             .transitive_unblocks
             .cmp(&a.result.transitive_unblocks)
+            .then_with(|| b.result.direct_unblocks.cmp(&a.result.direct_unblocks))
+            .then_with(|| a.node.cmp(&b.node))
     });
 
     results.truncate(limit);
@@ -220,6 +222,8 @@ pub fn all_what_if(graph: &DiGraph, closed_set: &[bool], limit: usize) -> Vec<To
         b.result
             .transitive_unblocks
             .cmp(&a.result.transitive_unblocks)
+            .then_with(|| b.result.direct_unblocks.cmp(&a.result.direct_unblocks))
+            .then_with(|| a.node.cmp(&b.node))
     });
 
     results.truncate(limit);
@@ -235,11 +239,7 @@ pub fn all_what_if(graph: &DiGraph, closed_set: &[bool], limit: usize) -> Vec<To
 ///
 /// # Returns
 /// Combined WhatIfResult for closing all specified nodes.
-pub fn what_if_close_batch(
-    graph: &DiGraph,
-    nodes: &[usize],
-    closed_set: &[bool],
-) -> WhatIfResult {
+pub fn what_if_close_batch(graph: &DiGraph, nodes: &[usize], closed_set: &[bool]) -> WhatIfResult {
     let n = graph.len();
     if n == 0 || nodes.is_empty() {
         return WhatIfResult::empty();

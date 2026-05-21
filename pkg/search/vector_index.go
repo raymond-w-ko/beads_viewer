@@ -299,7 +299,21 @@ func (idx *VectorIndex) Get(issueID string) (VectorEntry, bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	e, ok := idx.entries[issueID]
-	return e, ok
+	if !ok {
+		return VectorEntry{}, false
+	}
+	e.Vector = cloneVector(e.Vector)
+	return e, true
+}
+
+func (idx *VectorIndex) contentHash(issueID string) (ContentHash, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	e, ok := idx.entries[issueID]
+	if !ok {
+		return ContentHash{}, false
+	}
+	return e.ContentHash, true
 }
 
 func (idx *VectorIndex) Size() int {
@@ -380,4 +394,13 @@ func dotFloat32(a, b []float32) float64 {
 		sum += float64(a[i]) * float64(b[i])
 	}
 	return sum
+}
+
+func cloneVector(vec []float32) []float32 {
+	if len(vec) == 0 {
+		return nil
+	}
+	cp := make([]float32, len(vec))
+	copy(cp, vec)
+	return cp
 }

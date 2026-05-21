@@ -1,6 +1,8 @@
 package correlation
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +25,29 @@ func TestNewStreamExtractor(t *testing.T) {
 	}
 }
 
+func TestNewStreamExtractorPrefersCanonicalBeadsJSONL(t *testing.T) {
+	repoPath := t.TempDir()
+	writeHistorySelectionFiles(t, repoPath)
+
+	s := NewStreamExtractor(repoPath)
+	if got, want := s.primaryBeadsFile(), ".beads/beads.jsonl"; got != want {
+		t.Fatalf("primaryBeadsFile = %s, want %s", got, want)
+	}
+}
+
+func TestNewStreamExtractorPrefersBDCompatibilityIssuesJSONL(t *testing.T) {
+	repoPath := t.TempDir()
+	beadsDir := writeHistorySelectionFiles(t, repoPath)
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStreamExtractor(repoPath)
+	if got, want := s.primaryBeadsFile(), ".beads/issues.jsonl"; got != want {
+		t.Fatalf("primaryBeadsFile = %s, want %s", got, want)
+	}
+}
+
 func TestStreamExtractor_SetProgressCallback(t *testing.T) {
 	s := NewStreamExtractor("/tmp/test")
 
@@ -39,6 +64,64 @@ func TestStreamExtractor_SetProgressCallback(t *testing.T) {
 	s.progressCB(1, 10)
 	if !called {
 		t.Error("callback should have been called")
+	}
+}
+
+func TestStreamExtractor_ProgressCallbackUsesExtractorDefault(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+
+	defaultCalls := 0
+	s.SetProgressCallback(func(processed, total int) {
+		defaultCalls++
+	})
+
+	onProgress := s.progressCallback(StreamOptions{})
+	if onProgress == nil {
+		t.Fatal("progressCallback returned nil")
+	}
+	onProgress(1, 1)
+	if defaultCalls == 0 {
+		t.Fatal("extractor-level progress callback was not used")
+	}
+}
+
+func TestStreamExtractor_ProgressCallbackOptionsOverrideDefault(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+
+	defaultCalls := 0
+	overrideCalls := 0
+	s.SetProgressCallback(func(processed, total int) {
+		defaultCalls++
+	})
+	opts := StreamOptions{
+		OnProgress: func(processed, total int) {
+			overrideCalls++
+		},
+	}
+
+	onProgress := s.progressCallback(opts)
+	if onProgress == nil {
+		t.Fatal("progressCallback returned nil")
+	}
+	onProgress(1, 1)
+	if overrideCalls == 0 {
+		t.Fatal("per-call progress callback was not used")
+	}
+	if defaultCalls != 0 {
+		t.Fatalf("extractor default progress callback was called %d times despite per-call override", defaultCalls)
+	}
+}
+
+func TestStreamExtractor_BuildStreamCommandDisablesColor(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+	cmd := s.buildStreamCommand(StreamOptions{Limit: 5}, 5)
+
+	args := cmd.Args
+	if len(args) < 4 {
+		t.Fatalf("git command args too short: %#v", args)
+	}
+	if args[0] != "git" || args[1] != "-c" || args[2] != "color.ui=false" || args[3] != "log" {
+		t.Fatalf("git command should disable color before log, got %#v", args)
 	}
 }
 
@@ -231,6 +314,43 @@ func TestBatchFileStatsExtractor_CacheHit(t *testing.T) {
 	}
 }
 
+func TestBatchFileStatsExtractor_CacheHitReturnsCopy(t *testing.T) {
+	b := NewBatchFileStatsExtractor("/tmp/test")
+	b.cache["abc123"] = []FileChange{{Path: "cached.go", Action: "M"}}
+
+	result, err := b.ExtractBatch([]string{"abc123"})
+	if err != nil {
+		t.Fatalf("ExtractBatch failed: %v", err)
+	}
+	result["abc123"][0].Path = "mutated.go"
+
+	result, err = b.ExtractBatch([]string{"abc123"})
+	if err != nil {
+		t.Fatalf("ExtractBatch failed: %v", err)
+	}
+	if got := result["abc123"][0].Path; got != "cached.go" {
+		t.Fatalf("cached path = %s, want cached.go", got)
+	}
+}
+
+func TestBatchFileStatsExtractor_StoredBatchReturnsCopy(t *testing.T) {
+	b := NewBatchFileStatsExtractor("/tmp/test")
+	result := make(map[string][]FileChange)
+
+	b.storeBatchResult(result, map[string][]FileChange{
+		"abc123": {{Path: "cached.go", Action: "M"}},
+	})
+	result["abc123"][0].Path = "mutated.go"
+
+	result, err := b.ExtractBatch([]string{"abc123"})
+	if err != nil {
+		t.Fatalf("ExtractBatch failed: %v", err)
+	}
+	if got := result["abc123"][0].Path; got != "cached.go" {
+		t.Fatalf("cached path = %s, want cached.go", got)
+	}
+}
+
 func TestStreamOptions_Defaults(t *testing.T) {
 	opts := StreamOptions{}
 
@@ -346,6 +466,15 @@ func TestStreamExtractor_ParseBufferedDiff_ClosedSince(t *testing.T) {
 		t.Errorf("old closed event should be filtered: got %d events", len(oldEvents))
 	}
 
+	oldTombstoneLines := []string{
+		`-{"id":"bv-1","status":"in_progress","title":"Old"}`,
+		`+{"id":"bv-1","status":"tombstone","title":"Old"}`,
+	}
+	oldTombstoneEvents := s.parseBufferedDiff(oldTombstoneLines, oldInfo, "", &cutoff)
+	if len(oldTombstoneEvents) != 0 {
+		t.Errorf("old tombstone event should be filtered as closed: got %d events", len(oldTombstoneEvents))
+	}
+
 	// Recent closed event (should pass)
 	recentInfo := commitInfo{
 		SHA:       "recent123",
@@ -385,6 +514,100 @@ func TestStreamExtractor_StreamEvents_InGitRepo(t *testing.T) {
 	t.Logf("Got %d events from stream extraction", len(events))
 }
 
+func TestStreamExtractor_StreamEventsWithGitColorAlways(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	runGit(t, repoPath, "config", "color.ui", "always")
+
+	writeStreamFixtureBead(t, repoPath, "bv-color")
+
+	events, err := NewStreamExtractor(repoPath).StreamEvents(StreamOptions{Limit: 5})
+	if err != nil {
+		t.Fatalf("StreamEvents failed: %v", err)
+	}
+	for _, event := range events {
+		if event.BeadID == "bv-color" && event.EventType == EventCreated {
+			return
+		}
+	}
+	t.Fatalf("expected created event for bv-color with color.ui=always, got %#v", events)
+}
+
+func TestStreamExtractor_StreamEventsUsesExtractorProgressCallback(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	writeStreamFixtureBead(t, repoPath, "bv-progress")
+
+	progressCalls := 0
+	s := NewStreamExtractor(repoPath)
+	s.SetProgressCallback(func(processed, total int) {
+		progressCalls++
+	})
+
+	events, err := s.StreamEvents(StreamOptions{Limit: 5})
+	if err != nil {
+		t.Fatalf("StreamEvents failed: %v", err)
+	}
+	if progressCalls == 0 {
+		t.Fatal("extractor-level progress callback was not called")
+	}
+	assertCreatedEvent(t, events, "bv-progress")
+}
+
+func TestStreamExtractor_StreamEventsOptionsProgressOverridesExtractorDefault(t *testing.T) {
+	repoPath := initTempGitRepo(t)
+	writeStreamFixtureBead(t, repoPath, "bv-progress-override")
+
+	defaultCalls := 0
+	overrideCalls := 0
+	s := NewStreamExtractor(repoPath)
+	s.SetProgressCallback(func(processed, total int) {
+		defaultCalls++
+	})
+
+	events, err := s.StreamEvents(StreamOptions{
+		Limit: 5,
+		OnProgress: func(processed, total int) {
+			overrideCalls++
+		},
+	})
+	if err != nil {
+		t.Fatalf("StreamEvents failed: %v", err)
+	}
+	if overrideCalls == 0 {
+		t.Fatal("per-call progress callback was not called")
+	}
+	if defaultCalls != 0 {
+		t.Fatalf("extractor default progress callback was called %d times despite per-call override", defaultCalls)
+	}
+	assertCreatedEvent(t, events, "bv-progress-override")
+}
+
+func writeStreamFixtureBead(t *testing.T, repoPath, beadID string) {
+	t.Helper()
+
+	beadsDir := filepath.Join(repoPath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads dir: %v", err)
+	}
+	beadsPath := filepath.Join(beadsDir, "beads.jsonl")
+	content := `{"id":"` + beadID + `","status":"open","title":"Stream fixture"}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write beads file: %v", err)
+	}
+	runGit(t, repoPath, "add", ".beads/beads.jsonl")
+	runGit(t, repoPath, "commit", "-m", "add stream fixture bead")
+}
+
+func assertCreatedEvent(t *testing.T, events []BeadEvent, beadID string) {
+	t.Helper()
+
+	for _, event := range events {
+		if event.BeadID == beadID && event.EventType == EventCreated {
+			return
+		}
+	}
+	t.Fatalf("expected created event for %s, got %#v", beadID, events)
+}
+
 func TestProgressCallback_CalledDuringParsing(t *testing.T) {
 	s := NewStreamExtractor("/tmp/test")
 
@@ -409,5 +632,21 @@ def456abc123789012345678901234567890abcd` + "\x00" + `2025-12-15T10:31:00Z` + "\
 	// Final call should always happen
 	if progressCalls == 0 {
 		t.Error("progress callback should have been called")
+	}
+}
+
+func TestStreamExtractor_ParseStreamInvalidHeaderReturnsError(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+
+	input := strings.NewReader(`abc123def456789012345678901234567890abcd` + "\x00" + `not-a-time` + "\x00" + `John` + "\x00" + `john@test.com` + "\x00" + `Commit
++{"id":"bv-1","status":"open"}
+`)
+
+	_, err := s.parseStream(input, "", nil, 1, nil)
+	if err == nil {
+		t.Fatalf("parseStream accepted a malformed commit header")
+	}
+	if !strings.Contains(err.Error(), "parsing commit header") {
+		t.Fatalf("parseStream error = %v, want commit header context", err)
 	}
 }

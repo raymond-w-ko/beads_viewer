@@ -178,6 +178,7 @@ type BackgroundWorker struct {
 	mu                sync.RWMutex
 	state             WorkerState
 	dirty             bool // True if a change came in while processing
+	processScheduled  bool // True after process() is queued but before it starts processing
 	snapshot          *DataSnapshot
 	started           bool // True if Start() has been called
 	watchdogStarted   bool
@@ -445,16 +446,17 @@ func (w *BackgroundWorker) openTraceFile() {
 }
 
 func (w *BackgroundWorker) closeTraceFile() {
-	if w == nil || w.traceFile == nil {
+	if w == nil {
 		return
 	}
 	w.traceMu.Lock()
 	f := w.traceFile
-	w.traceFile = nil
-	w.traceMu.Unlock()
 	if f == nil {
+		w.traceMu.Unlock()
 		return
 	}
+	w.traceFile = nil
+	w.traceMu.Unlock()
 	if err := f.Close(); err != nil {
 		w.logEvent(LogLevelWarn, "trace_close_failed", map[string]any{
 			"path":  w.tracePath,
@@ -467,7 +469,10 @@ func (w *BackgroundWorker) logEvent(level WorkerLogLevel, event string, fields m
 	if w == nil || level == LogLevelNone {
 		return
 	}
-	if w.traceFile == nil && (w.logLevel == LogLevelNone || level > w.logLevel) {
+	w.traceMu.Lock()
+	traceEnabled := w.traceFile != nil
+	w.traceMu.Unlock()
+	if !traceEnabled && (w.logLevel == LogLevelNone || level > w.logLevel) {
 		return
 	}
 
@@ -489,7 +494,7 @@ func (w *BackgroundWorker) logEvent(level WorkerLogLevel, event string, fields m
 	if w.logLevel != LogLevelNone && level <= w.logLevel {
 		log.Printf("%s", b)
 	}
-	if w.traceFile != nil {
+	if traceEnabled {
 		w.traceMu.Lock()
 		if w.traceFile != nil {
 			_, _ = w.traceFile.Write(append(b, '\n'))
@@ -607,6 +612,7 @@ func (w *BackgroundWorker) Stop() {
 		return
 	}
 	w.state = WorkerStopped
+	w.processScheduled = false
 	wasStarted := w.started
 	loopCancel := w.loopCancel
 	done := w.done
@@ -789,6 +795,7 @@ func (w *BackgroundWorker) attemptRecovery(reason string) {
 	w.generation++
 	w.state = WorkerIdle
 	w.dirty = false
+	w.processScheduled = false
 	w.processingStart = time.Time{}
 	w.lastHeartbeat = time.Now()
 
@@ -846,14 +853,15 @@ func (w *BackgroundWorker) attemptRecovery(reason string) {
 }
 
 // TriggerRefresh manually triggers a refresh of the data.
-// Has no effect if the worker is stopped or already processing.
+// Has no effect if the worker is stopped. Concurrent refresh requests are
+// coalesced while processing is active or already scheduled.
 func (w *BackgroundWorker) TriggerRefresh() {
 	w.mu.Lock()
 	if w.state == WorkerStopped {
 		w.mu.Unlock()
 		return
 	}
-	if w.state == WorkerProcessing {
+	if w.state == WorkerProcessing || w.processScheduled {
 		w.dirty = true
 		coalesced := w.coalesceCount.Add(1)
 		w.logEvent(LogLevelDebug, "coalesce", map[string]any{
@@ -862,6 +870,7 @@ func (w *BackgroundWorker) TriggerRefresh() {
 		w.mu.Unlock()
 		return
 	}
+	w.processScheduled = true
 	w.mu.Unlock()
 
 	// Trigger processing
@@ -877,10 +886,9 @@ func (w *BackgroundWorker) ForceRefresh() {
 		return
 	}
 
-	w.lastHash = ""
 	w.forceNext = true
 
-	if w.state == WorkerProcessing {
+	if w.state == WorkerProcessing || w.processScheduled {
 		w.dirty = true
 		coalesced := w.coalesceCount.Add(1)
 		w.logEvent(LogLevelDebug, "coalesce", map[string]any{
@@ -889,6 +897,7 @@ func (w *BackgroundWorker) ForceRefresh() {
 		w.mu.Unlock()
 		return
 	}
+	w.processScheduled = true
 	w.mu.Unlock()
 
 	go w.process()
@@ -1003,6 +1012,7 @@ func (w *BackgroundWorker) processLoop(loopCtx context.Context, done chan struct
 // process builds a new snapshot from the current file.
 func (w *BackgroundWorker) process() {
 	w.mu.Lock()
+	w.processScheduled = false
 	if w.state != WorkerIdle {
 		// Already stopped or processing
 		if w.state == WorkerProcessing {
@@ -1014,6 +1024,8 @@ func (w *BackgroundWorker) process() {
 	}
 	w.state = WorkerProcessing
 	w.dirty = false
+	forceNext := w.forceNext
+	w.forceNext = false
 	now := time.Now()
 	w.processingStart = now
 	w.lastHeartbeat = now
@@ -1033,7 +1045,7 @@ func (w *BackgroundWorker) process() {
 
 	// Load and build snapshot
 	// Returns nil if content unchanged (dedup) or on error
-	snapshot := w.buildSnapshot()
+	snapshot := w.buildSnapshot(forceNext)
 
 	w.mu.Lock()
 	// If we recovered while processing, ignore this stale result.
@@ -1058,6 +1070,7 @@ func (w *BackgroundWorker) process() {
 	var version uint64
 	if snapshot != nil {
 		swapStart := time.Now()
+		w.lastHash = snapshot.DataHash
 		w.snapshot = snapshot
 		swapLatency = time.Since(swapStart)
 		version = w.metrics.snapshotVersion.Add(1)
@@ -1115,7 +1128,7 @@ func (w *BackgroundWorker) process() {
 
 	// If dirty, process again immediately
 	if wasDirty {
-		go w.process()
+		w.TriggerRefresh()
 	}
 }
 
@@ -1235,17 +1248,18 @@ func (w *BackgroundWorker) maybeIdleGC(now time.Time) {
 	w.mu.Lock()
 	enabled := w.idleGCEnabled
 	state := w.state
+	processScheduled := w.processScheduled
 	threshold := w.idleGCThreshold
 	minInterval := w.idleGCMinInterval
 	w.mu.Unlock()
 
-	if !enabled || state != WorkerIdle {
+	if !enabled || state != WorkerIdle || processScheduled {
 		return
 	}
 
 	w.mu.Lock()
 	// Re-check under lock for correctness and to prevent racing with process() state transitions.
-	if !w.idleGCEnabled || w.state != WorkerIdle {
+	if !w.idleGCEnabled || w.state != WorkerIdle || w.processScheduled {
 		w.mu.Unlock()
 		return
 	}
@@ -1288,7 +1302,7 @@ func (w *BackgroundWorker) maybeIdleGC(now time.Time) {
 // buildSnapshot loads data and constructs a new DataSnapshot.
 // This is called from the worker goroutine (NOT the UI thread).
 // Returns nil if beadsPath is empty, loading fails, or content is unchanged.
-func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
+func (w *BackgroundWorker) buildSnapshot(forceNext bool) *DataSnapshot {
 	if w.beadsPath == "" {
 		return nil
 	}
@@ -1373,7 +1387,7 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 				return i.Status != model.StatusClosed && i.Status != model.StatusTombstone
 			}
 		}
-		loaded, err = loader.LoadIssuesFromFileWithOptionsPooled(w.beadsPath, opts)
+		loaded, err = loadIssuesForReload(w.beadsPath, opts)
 		if err == nil {
 			issues = loaded.Issues
 			pooledRefs = loaded.PoolRefs
@@ -1405,14 +1419,9 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 	hash := analysis.ComputeDataHash(issues)
 
 	// Check if content is unchanged (dedup optimization)
-	w.mu.Lock()
-	forceNext := w.forceNext
-	if forceNext {
-		w.forceNext = false
-		w.lastHash = ""
-	}
+	w.mu.RLock()
 	lastHash := w.lastHash
-	w.mu.Unlock()
+	w.mu.RUnlock()
 
 	if !forceNext && hash == lastHash && lastHash != "" {
 		w.logEvent(LogLevelDebug, "snapshot_deduped", map[string]any{
@@ -1432,18 +1441,16 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 	if prevSnapshot != nil {
 		diffValue := analysis.ComputeIssueDiff(prevSnapshot.Issues, issues)
 		diff = &diffValue
-		if w.logLevel >= LogLevelDebug || w.traceFile != nil {
-			w.logEvent(LogLevelDebug, "snapshot_diff", map[string]any{
-				"added":              len(diffValue.Added),
-				"removed":            len(diffValue.Removed),
-				"modified":           len(diffValue.Modified),
-				"content_changed":    len(diffValue.ContentChanged),
-				"dependency_changed": len(diffValue.DependencyChanged),
-				"unchanged":          len(diffValue.Unchanged),
-				"total_prev":         len(prevSnapshot.Issues),
-				"total_new":          len(issues),
-			})
-		}
+		w.logEvent(LogLevelDebug, "snapshot_diff", map[string]any{
+			"added":              len(diffValue.Added),
+			"removed":            len(diffValue.Removed),
+			"modified":           len(diffValue.Modified),
+			"content_changed":    len(diffValue.ContentChanged),
+			"dependency_changed": len(diffValue.DependencyChanged),
+			"unchanged":          len(diffValue.Unchanged),
+			"total_prev":         len(prevSnapshot.Issues),
+			"total_new":          len(issues),
+		})
 	}
 
 	// Build snapshot (includes Phase 1 analysis) with panic recovery
@@ -1485,11 +1492,6 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 
 	// Clear error on success
 	w.recordError(nil)
-
-	// Update lastHash for future dedup checks
-	w.mu.Lock()
-	w.lastHash = hash
-	w.mu.Unlock()
 
 	// Store hash in snapshot for external access
 	if snapshot != nil {

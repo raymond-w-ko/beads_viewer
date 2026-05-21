@@ -34,6 +34,35 @@ func TestWeightsValidate_Negative(t *testing.T) {
 	}
 }
 
+func TestWeightsValidate_NonFinite(t *testing.T) {
+	cases := []struct {
+		name    string
+		weights Weights
+	}{
+		{
+			name: "nan",
+			weights: Weights{
+				TextRelevance: math.NaN(),
+				PageRank:      1.0,
+			},
+		},
+		{
+			name: "infinity",
+			weights: Weights{
+				TextRelevance: math.Inf(1),
+				PageRank:      1.0,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.weights.Validate(); err == nil {
+				t.Fatal("expected error for non-finite weight")
+			}
+		})
+	}
+}
+
 func TestWeightsValidate_SumTolerance(t *testing.T) {
 	weights := Weights{
 		TextRelevance: 0.2,

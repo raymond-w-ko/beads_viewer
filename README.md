@@ -54,14 +54,14 @@ scoop install dicklesworthstone/bv
 
 ### Alternative: Direct Download
 
-Download the latest release for your platform (tar.gz assets):
-- [Linux x86_64](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_0.13.0_linux_amd64.tar.gz)
-- [Linux ARM64](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_0.13.0_linux_arm64.tar.gz)
-- [macOS Intel](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_0.13.0_darwin_amd64.tar.gz)
-- [macOS ARM](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_0.13.0_darwin_arm64.tar.gz)
-- [Windows](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_0.13.0_windows_amd64.tar.gz)
+Download the latest release archive for your platform:
+- [Linux x86_64](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_linux_amd64.tar.gz)
+- [Linux ARM64](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_linux_arm64.tar.gz)
+- [macOS Intel](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_darwin_amd64.tar.gz)
+- [macOS ARM](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_darwin_arm64.tar.gz)
+- [Windows](https://github.com/Dicklesworthstone/beads_viewer/releases/latest/download/bv_windows_amd64.zip)
 
-> Note: Asset names include the release version. If a link 404s, open the latest release page and download the matching asset.
+These links target the moving `latest` release aliases.
 
 ### Alternative: Install Script
 
@@ -194,6 +194,11 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 bv --robot-triage --format toon
 export BV_OUTPUT_FORMAT=toon
 bv --robot-next
+
+Before claiming, verify the current bead state with `br show <id> --json` or
+`br ready --json`. `recommendations` can include graph-important blocked or
+assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields
+represent claimable work.
 
 #### Other Commands
 
@@ -2489,7 +2494,7 @@ When cass is healthy, the status bar shows agent activity:
 # Install cass (see https://github.com/Dicklesworthstone/coding_agent_session_search for full docs)
 brew install dicklesworthstone/tap/cass   # macOS
 # or
-cargo install cass                         # From source
+cargo install coding-agent-search          # From source (binary is `cass`)
 
 # Index your coding sessions
 cass index
