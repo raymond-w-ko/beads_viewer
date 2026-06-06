@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"io"
 	"io/fs"
@@ -1321,6 +1322,28 @@ func printFlagSection(out io.Writer, allFlags *flag.FlagSet, title string, names
 	fmt.Fprintf(out, "%s:\n", title)
 	fmt.Fprint(out, sectionFlags.FlagUsagesWrapped(100))
 	fmt.Fprintln(out)
+}
+
+// issuesFingerprint returns an order-independent fingerprint of the issue set
+// that changes whenever anything the exported site renders changes. It folds in
+// the canonical per-issue content + dependency hashes — the same signal the
+// analysis cache uses for change detection — so it catches title/body/label/
+// priority/dependency edits, not just an updated_at bump. The --watch-export
+// loop uses it to skip a full re-export when a file change didn't actually
+// change any issue content (#159).
+func issuesFingerprint(issues []model.Issue) string {
+	keys := make([]string, len(issues))
+	for i, iss := range issues {
+		fp := analysis.ComputeIssueFingerprint(iss)
+		keys[i] = fp.ID + "\x1f" + fp.ContentHash + "\x1f" + fp.DependencyHash
+	}
+	sort.Strings(keys)
+	h := fnv.New64a()
+	for _, k := range keys {
+		_, _ = h.Write([]byte(k))
+		_, _ = h.Write([]byte{0})
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func main() {
@@ -2858,24 +2881,80 @@ func main() {
 				signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 				defer signal.Stop(sigCh)
 
-				// Watch loop
+				// Coalescing watch loop (#159): collapse bursts of file changes
+				// into a single export, rate-limit with adaptive backoff, and skip
+				// re-exporting when issue content is unchanged. Previously every
+				// file write triggered a full site + git-history regeneration,
+				// pinning a CPU under an active author.
+				reload := func() ([]model.Issue, error) {
+					if *workspaceConfig != "" {
+						iss, _, err := workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
+						return iss, err
+					}
+					return datasource.LoadIssues("")
+				}
+
+				const (
+					watchSettleMin = 500 * time.Millisecond
+					watchSettleMax = 30 * time.Second
+				)
+				// Seed the fingerprint from the initial export above so the first
+				// file change doesn't redundantly re-export identical content.
+				settle := watchSettleMin
+				lastHash := issuesFingerprint(issues)
+				var settleTimer *time.Timer
+				var settleC <-chan time.Time
+				armSettle := func() {
+					if settleTimer == nil {
+						settleTimer = time.NewTimer(settle)
+						settleC = settleTimer.C
+						return
+					}
+					if !settleTimer.Stop() {
+						select {
+						case <-settleTimer.C:
+						default:
+						}
+					}
+					settleTimer.Reset(settle)
+					settleC = settleTimer.C
+				}
+
 				for {
 					select {
 					case <-mergedChangeCh:
-						// Reload issues from disk using appropriate method
-						var freshIssues []model.Issue
-						var err error
-						if *workspaceConfig != "" {
-							freshIssues, _, err = workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
-						} else {
-							freshIssues, err = datasource.LoadIssues("")
-						}
+						// (Re)arm the settle timer; further changes within the
+						// quiet window coalesce into the same export.
+						armSettle()
+					case <-settleC:
+						settleC = nil
+						freshIssues, err := reload()
 						if err != nil {
 							fmt.Printf("  → Error reloading issues: %v\n", err)
 							continue
 						}
+						// Skip the (expensive) export when nothing meaningful
+						// changed — a file can be rewritten with identical content.
+						h := issuesFingerprint(freshIssues)
+						if h == lastHash {
+							settle = watchSettleMin
+							continue
+						}
+						start := time.Now()
 						if err := doExport(freshIssues); err != nil {
 							fmt.Printf("  → Export error: %v\n", err)
+							continue
+						}
+						lastHash = h
+						// Adaptive backoff: widen the coalescing window to ~2× the
+						// export cost (capped) so sustained churn can't thrash the
+						// CPU; cheap exports stay near the floor for responsiveness.
+						settle = 2 * time.Since(start)
+						if settle < watchSettleMin {
+							settle = watchSettleMin
+						}
+						if settle > watchSettleMax {
+							settle = watchSettleMax
 						}
 					case <-sigCh:
 						fmt.Println("\nStopping watch mode...")

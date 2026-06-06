@@ -134,9 +134,25 @@ type lineStats struct {
 	deletions  int
 }
 
+// excludePathspecArgs builds git pathspec arguments that exclude the directories
+// in excludedPaths. These are appended after a "--" separator so git skips diffing
+// the (often large) excluded blobs (e.g. .beads/issues.jsonl) entirely instead of
+// computing line stats for content the caller discards via isExcludedPath. See #160.
+func excludePathspecArgs() []string {
+	args := make([]string, 0, len(excludedPaths)+2)
+	args = append(args, "--", ".")
+	for _, prefix := range excludedPaths {
+		// Trim trailing slash; ':(exclude,glob)dir/**' matches everything under dir.
+		dir := strings.TrimSuffix(prefix, "/")
+		args = append(args, fmt.Sprintf(":(exclude,glob)%s/**", dir))
+	}
+	return args
+}
+
 // getFilesChanged runs git show --name-status to get changed files
 func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
-	cmd := exec.Command("git", "show", "--name-status", "--format=", sha)
+	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, excludePathspecArgs()...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = c.repoPath
 
 	out, err := cmd.Output()
@@ -183,7 +199,8 @@ func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
 
 // getLineStats runs git show --numstat to get insertion/deletion counts
 func (c *CoCommitExtractor) getLineStats(sha string) (map[string]lineStats, error) {
-	cmd := exec.Command("git", "show", "--numstat", "--format=", sha)
+	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, excludePathspecArgs()...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = c.repoPath
 
 	out, err := cmd.Output()

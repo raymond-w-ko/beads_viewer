@@ -81,8 +81,78 @@ type beadSnapshot struct {
 	Title  string
 }
 
-// Extract extracts bead lifecycle events from git history
+// snapshotBlobSizeThreshold is the followed-file blob size (in bytes) at or above
+// which Extract prefers the snapshot path over the legacy `git log -p` path.
+//
+// Both paths are O(blob x commits): the legacy path pays git's diff per commit;
+// the snapshot path pays two blob reads + line-hashing per commit. git's native
+// C diff has the better constant up to a point, so the snapshot path is actually
+// *slower* on small/medium blobs and only overtakes git once the blob is very
+// large (git's diff cost grows super-linearly while read+hash stays linear).
+//
+// Measured on synthetic 200-commit histories (this machine):
+//
+//	blob      legacy `-p`     snapshot     winner
+//	1.9 MB    ~1.9 s          ~5.4 s       legacy
+//	8.2 MB    ~16 s           ~29 s        legacy
+//	93 MB     ~25 min         ~13.7 min    snapshot (~1.8x)
+//
+// Crossover is ~40 MB, so we gate at 48 MB: anything below stays on the faster
+// native diff (no behavior change for the overwhelming majority of repos), and
+// only a pathologically large followed blob (the #161 case) is routed to the
+// snapshot path, which bounds — but does not eliminate — its worst case. The
+// real per-tick fix for large repos is caching the correlation result
+// (HeadSHA+beads-hash keyed, the #160 follow-up); the snapshot path only caps
+// the cold-cache cost. Output is byte-identical on either side of the gate
+// (verified by the differential test), so the threshold is purely a
+// speed/heuristic knob and never changes triage results.
+const snapshotBlobSizeThreshold = 48 * 1024 * 1024 // 48 MB
+
+// Extract extracts bead lifecycle events from git history.
+//
+// It reconstructs lifecycle events from per-commit JSONL snapshot differences
+// (extractViaSnapshots) instead of asking git to produce a full textual patch
+// (`git log -p`) of the followed beads blob. The `-p` path runs git's diff over
+// the whole multi-MB JSONL at every commit (O(blob x commits)) and dominated
+// `--robot-triage` on large repos (#161). The snapshot path reads each blob and
+// computes the changed record lines in Go, feeding the *unchanged* parseDiff so
+// event semantics are identical (proven by the differential test).
+//
+// The two paths produce byte-identical events; they differ only in cost profile,
+// so Extract dispatches on the followed file's current blob size: large blobs
+// (where `-p` blows up to minutes) take the snapshot path; small blobs take the
+// faster native path. See snapshotBlobSizeThreshold.
 func (e *Extractor) Extract(opts ExtractOptions) ([]BeadEvent, error) {
+	if e.preferSnapshotPath() {
+		return e.extractViaSnapshots(opts)
+	}
+	return e.extractViaGitLogPatch(opts)
+}
+
+// preferSnapshotPath reports whether the followed beads file's current (HEAD)
+// blob is large enough that the snapshot path should be used. It runs a single
+// cheap `git cat-file -s HEAD:<file>`. If the size cannot be determined (no
+// history yet, untracked file, detached/empty repo), it returns true so the
+// snapshot path — which already degrades gracefully to "no commits" — handles the
+// edge case, never falling back to a slower-or-equal native diff in that case.
+func (e *Extractor) preferSnapshotPath() bool {
+	primary := e.primaryBeadsFile()
+	cmd := exec.Command("git", "cat-file", "-s", "HEAD:"+primary)
+	cmd.Dir = e.repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return true
+	}
+	var size int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &size); err != nil {
+		return true
+	}
+	return size >= snapshotBlobSizeThreshold
+}
+
+// extractViaGitLogPatch is the legacy `git log -p` extraction path, retained for
+// reference and differential testing against extractViaSnapshots.
+func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, error) {
 	// Build git log command
 	logArgs := e.buildGitLogArgs(opts)
 
@@ -131,6 +201,7 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	args := []string{
 		"log",
 		"-p",                             // Include patch/diff
+		"--unified=0",                    // Zero context: parser only needs +/- JSONL lines, not unchanged records (#160)
 		"--follow",                       // Track renames; requires a single pathspec (handled below)
 		"--format=" + gitLogHeaderFormat, // Custom format for commit info
 		"--",

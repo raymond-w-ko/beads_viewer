@@ -455,7 +455,28 @@ func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
 	}
 }
 
-func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
+// TestComputeTriage_ParentChildOpenParentDoesNotBlockChild verifies that
+// when a child has ONLY a parent-child rollup edge to an OPEN, UNBLOCKED
+// parent, the child is treated as ready work — not as "blocked by parent".
+// This matches `br ready`'s semantics (beads_rust's
+// compute_blocked_issues_map_impl excludes parent-child from direct blocker
+// edges; an open parent only propagates blocking down to its descendants
+// when the parent ITSELF is transitively blocked).
+//
+// History:
+//
+//   - bv-96 / a010545 added an aggressive rule that treated every open
+//     parent-child parent as a claim blocker; this test originally asserted
+//     that the child must not appear in top picks while the parent was
+//     open, encoding that aggressive behavior.
+//   - beads_viewer#158 reported this as the inverse of `br ready` — a
+//     standalone open parent (rollup container) never gates its child's
+//     readiness, and the inverted advice ("Work on parent first to unblock
+//     child") was actively misleading agents.
+//
+// The transitive-blocked case (parent has a real `blocks` predecessor) is
+// covered by TestComputeTriage_ParentBlockedChildNotTopPickOrClaim.
+func TestComputeTriage_ParentChildOpenParentDoesNotBlockChild(t *testing.T) {
 	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
 	issues := []model.Issue{
 		{
@@ -481,18 +502,13 @@ func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
 
 	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
 
-	for _, pick := range triage.QuickRef.TopPicks {
-		if pick.ID == "child" {
-			t.Fatalf("parent-child child must not appear in top picks while parent is open")
-		}
+	// Both parent and child are actionable: the parent has no edges at all,
+	// and the child's only edge is a rollup that never gates it.
+	if triage.QuickRef.ActionableCount != 2 {
+		t.Fatalf("expected both parent and child actionable, got %d", triage.QuickRef.ActionableCount)
 	}
-	if len(triage.QuickRef.TopPicks) == 0 || triage.QuickRef.TopPicks[0].ID != "parent" {
-		t.Fatalf("expected parent to be the claimable top pick, got %+v", triage.QuickRef.TopPicks)
-	}
-
-	expectedClaim := "CI=1 br update parent --status in_progress --json"
-	if triage.Commands.ClaimTop != expectedClaim {
-		t.Fatalf("expected claim_top %q, got %q", expectedClaim, triage.Commands.ClaimTop)
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Fatalf("expected zero blocked issues, got %d", triage.QuickRef.BlockedCount)
 	}
 
 	var childRec *Recommendation
@@ -503,10 +519,10 @@ func TestComputeTriage_ParentChildParentBlocksChildClaim(t *testing.T) {
 		}
 	}
 	if childRec == nil {
-		t.Fatal("expected child recommendation to remain visible with blocked_by context")
+		t.Fatal("expected child recommendation to be present")
 	}
-	if len(childRec.BlockedBy) != 1 || childRec.BlockedBy[0] != "parent" {
-		t.Fatalf("expected child blocked_by parent, got %v", childRec.BlockedBy)
+	if len(childRec.BlockedBy) != 0 {
+		t.Fatalf("child.BlockedBy = %v, want empty (parent-child to open parent is not a blocker)", childRec.BlockedBy)
 	}
 }
 
