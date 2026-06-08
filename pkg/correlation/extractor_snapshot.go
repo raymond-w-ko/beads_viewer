@@ -4,44 +4,70 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"hash/maphash"
 	"os/exec"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// snapshotCommit holds the metadata and touched path for a single commit that
-// modified the followed beads file.
+// blobsReadCounter counts the total number of blob object ids passed to
+// readBlobs across the process. It exists solely so tests can prove the
+// incremental per-commit cache reads only the NEW commits' blobs (and ~0 when
+// nothing is new). It is never read on any production path.
+var blobsReadCounter int64
+
+// nullBlobSHA is git's all-zero object id, used in `--raw` diff lines for the
+// side of a change where the blob does not exist (a pure addition has an all-zero
+// "old" blob; a deletion an all-zero "new" blob).
+const nullBlobSHA = "0000000000000000000000000000000000000000"
+
+// snapshotCommit holds the metadata and the followed file's old/new blob object
+// ids for a single commit that modified the followed beads file.
 type snapshotCommit struct {
 	info commitInfo
-	// path is the beads-file path *at this commit* (new name on a rename).
-	path string
-	// parentPath is the path the file had in the parent commit. It differs from
-	// path only across a rename; empty when the file did not exist in the parent
-	// (an addition).
-	parentPath string
-	// hadParent is false for the file's first appearance (no "-" side to diff).
-	hadParent bool
+	// oldSHA is the followed file's blob in the commit's first parent, "" when the
+	// file did not exist in the parent (an addition).
+	oldSHA string
+	// newSHA is the followed file's blob at this commit.
+	newSHA string
 }
 
 // extractViaSnapshots reconstructs bead lifecycle events without asking git to
 // produce a textual patch (`-p`) of the followed beads blob.
 //
-// Rationale (#160 follow-up / #161): `git log -p --follow -- <beads.jsonl>` runs
-// git's Myers diff over the entire multi-MB JSONL blob at every commit, which is
-// O(blob-size x commits) and dominates `--robot-triage` on large repos (measured
-// ~13 min on a 93 MB blob across 200 commits). The parser only needs the set of
-// added/removed `+{...}`/`-{...}` JSONL *record lines* per commit. Because the
-// beads exporter writes one whole JSON record per line, that set is exactly the
-// per-commit line-level set difference between the file's blob and its parent's
-// blob — which we can compute from cheap blob reads (reading a blob is ~50x
-// cheaper than diffing it) plus a hash-set comparison in Go. The synthesized
-// per-commit diff is fed to the *unchanged* parseDiff, so event semantics
-// (created/claimed/closed/reopened/modified) are identical to the `-p` path.
+// Rationale (#160 follow-up / #161 / pass-3): `git log -p --follow --
+// <beads.jsonl>` runs git's Myers diff over the entire multi-MB JSONL blob at
+// every commit and then *streams the full patch text* (megabytes of +/- record
+// lines) back to us. Measured on this repo (1.9 MB blob, 200 commits, warm
+// cache) that subprocess alone is ~720 ms. The parser, however, only needs the
+// set of added/removed `+{...}`/`-{...}` JSONL *record lines* per commit. Because
+// the beads exporter writes one whole JSON record per line, that set is exactly
+// the per-commit line-level set difference between the file's blob and its
+// parent's blob.
 //
-// The commit list, ordering, rename-following, and Since/Until/Limit filtering
-// are obtained from a metadata-only `git log --follow --name-status` (no `-p`),
-// which is effectively free.
+// So instead we:
+//
+//  1. run a metadata-only `git log --raw --follow` (~20 ms) that yields, per
+//     commit, the header plus the followed file's old+new blob object ids
+//     directly — git's own rename-following picks the correct parent blob, so we
+//     never have to resolve SHA^:path ourselves (the source of the earlier
+//     parent-diff subtlety);
+//  2. read each *unique* blob exactly once through a single streaming
+//     `git cat-file --batch` (consecutive commits share their boundary blob, so
+//     the 2xN referenced blobs collapse to ~N unique reads — ~half the I/O the
+//     old SHA:path/SHA^:path scheme paid);
+//  3. hash each blob's record lines once into a 64-bit-keyed multiset
+//     (recordLineSetHashed, ~4x faster than a full-string-keyed map), and emit
+//     the synthesized per-commit `+{...}`/`-{...}` diff for the *unchanged*
+//     parseDiff, so event semantics (created/claimed/closed/reopened/modified)
+//     are byte-identical to the `-p` path (proven by the differential test and
+//     the golden artifacts).
+//
+// Net effect on this repo: ~720 ms git + ~270 ms parse on the `-p` path drops to
+// ~310 ms git (raw log + dedup cat-file) + ~150 ms hash/diff. Since/Until/Limit
+// and rename-following are honored by the same `--raw --follow` walk.
 func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error) {
 	commits, err := e.snapshotCommits(opts)
 	if err != nil {
@@ -51,40 +77,98 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		return nil, nil
 	}
 
-	// For each commit diff the followed file's blob at the commit against its
-	// blob in the commit's first parent (the same two sides git's `-p --follow`
-	// compares). Both blobs are batched through a single `git cat-file --batch`
-	// so we pay one fork for the whole pass. We intentionally read the true
-	// SHA^ blob rather than carrying the previous --follow entry forward: the
-	// chronological predecessor in the --follow list is not always the commit's
-	// first parent (merges / history rewrites), and using it produces spurious
-	// events. Reading SHA^ keeps the output byte-identical to the legacy path
-	// (verified by the differential test).
-	specs := make([]string, 0, len(commits)*2)
-	for _, c := range commits {
-		specs = append(specs, c.info.SHA+":"+c.path)
-		if c.hadParent {
-			specs = append(specs, c.info.SHA+"^:"+c.parentPath)
+	// INCREMENTAL per-commit cache: each commit's events are an immutable pure
+	// function of its (oldSHA,newSHA) blob pair + commit metadata + BeadID filter
+	// (see per_commit_event_cache.go). Load the cached contributions for this
+	// (file,BeadID) namespace; reuse them for already-seen commits so a HEAD
+	// advance only reads + diffs the NEW commits' blobs instead of all ~200.
+	namespace := perCommitEventCacheNamespace(e.primaryBeadsFile(), opts.BeadID)
+	cached := loadPerCommitEvents(namespace)
+
+	// Per-commit events in git-log (newest-first) order; nil means "must compute".
+	perCommitEvents := make([][]BeadEvent, len(commits))
+	fresh := make(map[string]perCommitEventEntry)
+
+	// Collect the unique blob object ids referenced ONLY by the uncached commits.
+	// Adjacent uncached commits in the followed history can still share a boundary
+	// blob, so this dedups too. Cached commits contribute zero blob reads — the
+	// 232MB cat-file is skipped entirely when nothing is new.
+	seen := make(map[string]struct{}, len(commits)+1)
+	unique := make([]string, 0, len(commits)+1)
+	addSHA := func(s string) {
+		if s == "" {
+			return
 		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		unique = append(unique, s)
 	}
-	blobs, err := e.readBlobs(specs)
+	for i := range commits {
+		c := commits[i]
+		// A cache hit is valid only if the stored blob pair still matches the
+		// followed file's parent/child OIDs for this commit (re-validation guards
+		// against any rename-following anomaly; in practice always matches).
+		if ce, ok := cached[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA {
+			perCommitEvents[i] = ce.Events
+			continue
+		}
+		addSHA(c.oldSHA)
+		addSHA(c.newSHA)
+	}
+
+	blobs, err := e.readBlobs(unique)
 	if err != nil {
 		return nil, err
 	}
 
+	// Hash each (uncached-referenced) unique blob's record lines exactly once.
+	sets := make(map[string]recordLineSet, len(blobs))
+	for sha, content := range blobs {
+		sets[sha] = newRecordLineSet(content)
+	}
+
+	// Compute the uncached commits' contributions and record them for caching.
+	for i := range commits {
+		if perCommitEvents[i] != nil {
+			continue // served from cache
+		}
+		c := commits[i]
+		newSet := sets[c.newSHA]
+		var oldSet recordLineSet
+		if c.oldSHA != "" {
+			oldSet = sets[c.oldSHA]
+		}
+		var evs []BeadEvent
+		diffText := synthesizeRecordDiff(oldSet, newSet)
+		if len(diffText) > 0 {
+			evs = e.parseDiff(diffText, c.info, opts.BeadID)
+		}
+		// Store an empty-but-non-nil slice so the compose loop and the cache both
+		// treat "computed, no events" as a definitive result (never re-read).
+		if evs == nil {
+			evs = []BeadEvent{}
+		}
+		perCommitEvents[i] = evs
+		fresh[c.info.SHA] = perCommitEventEntry{
+			CreatedAt: time.Now().UTC(),
+			OldSHA:    c.oldSHA,
+			NewSHA:    c.newSHA,
+			Events:    evs,
+		}
+	}
+
+	// Persist only the freshly computed commits (pure hits are never re-written,
+	// preserving the no-rewrite-on-pure-hit discipline when nothing is new).
+	storePerCommitEvents(namespace, fresh)
+
+	// Compose the full event slice in the SAME ORDER a full extraction produces:
+	// concatenate per-commit events in git-log (newest-first) order, exactly as
+	// the original single loop did, then reverse to chronological.
 	var events []BeadEvent
 	for i := range commits {
-		c := commits[i]
-		newSet := recordLineSet(blobs[c.info.SHA+":"+c.path])
-		var oldSet map[string]int
-		if c.hadParent {
-			oldSet = recordLineSet(blobs[c.info.SHA+"^:"+c.parentPath])
-		}
-
-		diffText := synthesizeRecordDiffSets(oldSet, newSet)
-		if len(diffText) > 0 {
-			events = append(events, e.parseDiff(diffText, c.info, opts.BeadID)...)
-		}
+		events = append(events, perCommitEvents[i]...)
 	}
 
 	// snapshotCommits returns newest-first (git log order); match the legacy
@@ -94,15 +178,18 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 }
 
 // snapshotCommits returns, newest-first, the commits that touched the followed
-// beads file together with the path the file had at the commit and at its
-// parent. It uses a metadata-only `git log --follow --name-status` (no `-p`).
+// beads file together with the followed file's old (parent) and new blob object
+// ids. It uses a metadata-only `git log --raw --follow` (no `-p`): git's `--raw`
+// output already carries both blob ids per change, and `--follow` makes git pick
+// the correct parent blob across renames.
 func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, error) {
 	primary := e.primaryBeadsFile()
 
 	args := []string{
 		"log",
+		"--raw",
+		"--no-abbrev", // full 40-char blob ids so cat-file resolves them directly
 		"--follow",
-		"--name-status",
 		"--format=" + gitLogHeaderFormat,
 	}
 	args = appendHistoryFilters(args, opts)
@@ -113,9 +200,9 @@ func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, erro
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("git log --name-status failed: %s", string(exitErr.Stderr))
+			return nil, fmt.Errorf("git log --raw failed: %s", string(exitErr.Stderr))
 		}
-		return nil, fmt.Errorf("git log --name-status failed: %w", err)
+		return nil, fmt.Errorf("git log --raw failed: %w", err)
 	}
 
 	return parseSnapshotLog(out)
@@ -136,15 +223,20 @@ func appendHistoryFilters(args []string, opts ExtractOptions) []string {
 	return args
 }
 
-// parseSnapshotLog parses the newline-delimited output of
-// `git log --follow --name-status --format=<header>`.
+// parseSnapshotLog parses the output of `git log --raw --no-abbrev --follow
+// --format=<header>`.
 //
 // Per commit the stream is: a header line (NUL-separated %H..%s, terminated by
-// '\n'), followed by tab-separated name-status line(s) such as "M\t<path>" or
-// "R100\t<old>\t<new>", then a blank line before the next commit. We split the
-// stream on the commit-header marker (commitPattern), reusing the same boundary
-// detection as the streaming patch parser, then read the name-status lines that
-// follow each header.
+// '\n'), a blank line, then one or more `--raw` diff lines such as
+//
+//	:100644 100644 <oldsha> <newsha> M\t<path>
+//	:000000 100644 <zero>   <newsha> A\t<path>
+//	:100644 100644 <oldsha> <newsha> R100\t<oldpath>\t<newpath>
+//
+// We split the stream on the commit-header marker (commitPattern), reusing the
+// same boundary detection as the streaming patch parser, then read the `--raw`
+// line that follows each header. With --follow against a single pathspec there is
+// exactly one diff entry per commit; we take the first usable one.
 func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 	var commits []snapshotCommit
 
@@ -168,11 +260,8 @@ func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 			return nil, fmt.Errorf("parsing snapshot commit header: %w", err)
 		}
 
-		// Remaining lines are the tab-separated name-status entries. With
-		// --follow against a single pathspec there is exactly one entry per
-		// commit, but we scan defensively and take the first usable one.
 		sc := snapshotCommit{info: info}
-		if parseNameStatusLines(chunk[nl+1:], &sc) {
+		if parseRawDiffLines(chunk[nl+1:], &sc) {
 			commits = append(commits, sc)
 		}
 	}
@@ -180,63 +269,60 @@ func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 	return commits, nil
 }
 
-// parseNameStatusLines reads the tab-separated name-status lines for one commit
-// and fills sc with the status and path(s) for the followed file. Returns false
-// when no usable name-status entry is present.
-func parseNameStatusLines(payload []byte, sc *snapshotCommit) bool {
+// parseRawDiffLines reads the `--raw` diff line(s) for one commit and fills sc
+// with the followed file's old/new blob object ids. Returns false when no usable
+// raw entry is present. A raw line looks like:
+//
+//	:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>[\t<newpath>]
+func parseRawDiffLines(payload []byte, sc *snapshotCommit) bool {
 	scanner := bufio.NewScanner(bytes.NewReader(payload))
 	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" {
+		if len(line) == 0 || line[0] != ':' {
 			continue
 		}
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
+		// The leading metadata (everything before the first TAB) is
+		// space-separated: ":<oldmode> <newmode> <oldsha> <newsha> <status>".
+		tab := strings.IndexByte(line, '\t')
+		meta := line
+		if tab >= 0 {
+			meta = line[:tab]
+		}
+		fields := strings.Fields(meta)
+		if len(fields) < 5 {
 			continue
 		}
-		status := parts[0]
-		switch {
-		case (strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C")) && len(parts) >= 3:
-			// Rename/copy: "R100"\t<old>\t<new>. Diff the new path's content
-			// against the source path as it existed in the parent.
-			sc.parentPath = parts[1]
-			sc.path = parts[2]
-			sc.hadParent = true
-			return true
-		case strings.HasPrefix(status, "A"):
-			// Addition: file did not exist in the parent.
-			sc.path = parts[1]
-			sc.hadParent = false
-			return true
-		default:
-			// Modify/Type-change/etc.: "M"\t<path>.
-			sc.path = parts[1]
-			sc.parentPath = parts[1]
-			sc.hadParent = true
-			return true
+		oldSHA := fields[2]
+		newSHA := fields[3]
+		if oldSHA != nullBlobSHA {
+			sc.oldSHA = oldSHA
 		}
+		if newSHA != nullBlobSHA {
+			sc.newSHA = newSHA
+		}
+		// We only act on commits where the followed file has a current blob; a
+		// pure deletion (new == zero) carries no `+{...}` records to extract and
+		// the legacy `-p` path likewise produced no events for it.
+		return sc.newSHA != ""
 	}
 	return false
 }
 
-// readBlobs reads the requested <rev>:<path> blob specs via a single
-// `git cat-file --batch` process and returns their contents keyed by spec.
-// Missing blobs map to nil (treated as empty by the caller).
-func (e *Extractor) readBlobs(specs []string) (map[string][]byte, error) {
-	result := make(map[string][]byte, len(specs))
-
-	// De-duplicate specs (the same blob can recur across adjacent commits).
-	seen := make(map[string]struct{}, len(specs))
-	unique := make([]string, 0, len(specs))
-	for _, s := range specs {
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		unique = append(unique, s)
+// readBlobs reads the requested blob object ids via a single
+// `git cat-file --batch` process and returns their contents keyed by object id.
+// Object ids must already be unique. Missing blobs map to nil (treated as empty
+// by the caller).
+func (e *Extractor) readBlobs(ids []string) (map[string][]byte, error) {
+	result := make(map[string][]byte, len(ids))
+	atomic.AddInt64(&blobsReadCounter, int64(len(ids)))
+	if len(ids) == 0 {
+		return result, nil
 	}
-	sort.Strings(unique)
+
+	// Sort for deterministic request ordering (purely cosmetic; output is keyed
+	// by id so order does not affect correctness).
+	sort.Strings(ids)
 
 	cmd := exec.Command("git", "cat-file", "--batch")
 	cmd.Dir = e.repoPath
@@ -252,11 +338,11 @@ func (e *Extractor) readBlobs(specs []string) (map[string][]byte, error) {
 		return nil, fmt.Errorf("starting git cat-file: %w", err)
 	}
 
-	// Writer goroutine: feed all specs then close stdin.
+	// Writer goroutine: feed all ids then close stdin.
 	writeErr := make(chan error, 1)
 	go func() {
 		w := bufio.NewWriter(stdin)
-		for _, s := range unique {
+		for _, s := range ids {
 			if _, err := w.WriteString(s + "\n"); err != nil {
 				writeErr <- err
 				_ = stdin.Close()
@@ -274,8 +360,8 @@ func (e *Extractor) readBlobs(specs []string) (map[string][]byte, error) {
 
 	reader := bufio.NewReaderSize(stdout, gitLogMaxScanTokenSize)
 	parseErr := func() error {
-		for _, s := range unique {
-			// Response header: "<sha> <type> <size>\n" or "<spec> missing\n".
+		for _, s := range ids {
+			// Response header: "<sha> <type> <size>\n" or "<id> missing\n".
 			header, err := reader.ReadString('\n')
 			if err != nil {
 				return fmt.Errorf("reading cat-file header for %q: %w", s, err)
@@ -306,13 +392,23 @@ func (e *Extractor) readBlobs(specs []string) (map[string][]byte, error) {
 		return nil
 	}()
 
-	wErr := <-writeErr
-	waitErr := cmd.Wait()
 	if parseErr != nil {
+		// We stopped reading stdout mid-stream. If git's stdout pipe has filled,
+		// git blocks writing → stops reading stdin → the writer goroutine blocks
+		// on Flush/WriteString, so a plain `<-writeErr` here would deadlock on
+		// large histories. Kill git first (mirroring the legacy `git log -p`
+		// path's Process.Kill on parse error): that breaks the stdin pipe, the
+		// writer returns, and Wait completes. Then surface the parse error.
+		_ = cmd.Process.Kill()
+		<-writeErr
+		_ = cmd.Wait()
 		return nil, parseErr
 	}
+
+	wErr := <-writeErr
+	waitErr := cmd.Wait()
 	if wErr != nil {
-		return nil, fmt.Errorf("writing cat-file specs: %w", wErr)
+		return nil, fmt.Errorf("writing cat-file ids: %w", wErr)
 	}
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -336,58 +432,88 @@ func readFull(r *bufio.Reader, buf []byte) (int, error) {
 	return total, nil
 }
 
-// synthesizeRecordDiff produces the same `+{...}`/`-{...}` record lines that
-// `git log -p --unified=0` would emit for one commit, by computing the
-// line-level set difference between the parent blob (old) and the commit blob
-// (new). Beads exports one whole JSON record per line, so a record's presence in
-// exactly one side marks it added/removed; a modified record appears as the old
-// line removed and the new line added (identical to git's unified=0 output).
-//
-// Only record lines (those beginning with '{') are emitted, matching what the
-// downstream parser consumes. Lines unchanged between the two blobs are omitted.
-func synthesizeRecordDiff(oldBlob, newBlob []byte) []byte {
-	return synthesizeRecordDiffSets(recordLineSet(oldBlob), recordLineSet(newBlob))
+// recordLineSetSeed gives the per-process maphash a stable seed so the same line
+// hashes consistently within a single extraction (the only place these hashes are
+// compared). It is never persisted, so cross-process determinism is unnecessary.
+var recordLineSetSeed = maphash.MakeSeed()
+
+// recordLineEntry is one entry of a recordLineSet: how many times the record line
+// occurs in the blob, plus a representative copy of the line bytes (needed to emit
+// the synthesized diff for changed records).
+type recordLineEntry struct {
+	count int
+	text  []byte
 }
 
-// synthesizeRecordDiffSets is synthesizeRecordDiff over already-hashed record
-// multisets, so the carry-forward extraction loop hashes each blob only once.
-// A nil oldSet means "no parent" — every record reads as an addition.
-func synthesizeRecordDiffSets(oldSet, newSet map[string]int) []byte {
+// recordLineSet is the multiset of a blob's JSON record lines (those beginning
+// with '{'), keyed by a 64-bit hash of the line. Beads writes one whole JSON
+// record per line, so identity of a record is line identity; keying by hash
+// avoids retaining/hashing the full multi-KB line strings as map keys
+// (~4x faster than a map[string]int over the same blob).
+type recordLineSet map[uint64]*recordLineEntry
+
+// newRecordLineSet builds the record-line multiset for a blob. Non-record lines
+// (not starting with '{') are ignored, matching parseDiff which only acts on
+// lines beginning with '{'. The returned entries alias into blob, which the
+// caller retains for the duration of the extraction.
+func newRecordLineSet(blob []byte) recordLineSet {
+	set := make(recordLineSet)
+	for len(blob) > 0 {
+		nl := bytes.IndexByte(blob, '\n')
+		var line []byte
+		if nl < 0 {
+			line = blob
+			blob = nil
+		} else {
+			line = blob[:nl]
+			blob = blob[nl+1:]
+		}
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		h := maphash.Bytes(recordLineSetSeed, line)
+		if e, ok := set[h]; ok {
+			e.count++
+		} else {
+			set[h] = &recordLineEntry{count: 1, text: line}
+		}
+	}
+	return set
+}
+
+// synthesizeRecordDiff produces the same `+{...}`/`-{...}` record lines that
+// `git log -p --unified=0` would emit for one commit, by computing the line-level
+// set difference between the parent blob's record set (old) and the commit blob's
+// record set (new). A nil oldSet means "no parent" — every record reads as an
+// addition. A record present in exactly one side marks it added/removed; a
+// modified record appears as the old line removed and the new line added
+// (identical to git's unified=0 output for the downstream parser, which only
+// consumes lines beginning with '{').
+func synthesizeRecordDiff(oldSet, newSet recordLineSet) []byte {
 	var buf bytes.Buffer
 	// Removed: present in old, absent (or fewer) in new.
-	for line, n := range oldSet {
-		for i := 0; i < n-newSet[line]; i++ {
+	for h, oe := range oldSet {
+		newCount := 0
+		if ne, ok := newSet[h]; ok {
+			newCount = ne.count
+		}
+		for i := 0; i < oe.count-newCount; i++ {
 			buf.WriteByte('-')
-			buf.WriteString(line)
+			buf.Write(oe.text)
 			buf.WriteByte('\n')
 		}
 	}
 	// Added: present in new, absent (or fewer) in old.
-	for line, n := range newSet {
-		for i := 0; i < n-oldSet[line]; i++ {
+	for h, ne := range newSet {
+		oldCount := 0
+		if oe, ok := oldSet[h]; ok {
+			oldCount = oe.count
+		}
+		for i := 0; i < ne.count-oldCount; i++ {
 			buf.WriteByte('+')
-			buf.WriteString(line)
+			buf.Write(ne.text)
 			buf.WriteByte('\n')
 		}
 	}
 	return buf.Bytes()
-}
-
-// recordLineSet returns the multiset of JSON record lines (those starting with
-// '{') in a blob. Non-record lines are ignored, matching parseDiff which only
-// acts on lines beginning with '{'.
-func recordLineSet(blob []byte) map[string]int {
-	set := make(map[string]int)
-	if len(blob) == 0 {
-		return set
-	}
-	scanner := bufio.NewScanner(bytes.NewReader(blob))
-	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) > 0 && line[0] == '{' {
-			set[line]++
-		}
-	}
-	return set
 }

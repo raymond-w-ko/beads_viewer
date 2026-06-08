@@ -1170,9 +1170,49 @@ type Analyzer struct {
 	idToNode         map[string]int64
 	nodeToID         map[int64]string
 	issueMap         map[string]model.Issue
+	issues           []model.Issue // Original input slice, retained for data-hash memoization
 	blockerCounts    []int
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults
+
+	dataHashOnce sync.Once
+	dataHash     string
+}
+
+// SeedDataHash records a pre-computed ComputeDataHash for the analyzer's input
+// issues, so the disk-cache key path reuses it instead of running the SHA256
+// again. The caller MUST guarantee hash == ComputeDataHash(theInputIssues);
+// passing a hash for a different issue set would corrupt the analysis cache key.
+// An empty hash is ignored (DataHash then falls back to computing it).
+func (a *Analyzer) SeedDataHash(hash string) {
+	if hash == "" {
+		return
+	}
+	a.dataHashOnce.Do(func() {
+		a.dataHash = hash
+	})
+}
+
+// DataHash returns ComputeDataHash for the analyzer's input issues, computed at
+// most once per Analyzer. The analyzer owns its issue set for its lifetime, so
+// the value is stable; callers that recompute the same hash (e.g. the robot
+// disk-cache key path) reuse this result instead of re-running the SHA256.
+//
+// The emitted value is byte-identical to ComputeDataHash(issues): ComputeDataHash
+// sorts by ID, so hashing the retained slice (or, as a fallback, a slice rebuilt
+// from issueMap) yields the same digest.
+func (a *Analyzer) DataHash() string {
+	a.dataHashOnce.Do(func() {
+		issues := a.issues
+		if issues == nil {
+			issues = make([]model.Issue, 0, len(a.issueMap))
+			for _, issue := range a.issueMap {
+				issues = append(issues, issue)
+			}
+		}
+		a.dataHash = ComputeDataHash(issues)
+	})
+	return a.dataHash
 }
 
 // SetConfig sets a custom analysis configuration.
@@ -1314,6 +1354,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		idToNode:         idToNode,
 		nodeToID:         nodeToID,
 		issueMap:         issueMap,
+		issues:           issues,
 		blockerCounts:    blockerCounts,
 		blockerCountsMax: maxBlockers,
 	}
@@ -1355,11 +1396,10 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 
 	var robotCacheKey, dataHash string
 	if robotDiskCacheEnabled() {
-		issues := make([]model.Issue, 0, len(a.issueMap))
-		for _, issue := range a.issueMap {
-			issues = append(issues, issue)
-		}
-		dataHash = ComputeDataHash(issues)
+		// Reuse the analyzer-scoped memoized hash instead of rebuilding a slice
+		// from issueMap and re-running the SHA256 on every analysis. Identical
+		// value (ComputeDataHash sorts by ID), one computation per analyzer.
+		dataHash = a.DataHash()
 		robotCacheKey = dataHash + "|" + configHash
 
 		if cached, xfetchRefresh, ok := getRobotDiskCachedStats(robotCacheKey); ok {

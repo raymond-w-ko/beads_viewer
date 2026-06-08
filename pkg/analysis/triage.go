@@ -307,6 +307,13 @@ type TriageOptions struct {
 
 	// History report for staleness analysis
 	History *correlation.HistoryReport
+
+	// SeedDataHash, when non-empty, is a pre-computed ComputeDataHash(issues)
+	// the caller has already calculated for the same issue set. It is used to
+	// seed the analyzer's disk-cache key so the identical SHA256 is not run
+	// again. It is ignored when RootIssueID scopes the issue set (the seed would
+	// then describe a different slice).
+	SeedDataHash string
 }
 
 // TrackRecommendationGroup groups recommendations by execution track (bv-87)
@@ -344,6 +351,11 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 
 	// Build analyzer and stats
 	analyzer := NewAnalyzer(issues)
+	// Reuse a caller-supplied data hash when it still describes this exact issue
+	// set (i.e. no root-subgraph scoping happened above).
+	if opts.SeedDataHash != "" && opts.RootIssueID == "" {
+		analyzer.SeedDataHash(opts.SeedDataHash)
+	}
 
 	// bv-perf: Check if there are any open issues before computing Phase 2
 	// Phase 2 metrics (PageRank, Betweenness) are only used for scoring open issues.

@@ -2375,6 +2375,11 @@ func main() {
 
 		// Stable data hash for robot outputs (after repo filter but before recipes/TUI)
 		dataHash := analysis.ComputeDataHash(issues)
+		// dataHash corresponds to the current `issues` slice. Track whether later
+		// reassignments (label-scope subgraph, recipe filtering) change `issues`
+		// out from under it; when unchanged we can seed analyzers with dataHash to
+		// avoid recomputing the identical SHA256 for their disk-cache key.
+		dataHashMatchesIssues := true
 
 		// Label subgraph scoping (bv-122)
 		// When --label is specified, extract the label's subgraph and use it for all robot analysis.
@@ -2395,6 +2400,7 @@ func main() {
 					}
 				}
 				issues = subgraphIssues
+				dataHashMatchesIssues = false
 				// Compute label health for context
 				cfg := analysis.DefaultLabelHealthConfig()
 				allHealth := analysis.ComputeAllLabelHealth(issues, cfg, time.Now().UTC(), nil)
@@ -2413,9 +2419,11 @@ func main() {
 		if activeRecipe != nil && (*robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel || *robotPriority || *robotInsights || *robotPlan) {
 			issues = applyRecipeFilters(issues, activeRecipe)
 			issues = applyRecipeSort(issues, activeRecipe)
+			dataHashMatchesIssues = false
 		}
 		robotDispatchContext.Issues = issues
 		robotDispatchContext.DataHash = dataHash
+		robotDispatchContext.DataHashMatchesIssues = dataHashMatchesIssues
 		robotDispatchContext.AsOf = *asOf
 		robotDispatchContext.AsOfCommit = asOfResolved
 		robotDispatchContext.LabelScope = *labelScope
@@ -8660,16 +8668,20 @@ func resolveSingleRepoWatchFile(projectDir string) (string, error) {
 	// match the source bv reads from. For br repos this is typically the
 	// SQLite beads.db; without this, the watcher fires only on JSONL writes
 	// even though br updates land in SQLite first.
+	//
+	// We only need the selected source's PATH here, not a content validation:
+	// DiscoverSources already returns sources sorted freshest-first (ties broken
+	// by priority), which is exactly what SelectBestSource picks among valid
+	// candidates. Skipping ValidateAfterDiscovery avoids a redundant full parse
+	// of the 1.9MB issues.jsonl on the robot path (it is parsed once by the
+	// loader for the actual data load).
 	sources, discoverErr := datasource.DiscoverSources(datasource.DiscoveryOptions{
 		BeadsDir:               beadsDir,
 		RepoPath:               projectDir,
-		ValidateAfterDiscovery: true,
-		IncludeInvalid:         false,
+		ValidateAfterDiscovery: false,
 	})
-	if discoverErr == nil && len(sources) > 0 {
-		if best, selErr := datasource.SelectBestSource(sources); selErr == nil && best.Path != "" {
-			return best.Path, nil
-		}
+	if discoverErr == nil && len(sources) > 0 && sources[0].Path != "" {
+		return sources[0].Path, nil
 	}
 
 	beadsPath, err := loader.FindJSONLPath(beadsDir)
