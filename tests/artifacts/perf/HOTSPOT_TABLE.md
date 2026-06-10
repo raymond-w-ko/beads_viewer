@@ -198,3 +198,37 @@ Differential test byte-identical (fetch count == uncached count); -race clean.
 Residual on new-commit path: snapshot `git log --raw --follow` enumeration over full
 history + new commits' blob reads + report reassembly. Truly-cold one-time extraction (~1.0s)
 is irreducible without making correlation lazy (declined: changes output semantics).
+
+## 2026-06-08 — independent re-profile (post pass-14 + fresh-eyes bug fixes)
+Goal: confirm whether any low-hanging fruit remains before cutting a release.
+Host: 64 cores; fresh optimized build; isolated `XDG_CACHE_HOME` per scenario; hyperfine -N.
+In-process CPU attribution via Go pprof (measurement-only `pprof.StopCPUProfile()` before the
+robot-path `os.Exit`, since the documented `--cpu-profile` defer never fires on that path;
+instrumentation reverted afterwards — tree pristine).
+
+Baselines (warm = repeat call, what agents do):
+| path           | warm   | cold (fresh cache) |
+|----------------|--------|--------------------|
+| triage         | 98 ms  | 0.95 s             |
+| next           | 96 ms  | (≈triage)          |
+| plan           | 83 ms  | 0.07 s             |
+| insights       | 307 ms | 0.24 s             |
+| `--version` (irreducible Go startup floor) | 29.6 ms | — |
+
+Findings:
+- **Warm triage/next/plan** sit ~55-70 ms above a 29.6 ms irreducible startup floor. pprof flat
+  profile is FLAT (no node >10 ms self) — time is spread across necessary work (parse 1.9 MB
+  JSONL once, build graph, goccy-decode SoA cache, encode JSON) + GC. No hotspot. Nothing to grab.
+- **Cold triage 0.95 s** is ~half off-CPU (waiting on `git cat-file` blob pipe; only 8 git execs
+  total — fan-out already eliminated). In-process CPU = readBlobs/readFull (190 ms, of which
+  110 ms is memmove copying blob bytes) + 130 ms GC. Once-per-HEAD, already incrementally cached
+  (passes 11-14). Reducing alloc churn could shave ~100-150 ms off a once-per-machine op — low ROI.
+- **Warm insights 307 ms** (the slowest warm path, explicitly secondary per README): ~60 ms goccy
+  decode of the (larger) insights SoA cache blob + ~60 ms `TopWhatIfDeltas` + ~90 ms GC.
+  `TopWhatIfDeltas` is O(V·(V+E)) — one `countTransitiveUnblocks` BFS per open issue. It is correct
+  and produces real output; collapsing it to a single reverse-topo DP pass is a genuine algorithmic
+  rewrite with correctness risk (diamond/cascade unblock semantics), NOT low-hanging fruit, and only
+  helps a secondary path.
+
+VERDICT: no candidate clears Impact×Confidence/Effort ≥ 2.0. After 14 passes + the 6-bug
+fresh-eyes review, the robot path is at its practical floor. Stop optimizing; cut a release.

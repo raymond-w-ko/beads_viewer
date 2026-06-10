@@ -8,6 +8,55 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 ---
 
+## [v0.17.0] -- 2026-06-08 (Release)
+
+Performance release: a profile-driven overhaul of the agent-facing robot path makes repeat
+`--robot-*` calls roughly **25× faster** (warm triage ~2.3 s → ~0.09 s) and cuts git
+subprocesses from ~340 to 3 — all while keeping output byte-identical (verified by golden and
+differential tests). Also bundles the correctness fixes and a fresh-eyes bug-review pass found
+during the optimization work, plus a routine dependency refresh.
+
+### Added
+
+- **TUI:** left-click now focuses a panel and selects the row under the cursor, with precise
+  geometry inversion for split and single-column list views (drags and out-of-range clicks are
+  ignored) (bv-162).
+
+### Performance — Robot Path (`--robot-triage` / `--robot-next` / `--robot-plan` / `--robot-insights`)
+
+- **Correlation (the dominant former hotspot):** replaced ~2 `git show` per commit with 2 batched
+  `git log` calls; extract bead lifecycle via deduped `--raw` blob snapshots instead of
+  `git log -p`; added a persistent correlation result cache keyed on HEAD + beads-hash + opts so
+  repeat calls skip git extraction entirely. Cold-path: split the cache so working-tree bead edits
+  no longer bust the HEAD-only extraction, and added content-addressed per-commit **event** and
+  **co-commit** caches keyed by immutable commit SHA, so advancing HEAD only processes the new
+  commits (#160, #161).
+- **Analysis disk cache:** no longer rewrites the whole cache file on a read-hit; switched to
+  goccy/go-json streaming codec; adopted a columnar struct-of-arrays on-disk shape (v2, ~44 %
+  smaller).
+- **Loader / datasource:** parse `issues.jsonl` once on the robot path (fused load + validation
+  via a typed probe), memoize the data hash per invocation, and added a size-gated
+  (≥ 4 MiB) parallel JSONL parse for large stores.
+
+### Fixed
+
+- **triage:** exclude unblocked parent-child rollup edges from `blocked_by` (#158).
+- **watch:** coalesce `--watch-export` with adaptive backoff and skip exports via the canonical
+  content + dependency hash (#159).
+- **Fresh-eyes review (output-preserving):** restored commit `BeadID`s dropped from the HEAD
+  artifact cache; rejected a fresher empty/non-issue JSONL from shadowing the real `issues.jsonl`;
+  fixed parallel-parser `ParseStats` merge and an off-by-one max-capacity line boundary; stopped a
+  transient git failure from poisoning the co-commit cache; fixed a possible `readBlobs` deadlock
+  on a `cat-file` parse error; fixed a negative-index panic and a per-commit cache self-wipe.
+
+### Dependencies
+
+- Updated 7 direct dependencies (`git.sr.ht/~sbinet/gg`, `mattn/go-runewidth`,
+  `golang.org/x/{image,sync,sys,term}`, `modernc.org/sqlite`) and re-vendored canonically. See
+  `UPGRADE_LOG.md`.
+
+---
+
 ## [v0.16.2] -- 2026-05-16 (Release)
 
 Patch release focused on updater correctness, release artifact reliability, and hardening fixes found during fresh-eyes review passes.
@@ -795,7 +844,8 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.17.0...HEAD
+[v0.17.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.4...v0.17.0
 [v0.16.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.1...v0.16.2
 [v0.16.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.16.0...v0.16.1
 [v0.16.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.15.2...v0.16.0

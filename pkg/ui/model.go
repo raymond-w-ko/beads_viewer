@@ -3668,6 +3668,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.flowMatrix.MoveDown()
 			}
 			return m, nil
+
+		case tea.MouseButtonLeft:
+			// Left-click to focus a panel and select the row under the cursor
+			// (bv-162). WithMouseCellMotion also delivers motion and release
+			// events for the left button, so only act on a press.
+			if msg.Action != tea.MouseActionPress {
+				return m, nil
+			}
+			m = m.handleLeftClick(msg.X, msg.Y)
+			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
@@ -7130,6 +7140,98 @@ func (m *Model) recalculateSplitPaneSizes() {
 	m.viewport = viewport.New(detailInnerWidth, bodyHeight-2)
 	m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
 	m.updateViewportContent()
+}
+
+// handleLeftClick maps a left-click at terminal cell (x, y) to a focus change
+// and/or row selection in the currently-rendered view (bv-162).
+//
+// The mapping mirrors the geometry produced by View():
+//
+//   - Split view (m.isSplitView): the list panel is drawn on the left wrapped
+//     in a rounded-border panel of total width listInnerWidth+4 (1 border + 1
+//     style-content padding column on each side, with the list rendered at
+//     listInnerWidth). A click with x inside that span focuses the list; any
+//     other x focuses the detail panel. Within the list panel the visible rows
+//     are: y==0 the top border, y==1 the column header, y>=2 the list rows, so
+//     the clicked row offset is y-2 relative to the first row of the current
+//     pagination page.
+//
+//   - Mobile / single-column list view (renderListWithHeader): no border, so
+//     y==0 is the column header and y>=1 are list rows (offset y-1).
+//
+// For the absolute item index we add the current page's starting offset
+// (Paginator.Page * Paginator.PerPage), exactly the same slice start that
+// list.populatedView() uses to render the page.
+//
+// Modes other than the list (board, tree, graph, insights, history, sprint,
+// flow-matrix) are full-screen single panels with their own internal layout;
+// they are already focused, so a click there is treated as a no-op rather than
+// guessing at their internal geometry. The viewer stays read-only.
+func (m Model) handleLeftClick(x, y int) Model {
+	// Ignore clicks while any overlay/modal is up: the main list isn't drawn,
+	// so there is nothing meaningful to focus or select.
+	if m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||
+		m.showUpdateModal || m.showLabelHealthDetail || m.showLabelGraphAnalysis ||
+		m.showLabelDrilldown || m.showAlertsPanel || m.showTimeTravelPrompt ||
+		m.showRecipePicker || m.showRepoPicker || m.showLabelPicker ||
+		m.showHelp || m.showTutorial {
+		return m
+	}
+
+	// Full-screen single-panel views: nothing to re-focus (already focused),
+	// and their internal layouts aren't inverted here. No-op, read-only.
+	if m.focused == focusInsights || m.focused == focusFlowMatrix ||
+		m.focused == focusTree || m.isGraphView || m.isBoardView ||
+		m.isActionableView || m.isHistoryView || m.isSprintView ||
+		m.focused == focusLabelDashboard {
+		return m
+	}
+
+	// selectListRow selects the list item at rowOffset within the current page
+	// and syncs the detail pane when in split view. Out-of-range clicks (e.g.
+	// the page-indicator line or empty padding rows) are ignored.
+	selectListRow := func(rowOffset int) {
+		if rowOffset < 0 {
+			return
+		}
+		total := len(m.list.Items())
+		if total == 0 {
+			return
+		}
+		start := m.list.Paginator.Page * m.list.Paginator.PerPage
+		idx := start + rowOffset
+		if idx < 0 || idx >= total || idx >= start+m.list.Paginator.PerPage {
+			return
+		}
+		m.list.Select(idx)
+		if m.isSplitView {
+			m.updateViewportContent()
+		}
+	}
+
+	if m.isSplitView {
+		// Total width of the bordered list panel: list rendered at
+		// listInnerWidth, wrapped by a style of Width(listInnerWidth+2) plus a
+		// 1-cell rounded border on each side => listInnerWidth+4 total.
+		listPanelWidth := m.list.Width() + 4
+		if x < listPanelWidth {
+			m.focused = focusList
+			// y: 0 border, 1 header, 2.. list rows.
+			selectListRow(y - 2)
+		} else {
+			m.focused = focusDetail
+		}
+		return m
+	}
+
+	// Single-column mobile list view. Only meaningful when the list (not the
+	// detail viewport) is showing.
+	if !m.showDetails {
+		m.focused = focusList
+		// y: 0 header, 1.. list rows.
+		selectListRow(y - 1)
+	}
+	return m
 }
 
 func (m *Model) updateViewportContent() {
