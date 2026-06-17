@@ -187,6 +187,18 @@ bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Inste
 - `project_health`: status/type/priority distributions, graph metrics
 - `commands`: copy-paste shell commands for next steps
 
+**Count semantics (strict since #165):**
+- `quick_ref.open_count` / `project_health.counts.open` — issues with status exactly `open`; always equals `counts.by_status.open`
+- `quick_ref.blocked_count` / `counts.blocked` — issues with status exactly `blocked`; always equals `counts.by_status.blocked`
+- `quick_ref.in_progress_count` — status exactly `in_progress`
+- `counts.closed` — closed-like issues (`closed` + `tombstone`)
+- `quick_ref.not_closed_count` / `counts.not_closed` — every non-closed issue (`open`+`in_progress`+`blocked`+`deferred`); this is the pre-#165 meaning of `open_count`
+- `quick_ref.actionable_count` / `counts.actionable` — non-closed issues with no open blocking dependencies (ready to work now)
+- `quick_ref.not_actionable_count` / `counts.dependency_blocked` — non-closed issues blocked by open dependencies regardless of status; this is the pre-#165 meaning of `blocked_count`
+- Partition invariant: `not_closed == actionable + not_actionable` (every non-closed issue is exactly one of the two)
+
+**Liveness (#166):** the git-history prologue of `--robot-triage` is bounded (default 10s; tune via `--robot-history-timeout-ms <ms>` or `BV_ROBOT_HISTORY_TIMEOUT_MS`, `0` = unbounded). On timeout the in-flight git subprocess is killed and triage proceeds without history; `meta.history_status` reports `ok`, `error`, or `timeout` (omitted when history was not attempted).
+
 bv --robot-triage        # THE MEGA-COMMAND: start here
 bv --robot-next          # Minimal: just the single top pick + claim command
 

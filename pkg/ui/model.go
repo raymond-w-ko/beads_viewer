@@ -5047,12 +5047,20 @@ func (m Model) renderListWithHeader() string {
 		availableHeight = m.height - 3 // fallback
 	}
 
-	// Render column header
+	// Render column header.
+	//
+	// Clamp to a single line (Height/MaxHeight 1): the header strings below are
+	// ~65 columns wide, so on a narrow terminal (m.width-2 < header width) they
+	// would otherwise wrap to a 2nd line, misaligning columns AND shifting every
+	// list row down by a line, which broke the click->row mapping in
+	// handleLeftClick (bv-164). See listChromeLines().
 	headerStyle := t.Renderer.NewStyle().
 		Background(t.Primary).
 		Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}).
 		Bold(true).
-		Width(m.width - 2)
+		Width(m.width - 2).
+		Height(1).
+		MaxHeight(1)
 
 	headerText := "  TYPE PRI STATUS      ID                                   TITLE"
 	if m.workspaceMode {
@@ -5136,12 +5144,21 @@ func (m Model) renderSplitView() string {
 	listInnerWidth := m.list.Width()
 	panelHeight := m.height - 1
 
-	// Create header row for list
+	// Create header row for list.
+	//
+	// Clamp to a single line (Height/MaxHeight 1): the header string is ~51
+	// columns wide, so on a narrow list pane (listInnerWidth < ~51) it would
+	// otherwise wrap to a 2nd line. That wrap both misaligns the columns AND
+	// shifts every list row down by a line, breaking the click->row mapping in
+	// handleLeftClick (bv-164). Clamping keeps the chrome above the first row at
+	// a constant height regardless of width; see listChromeLines().
 	headerStyle := t.Renderer.NewStyle().
 		Background(t.Primary).
 		Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}).
 		Bold(true).
-		Width(listInnerWidth)
+		Width(listInnerWidth).
+		Height(1).
+		MaxHeight(1)
 
 	header := headerStyle.Render("  TYPE PRI STATUS      ID                     TITLE")
 
@@ -7142,22 +7159,70 @@ func (m *Model) recalculateSplitPaneSizes() {
 	m.updateViewportContent()
 }
 
-// handleLeftClick maps a left-click at terminal cell (x, y) to a focus change
-// and/or row selection in the currently-rendered view (bv-162).
+// listChromeLines returns the number of non-row lines rendered above the first
+// list row, in the currently-active layout. It is the single source of truth
+// shared by the renderers' geometry and handleLeftClick's click->row mapping
+// (bv-164), so the two can never drift.
 //
-// The mapping mirrors the geometry produced by View():
+// The lines accounted for, top to bottom, are:
+//
+//	+1  panel top border        — split view only (rounded-border panel; the
+//	                              mobile/single-column view has no border).
+//	+1  column header           — the "TYPE PRI STATUS ..." line that both
+//	                              renderSplitView and renderListWithHeader draw
+//	                              before m.list.View(). It is clamped to a single
+//	                              line (MaxHeight(1)) so it cannot wrap on a
+//	                              narrow pane and is therefore always exactly 1.
+//	+1  list title/filter bar   — bubbles' list.View() always emits a leading
+//	                              title/filter section when
+//	                              showTitle || (showFilter && filteringEnabled).
+//	                              This list sets ShowTitle(false) but keeps the
+//	                              default ShowFilter(true) + FilteringEnabled(true)
+//	                              (the "/" search input must stay available), so
+//	                              the guard is true and a 1-line section is always
+//	                              rendered — blank when not actively filtering,
+//	                              the single-line FilterInput while typing — even
+//	                              though titleView() returns "". JoinVertical
+//	                              still renders it as one line.
+//
+// Mirroring bubbles' exact guard (list.go View): the filter-bar term is only
+// added when that condition holds, so disabling filtering later would
+// automatically drop it without touching this math.
+func (m Model) listChromeLines() int {
+	lines := 1 // column header (clamped to 1 line; never wraps)
+	if m.isSplitView {
+		lines++ // top border of the rounded-border list panel
+	}
+	if m.list.ShowTitle() || (m.list.ShowFilter() && m.list.FilteringEnabled()) {
+		lines++ // bubbles' always-present leading title/filter bar line
+	}
+	return lines
+}
+
+// handleLeftClick maps a left-click at terminal cell (x, y) to a focus change
+// and/or row selection in the currently-rendered view (bv-162, bv-164).
+//
+// The mapping mirrors the geometry produced by View(). The number of non-row
+// lines above the first list row is computed once by listChromeLines() so the
+// click math and the renderers share a single source of truth:
 //
 //   - Split view (m.isSplitView): the list panel is drawn on the left wrapped
 //     in a rounded-border panel of total width listInnerWidth+4 (1 border + 1
 //     style-content padding column on each side, with the list rendered at
 //     listInnerWidth). A click with x inside that span focuses the list; any
-//     other x focuses the detail panel. Within the list panel the visible rows
-//     are: y==0 the top border, y==1 the column header, y>=2 the list rows, so
-//     the clicked row offset is y-2 relative to the first row of the current
-//     pagination page.
+//     other x focuses the detail panel. Within the list panel the lines above
+//     the first row are: the top border, the column header, and the list's
+//     always-present title/filter bar (listChromeLines() == 3), so the clicked
+//     row offset is y-listChromeLines() relative to the first row of the
+//     current pagination page.
 //
 //   - Mobile / single-column list view (renderListWithHeader): no border, so
-//     y==0 is the column header and y>=1 are list rows (offset y-1).
+//     the lines above the first row are the column header and the filter bar
+//     (listChromeLines() == 2).
+//
+// Both headers are clamped to one line, so the offset is constant across wide
+// and narrow terminals (previously a narrow pane wrapped the header, shifting
+// every row down by an extra line — the off-by-two part of bv-164).
 //
 // For the absolute item index we add the current page's starting offset
 // (Paginator.Page * Paginator.PerPage), exactly the same slice start that
@@ -7216,8 +7281,8 @@ func (m Model) handleLeftClick(x, y int) Model {
 		listPanelWidth := m.list.Width() + 4
 		if x < listPanelWidth {
 			m.focused = focusList
-			// y: 0 border, 1 header, 2.. list rows.
-			selectListRow(y - 2)
+			// Lines above the first row: border + header + list filter bar.
+			selectListRow(y - m.listChromeLines())
 		} else {
 			m.focused = focusDetail
 		}
@@ -7228,8 +7293,8 @@ func (m Model) handleLeftClick(x, y int) Model {
 	// detail viewport) is showing.
 	if !m.showDetails {
 		m.focused = focusList
-		// y: 0 header, 1.. list rows.
-		selectListRow(y - 1)
+		// Lines above the first row: header + list filter bar (no border).
+		selectListRow(y - m.listChromeLines())
 	}
 	return m
 }

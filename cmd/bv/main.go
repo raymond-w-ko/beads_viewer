@@ -266,6 +266,8 @@ func modifierRecoveryExamples(modifier string) []string {
 		return []string{"bv --check-drift --robot-drift --format json"}
 	case "history-since", "history-limit", "min-confidence":
 		return []string{"bv robot-history --history-since \"30 days ago\" --json"}
+	case "robot-history-timeout-ms":
+		return []string{"bv robot-triage --robot-history-timeout-ms 10000 --json"}
 	case "correlation-by", "correlation-reason":
 		return []string{"bv robot-confirm-correlation deadbeef:A --correlation-by agent --json"}
 	case "orphans-min-score":
@@ -1429,6 +1431,7 @@ func main() {
 	beadHistory := flag.String("bead-history", "", "Show history for specific bead ID")
 	historySince := flag.String("history-since", "", "Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01')")
 	historyLimit := flag.Int("history-limit", 500, "Max commits to analyze (0 = unlimited)")
+	robotHistoryTimeoutMs := flag.Int("robot-history-timeout-ms", -1, "Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS)")
 	minConfidence := flag.Float64("min-confidence", 0.0, "Filter correlations by minimum confidence (0.0-1.0)")
 	// Correlation audit flags (bv-e1u6)
 	robotExplainCorrelation := flag.String("robot-explain-correlation", "", "Explain why a commit is linked to a bead (format: SHA:beadID)")
@@ -1602,6 +1605,7 @@ func main() {
 		RobotCapacityFlag:       robotCapacity,
 		ForceFullAnalysis:       forceFullAnalysis,
 		HistoryLimit:            historyLimit,
+		HistoryTimeoutMs:        robotHistoryTimeoutMs,
 		HistorySince:            historySince,
 		MinConfidence:           minConfidence,
 		AttentionLimit:          attentionLimit,
@@ -1639,6 +1643,7 @@ func main() {
 			{modifier: "robot-drift", requires: []string{"check-drift"}},
 			{modifier: "history-since", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "history-limit", requires: []string{"robot-history", "bead-history"}},
+			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
 			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
@@ -8859,15 +8864,22 @@ func generateRobotSchemas() RobotSchemas {
 								"generated_at": map[string]interface{}{"type": "string"},
 								"phase2_ready": map[string]interface{}{"type": "boolean"},
 								"issue_count":  map[string]interface{}{"type": "integer"},
+								"history_status": map[string]interface{}{
+									"type":        "string",
+									"enum":        []string{"ok", "error", "timeout"},
+									"description": "Outcome of the git-history correlation prologue; omitted when history was not attempted (#166)",
+								},
 							},
 						},
 						"quick_ref": map[string]interface{}{
 							"type": "object",
 							"properties": map[string]interface{}{
-								"open_count":        map[string]interface{}{"type": "integer"},
-								"actionable_count":  map[string]interface{}{"type": "integer"},
-								"blocked_count":     map[string]interface{}{"type": "integer"},
-								"in_progress_count": map[string]interface{}{"type": "integer"},
+								"open_count":           map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
+								"actionable_count":     map[string]interface{}{"type": "integer", "description": "Non-closed issues ready to work on (no open blocking dependencies)"},
+								"blocked_count":        map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == blocked (equals project_health.counts.by_status.blocked)"},
+								"in_progress_count":    map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == in_progress"},
+								"not_closed_count":     map[string]interface{}{"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
+								"not_actionable_count": map[string]interface{}{"type": "integer", "description": "Non-closed issues blocked by open dependencies, regardless of status"},
 								"top_picks": map[string]interface{}{
 									"type":  "array",
 									"items": map[string]interface{}{"$ref": "#/$defs/recommendation"},

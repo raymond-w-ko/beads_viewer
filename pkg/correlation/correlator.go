@@ -2,6 +2,7 @@
 package correlation
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,10 @@ type Correlator struct {
 	repoPath    string
 	extractor   *Extractor
 	coCommitter *CoCommitExtractor
+
+	// ctx, when set via WithContext, bounds every git subprocess spawned
+	// during report generation (issue #166). nil means context.Background().
+	ctx context.Context
 }
 
 // NewCorrelator creates a new correlator for the given repository.
@@ -27,6 +32,22 @@ func NewCorrelator(repoPath string, beadsFilePath ...string) *Correlator {
 		extractor:   NewExtractor(repoPath, beadsFilePath...),
 		coCommitter: NewCoCommitExtractor(repoPath),
 	}
+}
+
+// WithContext binds ctx to the correlator and its underlying extractors so
+// every git subprocess spawned while generating a report is killed as soon as
+// ctx is cancelled (issue #166: bounded robot liveness). It mutates and
+// returns the receiver for chaining:
+//
+//	report, err := NewCorrelator(dir).WithContext(ctx).GenerateReportCached(beads, opts)
+//
+// A nil ctx (or never calling WithContext) preserves the legacy
+// run-to-completion behavior.
+func (c *Correlator) WithContext(ctx context.Context) *Correlator {
+	c.ctx = ctx
+	c.extractor.ctx = ctx
+	c.coCommitter.ctx = ctx
+	return c
 }
 
 // CorrelatorOptions controls how the history report is generated

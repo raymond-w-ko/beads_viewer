@@ -4,8 +4,8 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -28,6 +28,11 @@ var coCommitFetchedSHAsCounter int64
 // CoCommitExtractor extracts files that were changed in the same commit as bead changes
 type CoCommitExtractor struct {
 	repoPath string
+
+	// ctx, when set (via Correlator.WithContext or directly), bounds the git
+	// subprocesses spawned during co-commit extraction (issue #166). nil means
+	// context.Background().
+	ctx context.Context
 
 	// Memoized per-commit diff data, populated lazily by primeBatch. Once a SHA
 	// is present in batchedSHAs, getFilesChanged/getLineStats serve it from these
@@ -288,7 +293,7 @@ func batchLogArgs(diffFlag string, shas []string) []string {
 func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileChange, error) {
 	files := make(map[string][]FileChange, len(shas))
 
-	cmd := exec.Command("git", withNoColorGit(batchLogArgs("--name-status", shas))...)
+	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--name-status", shas))...)
 	cmd.Dir = c.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -307,7 +312,7 @@ func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileC
 func (c *CoCommitExtractor) batchLineStats(shas []string) (map[string]map[string]lineStats, error) {
 	stats := make(map[string]map[string]lineStats, len(shas))
 
-	cmd := exec.Command("git", withNoColorGit(batchLogArgs("--numstat", shas))...)
+	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--numstat", shas))...)
 	cmd.Dir = c.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -443,7 +448,7 @@ func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
 	}
 
 	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, excludePathspecArgs()...)
-	cmd := exec.Command("git", gitArgs...)
+	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 
 	out, err := cmd.Output()
@@ -465,7 +470,7 @@ func (c *CoCommitExtractor) getLineStats(sha string) (map[string]lineStats, erro
 	}
 
 	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, excludePathspecArgs()...)
-	cmd := exec.Command("git", gitArgs...)
+	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 
 	out, err := cmd.Output()

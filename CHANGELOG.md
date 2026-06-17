@@ -6,6 +6,32 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 ## [Unreleased]
 
+### Changed — **BREAKING (robot JSON semantics)**
+
+- **Strict count semantics in triage output (#165).** `quick_ref.open_count` /
+  `project_health.counts.open` now count ONLY issues whose status is exactly `open` (previously:
+  every non-closed issue, i.e. `open`+`in_progress`+`blocked`+`deferred`), and
+  `quick_ref.blocked_count` / `counts.blocked` now count ONLY issues whose status is exactly
+  `blocked` (previously: every non-closed, non-actionable issue). Both now always equal the
+  corresponding `counts.by_status` entries. The legacy aggregates are preserved under
+  semantically accurate names: `not_closed_count` / `counts.not_closed` (old `open_count`) and
+  `not_actionable_count` / `counts.dependency_blocked` (old `blocked_count`), with the partition
+  invariant `not_closed == actionable + not_actionable`. Consumers that relied on
+  `counts.open` meaning "non-closed" must switch to `not_closed`; consumers that relied on
+  `counts.blocked` meaning "dependency-blocked" must switch to `dependency_blocked` /
+  `not_actionable_count`. This also aligns the triage counts with the bundled viewer's strict
+  status tiles.
+
+### Added
+
+- **Bounded robot liveness for the triage history prologue (#166).** The git-history correlation
+  step of `--robot-triage` / `--robot-next` now runs under a hard budget (default 10 s),
+  overridable via `--robot-history-timeout-ms` or `BV_ROBOT_HISTORY_TIMEOUT_MS` (`0` =
+  unbounded). On timeout the in-flight git subprocess is killed (the correlation package now
+  threads a `context.Context` into every `git` invocation via `exec.CommandContext`) and triage
+  proceeds without history. The outcome is surfaced as `meta.history_status`
+  (`ok` | `error` | `timeout`; omitted when history generation was not attempted).
+
 ---
 
 ## [v0.17.0] -- 2026-06-08 (Release)

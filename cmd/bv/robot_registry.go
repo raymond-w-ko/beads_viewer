@@ -165,6 +165,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotImpactFlag         *string
 	ForceFullAnalysis       *bool
 	HistoryLimit            *int
+	HistoryTimeoutMs        *int // #166: budget for the triage history prologue (-1 = unset, 0 = unbounded)
 	HistorySince            *string
 	MinConfidence           *float64
 	AttentionLimit          *int
@@ -1701,8 +1702,75 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	return nil
 }
 
+// defaultRobotHistoryTimeout bounds the git-history correlation prologue of
+// --robot-triage / --robot-next (issue #166). The prologue is best-effort
+// enrichment (staleness metrics); it must never be able to hang the robot
+// surface, which agents rely on as their single bounded entry point.
+const defaultRobotHistoryTimeout = 10 * time.Second
+
+// resolveRobotHistoryTimeout returns the history-prologue budget. Precedence:
+// the --robot-history-timeout-ms flag (when explicitly set, i.e. >= 0), then
+// the BV_ROBOT_HISTORY_TIMEOUT_MS environment variable, then the 10s default.
+// A value of 0 disables the bound entirely (legacy run-to-completion).
+func resolveRobotHistoryTimeout(cfg phaseThreeRobotHandlerConfig) time.Duration {
+	if cfg.HistoryTimeoutMs != nil && *cfg.HistoryTimeoutMs >= 0 {
+		return time.Duration(*cfg.HistoryTimeoutMs) * time.Millisecond
+	}
+	if env := strings.TrimSpace(os.Getenv("BV_ROBOT_HISTORY_TIMEOUT_MS")); env != "" {
+		if ms, err := strconv.Atoi(env); err == nil && ms >= 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return defaultRobotHistoryTimeout
+}
+
+// generateTriageHistoryBounded runs the expensive git-history correlation
+// prologue of --robot-triage under a hard time budget (issue #166).
+//
+// The report generation runs in a goroutine while this function selects on
+// the result vs. the budget. On timeout it returns (nil, "timeout") and
+// triage proceeds without history — the already-supported degradation path.
+// Crucially the goroutine does NOT leak unbounded work: the correlator is
+// bound to the timed-out context, so every git subprocess it spawned (or
+// would spawn next) is killed via exec.CommandContext, and the goroutine
+// unblocks and exits promptly.
+//
+// The returned status is "ok", "error", or "timeout"; it is surfaced as
+// meta.history_status in the triage output.
+func generateTriageHistoryBounded(workDir, beadsPath string, beadInfos []correlation.BeadInfo, limit int, timeout time.Duration) (*correlation.HistoryReport, string) {
+	histCtx := context.Background()
+	cancel := context.CancelFunc(func() {})
+	if timeout > 0 {
+		histCtx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	defer cancel()
+
+	correlator := correlation.NewCorrelator(workDir, beadsPath).WithContext(histCtx)
+
+	type historyResult struct {
+		report *correlation.HistoryReport
+		err    error
+	}
+	resCh := make(chan historyResult, 1)
+	go func() {
+		report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit})
+		resCh <- historyResult{report: report, err: err}
+	}()
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return nil, "error"
+		}
+		return res.report, "ok"
+	case <-histCtx.Done():
+		return nil, "timeout"
+	}
+}
+
 func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	var historyReport *correlation.HistoryReport
+	historyStatus := "" // empty = history generation not attempted (#166)
 	hasOpenIssues := false
 	for _, issue := range ctx.Issues {
 		if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone {
@@ -1732,10 +1800,8 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 								Status: string(issue.Status),
 							}
 						}
-						correlator := correlation.NewCorrelator(workDir, beadsPath)
-						if report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{Limit: limit}); err == nil {
-							historyReport = report
-						}
+						historyReport, historyStatus = generateTriageHistoryBounded(
+							workDir, beadsPath, beadInfos, limit, resolveRobotHistoryTimeout(cfg))
 					}
 				}
 			}
@@ -1763,6 +1829,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		SeedDataHash:  seedHash,
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
+	triage.Meta.HistoryStatus = historyStatus
 
 	var feedbackInfo *analysis.FeedbackJSON
 	if beadsDir, err := loader.GetBeadsDir(""); err == nil {

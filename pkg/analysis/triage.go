@@ -40,15 +40,47 @@ type TriageMeta struct {
 	Phase2Ready   bool      `json:"phase2_ready"`
 	IssueCount    int       `json:"issue_count"`
 	ComputeTimeMs int64     `json:"compute_time_ms"`
+	// HistoryStatus reports the outcome of the optional git-history
+	// correlation prologue used by --robot-triage (issue #166):
+	// "ok" (history report generated), "error" (generation failed),
+	// "timeout" (generation exceeded the configured budget and was
+	// cancelled; triage proceeded without history), or empty when history
+	// generation was not attempted (no git repo / no open issues / callers
+	// outside the robot-triage path).
+	HistoryStatus string `json:"history_status,omitempty"`
 }
 
-// QuickRef provides at-a-glance summary for fast decisions
+// QuickRef provides at-a-glance summary for fast decisions.
+//
+// Count semantics (issue #165): open_count and blocked_count are STRICT
+// status counts and always equal project_health.counts.by_status["open"] and
+// by_status["blocked"]. The legacy aggregate values (every non-closed issue,
+// and every non-closed-but-not-actionable issue) moved to not_closed_count
+// and not_actionable_count. Partition invariant:
+//
+//	not_closed_count == actionable_count + not_actionable_count
 type QuickRef struct {
-	OpenCount       int       `json:"open_count"`
-	ActionableCount int       `json:"actionable_count"`
-	BlockedCount    int       `json:"blocked_count"`
-	InProgressCount int       `json:"in_progress_count"`
-	TopPicks        []TopPick `json:"top_picks"` // Top 3 recommended items
+	// OpenCount counts issues whose status is exactly "open"
+	// (== by_status["open"]; excludes in_progress/blocked/deferred).
+	OpenCount int `json:"open_count"`
+	// ActionableCount counts non-closed issues that are ready to work on
+	// (no open blocking dependencies).
+	ActionableCount int `json:"actionable_count"`
+	// BlockedCount counts issues whose status is exactly "blocked"
+	// (== by_status["blocked"]). For dependency-blocked work regardless of
+	// status, see NotActionableCount.
+	BlockedCount int `json:"blocked_count"`
+	// InProgressCount counts issues whose status is exactly "in_progress".
+	InProgressCount int `json:"in_progress_count"`
+	// NotClosedCount counts every issue that is not closed-like (status is
+	// not "closed"/"tombstone"). This carries the pre-#165 open_count
+	// semantics.
+	NotClosedCount int `json:"not_closed_count"`
+	// NotActionableCount counts non-closed issues that are NOT actionable
+	// (blocked by open dependencies, whatever their status). This carries
+	// the pre-#165 blocked_count semantics.
+	NotActionableCount int       `json:"not_actionable_count"`
+	TopPicks           []TopPick `json:"top_picks"` // Top 3 recommended items
 }
 
 // TopPick is a condensed recommendation for quick reference
@@ -104,16 +136,41 @@ type ProjectHealth struct {
 	Staleness *Staleness   `json:"staleness,omitempty"` // nil until history ready
 }
 
-// HealthCounts is basic issue statistics
+// HealthCounts is basic issue statistics.
+//
+// Count semantics (issue #165): Open and Blocked are STRICT status counts
+// (always equal to ByStatus["open"] / ByStatus["blocked"]). The pre-#165
+// aggregate values are preserved under the semantically accurate names
+// NotClosed and DependencyBlocked. Partition invariant:
+//
+//	not_closed == actionable + dependency_blocked
 type HealthCounts struct {
-	Total      int            `json:"total"`
-	Open       int            `json:"open"`
-	Closed     int            `json:"closed"`
-	Blocked    int            `json:"blocked"`
-	Actionable int            `json:"actionable"`
-	ByStatus   map[string]int `json:"by_status"`
-	ByType     map[string]int `json:"by_type"`
-	ByPriority map[int]int    `json:"by_priority"`
+	// Total counts every issue, including closed and tombstone.
+	Total int `json:"total"`
+	// Open counts issues whose status is exactly "open" (== ByStatus["open"]).
+	// Before #165 this counted every non-closed issue; that value is now
+	// NotClosed.
+	Open int `json:"open"`
+	// Closed counts closed-like issues (status "closed" or "tombstone").
+	Closed int `json:"closed"`
+	// Blocked counts issues whose status is exactly "blocked"
+	// (== ByStatus["blocked"]). Before #165 this counted non-closed issues
+	// that were not actionable; that value is now DependencyBlocked.
+	Blocked int `json:"blocked"`
+	// Actionable counts non-closed issues with no open blocking
+	// dependencies (ready to work on now).
+	Actionable int `json:"actionable"`
+	// NotClosed counts every issue that is not closed-like (status is not
+	// "closed"/"tombstone"): open + in_progress + blocked + deferred + any
+	// other live status. Pre-#165 "open" semantics.
+	NotClosed int `json:"not_closed"`
+	// DependencyBlocked counts non-closed issues that are NOT actionable
+	// (blocked by open dependencies, whatever their status). Pre-#165
+	// "blocked" semantics.
+	DependencyBlocked int            `json:"dependency_blocked"`
+	ByStatus          map[string]int `json:"by_status"`
+	ByType            map[string]int `json:"by_type"`
+	ByPriority        map[int]int    `json:"by_priority"`
 }
 
 // GraphHealth summarizes dependency graph metrics
@@ -546,11 +603,13 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 			ComputeTimeMs: elapsed.Milliseconds(),
 		},
 		QuickRef: QuickRef{
-			OpenCount:       counts.Open,
-			ActionableCount: counts.Actionable,
-			BlockedCount:    counts.Blocked,
-			InProgressCount: counts.ByStatus["in_progress"],
-			TopPicks:        topPicks,
+			OpenCount:          counts.Open,
+			ActionableCount:    counts.Actionable,
+			BlockedCount:       counts.Blocked,
+			InProgressCount:    counts.ByStatus["in_progress"],
+			NotClosedCount:     counts.NotClosed,
+			NotActionableCount: counts.DependencyBlocked,
+			TopPicks:           topPicks,
 		},
 		Recommendations:        recommendations,
 		QuickWins:              quickWins,
@@ -678,14 +737,19 @@ func computeCounts(issues []model.Issue, analyzer *Analyzer) HealthCounts {
 		if isClosedLikeStatus(issue.Status) {
 			counts.Closed++
 		} else {
-			counts.Open++
+			counts.NotClosed++
 			if actionableSet[issue.ID] {
 				counts.Actionable++
 			} else {
-				counts.Blocked++
+				counts.DependencyBlocked++
 			}
 		}
 	}
+
+	// Strict status counts (issue #165): keep Open/Blocked in lockstep with
+	// ByStatus so counts.open == by_status.open always holds.
+	counts.Open = counts.ByStatus[string(model.StatusOpen)]
+	counts.Blocked = counts.ByStatus[string(model.StatusBlocked)]
 
 	return counts
 }
@@ -708,15 +772,20 @@ func computeCountsWithContext(issues []model.Issue, ctx *TriageContext) HealthCo
 		if isClosedLikeStatus(issue.Status) {
 			counts.Closed++
 		} else {
-			counts.Open++
+			counts.NotClosed++
 			// Use cached IsActionable lookup - O(1) after first computation
 			if ctx.IsActionable(issue.ID) {
 				counts.Actionable++
 			} else {
-				counts.Blocked++
+				counts.DependencyBlocked++
 			}
 		}
 	}
+
+	// Strict status counts (issue #165): keep Open/Blocked in lockstep with
+	// ByStatus so counts.open == by_status.open always holds.
+	counts.Open = counts.ByStatus[string(model.StatusOpen)]
+	counts.Blocked = counts.ByStatus[string(model.StatusBlocked)]
 
 	return counts
 }

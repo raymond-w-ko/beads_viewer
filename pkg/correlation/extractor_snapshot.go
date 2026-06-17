@@ -195,7 +195,7 @@ func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, erro
 	args = appendHistoryFilters(args, opts)
 	args = append(args, "--", primary)
 
-	cmd := exec.Command("git", withNoColorGit(args)...)
+	cmd := gitCommand(e.ctx, withNoColorGit(args)...)
 	cmd.Dir = e.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -324,7 +324,7 @@ func (e *Extractor) readBlobs(ids []string) (map[string][]byte, error) {
 	// by id so order does not affect correctness).
 	sort.Strings(ids)
 
-	cmd := exec.Command("git", "cat-file", "--batch")
+	cmd := gitCommand(e.ctx, "cat-file", "--batch")
 	cmd.Dir = e.repoPath
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

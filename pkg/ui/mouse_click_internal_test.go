@@ -58,11 +58,13 @@ func TestLeftClickSelectsListRowInSplitView(t *testing.T) {
 		t.Fatalf("setup: expected list index 0, got %d", got)
 	}
 
-	// The list panel occupies x in [0, listInnerWidth+4). Rows: y0=border,
-	// y1=header, y2=first row. Click row index 3 (y == 2 + 3 == 5).
+	// The list panel occupies x in [0, listInnerWidth+4). The lines above the
+	// first row are border + header + filter bar (listChromeLines()), so the
+	// first row is at y == listChromeLines(). Click row index 3.
 	x := 5 // well inside the left panel
+	chrome := m.listChromeLines()
 	clickedRow := 3
-	updated := m.handleLeftClick(x, 2+clickedRow)
+	updated := m.handleLeftClick(x, chrome+clickedRow)
 
 	if updated.focused != focusList {
 		t.Errorf("after click in list panel, focused = %v, want focusList", updated.focused)
@@ -105,8 +107,11 @@ func TestLeftClickSelectsListRowMobile(t *testing.T) {
 	m.showDetails = false
 	m.list.Select(0)
 
+	// Mobile (no border): lines above first row are header + filter bar
+	// (listChromeLines()), so the first row is at y == listChromeLines().
+	chrome := m.listChromeLines()
 	clickedRow := 2
-	updated := m.handleLeftClick(3, 1+clickedRow) // y == 1 + row
+	updated := m.handleLeftClick(3, chrome+clickedRow)
 
 	if updated.focused != focusList {
 		t.Errorf("after mobile list click, focused = %v, want focusList", updated.focused)
@@ -123,7 +128,8 @@ func TestLeftClickHeaderRowIsNoop(t *testing.T) {
 	m.list.Select(7)
 	m.focused = focusList
 
-	// y==1 is the header row -> rowOffset 1-2 = -1 -> ignored.
+	// y==1 falls within the chrome (border/header/filter bar) above the first
+	// row -> rowOffset 1-listChromeLines() < 0 -> ignored.
 	updated := m.handleLeftClick(5, 1)
 	if got := updated.list.Index(); got != 7 {
 		t.Errorf("click on header row changed selection: index = %d, want 7", got)
@@ -141,8 +147,8 @@ func TestLeftClickOutOfRangeRowIgnored(t *testing.T) {
 	m.list.Select(1)
 	m.focused = focusList
 
-	// Click far down where no item exists.
-	updated := m.handleLeftClick(5, 2+20)
+	// Click far down where no item exists (well past the 3 real rows).
+	updated := m.handleLeftClick(5, m.listChromeLines()+20)
 	if got := updated.list.Index(); got != 1 {
 		t.Errorf("out-of-range click changed selection: index = %d, want 1", got)
 	}
@@ -180,8 +186,9 @@ func TestMouseLeftClickThroughUpdate(t *testing.T) {
 		t.Errorf("motion event changed selection to %d, want 0", m.list.Index())
 	}
 
-	// A genuine press selects the row.
-	updated, _ = m.Update(leftClick(5, 2+5))
+	// A genuine press selects the row under the cursor. The first row sits at
+	// y == listChromeLines(); row 5 is that plus 5.
+	updated, _ = m.Update(leftClick(5, m.listChromeLines()+5))
 	m = updated.(Model)
 	if m.list.Index() != 5 {
 		t.Errorf("press event: index = %d, want 5", m.list.Index())

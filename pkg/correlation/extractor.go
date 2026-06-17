@@ -4,6 +4,7 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,11 @@ type ExtractOptions struct {
 type Extractor struct {
 	repoPath   string
 	beadsFiles []string // Files to track (e.g., .beads/beads.jsonl, .beads/issues.jsonl)
+
+	// ctx, when set (via Correlator.WithContext or directly), bounds the git
+	// subprocesses spawned during extraction (issue #166). nil means
+	// context.Background().
+	ctx context.Context
 }
 
 // NewExtractor creates a new extractor for the given repository.
@@ -142,7 +148,7 @@ func (e *Extractor) Extract(opts ExtractOptions) ([]BeadEvent, error) {
 // edge case, never falling back to a slower-or-equal native diff in that case.
 func (e *Extractor) preferSnapshotPath() bool {
 	primary := e.primaryBeadsFile()
-	cmd := exec.Command("git", "cat-file", "-s", "HEAD:"+primary)
+	cmd := gitCommand(e.ctx, "cat-file", "-s", "HEAD:"+primary)
 	cmd.Dir = e.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -162,7 +168,7 @@ func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, err
 	logArgs := e.buildGitLogArgs(opts)
 
 	// Disable colors so patch lines still start with raw '+' and '-'.
-	cmd := exec.Command("git", withNoColorGit(logArgs)...)
+	cmd := gitCommand(e.ctx, withNoColorGit(logArgs)...)
 	cmd.Dir = e.repoPath
 
 	stdout, err := cmd.StdoutPipe()

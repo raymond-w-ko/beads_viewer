@@ -277,7 +277,7 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 		return c.GenerateReport(beads, opts)
 	}
 
-	headSHA, err := getGitHead(c.repoPath)
+	headSHA, err := getGitHeadContext(c.ctx, c.repoPath)
 	if err != nil {
 		// Can't key the cache without a stable HEAD; compute uncached.
 		return c.GenerateReport(beads, opts)

@@ -73,6 +73,90 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 	}
 }
 
+// TestComputeTriage_CountSemantics pins the strict count semantics from
+// issue #165 on a mixed-status fixture: open_count/blocked_count must equal
+// the canonical by_status counts, the legacy aggregates live on
+// not_closed/not_actionable, and the partition invariant
+// not_closed == actionable + not_actionable holds.
+func TestComputeTriage_CountSemantics(t *testing.T) {
+	now := time.Now()
+	issues := []model.Issue{
+		// 2 strictly open: one actionable, one dependency-blocked.
+		{ID: "open-1", Title: "Open actionable", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "open-2", Title: "Open but dep-blocked", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "open-1", Type: model.DepBlocks}}},
+		// 1 in_progress.
+		{ID: "wip-1", Title: "In progress", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeBug, UpdatedAt: now},
+		// 1 status-blocked (also dependency-blocked).
+		{ID: "blk-1", Title: "Status blocked", Status: model.StatusBlocked, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "open-1", Type: model.DepBlocks}}},
+		// 1 deferred.
+		{ID: "def-1", Title: "Deferred", Status: model.StatusDeferred, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		// 1 closed + 1 tombstone (both closed-like).
+		{ID: "done-1", Title: "Closed", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "ghost-1", Title: "Tombstone", Status: model.StatusTombstone, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+
+	triage := ComputeTriage(issues)
+	counts := triage.ProjectHealth.Counts
+	qr := triage.QuickRef
+
+	// Strict status counts must mirror by_status exactly.
+	if counts.Open != counts.ByStatus["open"] {
+		t.Errorf("counts.open=%d must equal by_status.open=%d", counts.Open, counts.ByStatus["open"])
+	}
+	if counts.Blocked != counts.ByStatus["blocked"] {
+		t.Errorf("counts.blocked=%d must equal by_status.blocked=%d", counts.Blocked, counts.ByStatus["blocked"])
+	}
+	if qr.OpenCount != counts.ByStatus["open"] {
+		t.Errorf("quick_ref.open_count=%d must equal by_status.open=%d", qr.OpenCount, counts.ByStatus["open"])
+	}
+	if qr.BlockedCount != counts.ByStatus["blocked"] {
+		t.Errorf("quick_ref.blocked_count=%d must equal by_status.blocked=%d", qr.BlockedCount, counts.ByStatus["blocked"])
+	}
+
+	// Absolute expectations for this fixture.
+	if counts.Open != 2 {
+		t.Errorf("expected 2 strictly open, got %d", counts.Open)
+	}
+	if counts.Blocked != 1 {
+		t.Errorf("expected 1 status-blocked, got %d", counts.Blocked)
+	}
+	if counts.Closed != 2 {
+		t.Errorf("expected 2 closed-like (closed+tombstone), got %d", counts.Closed)
+	}
+	if counts.NotClosed != 5 {
+		t.Errorf("expected 5 not closed, got %d", counts.NotClosed)
+	}
+	// Legacy aggregates survive under the new names: not_closed is the old
+	// "open" (open+in_progress+blocked+deferred) and dependency_blocked is
+	// the old "blocked" (non-closed && !actionable).
+	if counts.NotClosed != counts.Total-counts.Closed {
+		t.Errorf("not_closed=%d must equal total-closed=%d", counts.NotClosed, counts.Total-counts.Closed)
+	}
+
+	// Partition invariant: not_closed == actionable + not_actionable.
+	if counts.NotClosed != counts.Actionable+counts.DependencyBlocked {
+		t.Errorf("partition invariant violated: not_closed=%d, actionable=%d, dependency_blocked=%d",
+			counts.NotClosed, counts.Actionable, counts.DependencyBlocked)
+	}
+	if qr.NotClosedCount != qr.ActionableCount+qr.NotActionableCount {
+		t.Errorf("quick_ref partition invariant violated: not_closed_count=%d, actionable_count=%d, not_actionable_count=%d",
+			qr.NotClosedCount, qr.ActionableCount, qr.NotActionableCount)
+	}
+
+	// QuickRef mirrors HealthCounts.
+	if qr.NotClosedCount != counts.NotClosed {
+		t.Errorf("quick_ref.not_closed_count=%d must equal counts.not_closed=%d", qr.NotClosedCount, counts.NotClosed)
+	}
+	if qr.NotActionableCount != counts.DependencyBlocked {
+		t.Errorf("quick_ref.not_actionable_count=%d must equal counts.dependency_blocked=%d", qr.NotActionableCount, counts.DependencyBlocked)
+	}
+	if qr.InProgressCount != counts.ByStatus["in_progress"] {
+		t.Errorf("quick_ref.in_progress_count=%d must equal by_status.in_progress=%d", qr.InProgressCount, counts.ByStatus["in_progress"])
+	}
+}
+
 func TestComputeTriage_IgnoresTombstoneIssues(t *testing.T) {
 	issues := []model.Issue{
 		{
@@ -105,6 +189,9 @@ func TestComputeTriage_IgnoresTombstoneIssues(t *testing.T) {
 	}
 	if triage.QuickRef.BlockedCount != 0 {
 		t.Errorf("expected 0 blocked (tombstone blockers ignored), got %d", triage.QuickRef.BlockedCount)
+	}
+	if triage.QuickRef.NotActionableCount != 0 {
+		t.Errorf("expected 0 not actionable (tombstone blockers ignored), got %d", triage.QuickRef.NotActionableCount)
 	}
 
 	for _, rec := range triage.Recommendations {
@@ -149,9 +236,13 @@ func TestComputeTriage_WithDependencies(t *testing.T) {
 
 	triage := ComputeTriage(issues)
 
-	// One should be blocked
-	if triage.QuickRef.BlockedCount != 1 {
-		t.Errorf("expected 1 blocked, got %d", triage.QuickRef.BlockedCount)
+	// One should be dependency-blocked (not actionable). Both issues have
+	// status "open", so the strict blocked_count stays 0 (#165).
+	if triage.QuickRef.NotActionableCount != 1 {
+		t.Errorf("expected 1 not actionable, got %d", triage.QuickRef.NotActionableCount)
+	}
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Errorf("expected 0 status-blocked, got %d", triage.QuickRef.BlockedCount)
 	}
 	if triage.QuickRef.ActionableCount != 1 {
 		t.Errorf("expected 1 actionable, got %d", triage.QuickRef.ActionableCount)
@@ -413,8 +504,14 @@ func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
 	if triage.QuickRef.ActionableCount != 1 {
 		t.Fatalf("expected only the root blocker to be actionable, got %d", triage.QuickRef.ActionableCount)
 	}
-	if triage.QuickRef.BlockedCount != 2 {
-		t.Fatalf("expected parent and child blocked, got %d", triage.QuickRef.BlockedCount)
+	// Parent and child are dependency-blocked but their status is "open",
+	// so they count under not_actionable_count, not the strict
+	// blocked_count (#165).
+	if triage.QuickRef.NotActionableCount != 2 {
+		t.Fatalf("expected parent and child not actionable, got %d", triage.QuickRef.NotActionableCount)
+	}
+	if triage.QuickRef.BlockedCount != 0 {
+		t.Fatalf("expected 0 status-blocked, got %d", triage.QuickRef.BlockedCount)
 	}
 
 	for _, pick := range triage.QuickRef.TopPicks {
@@ -509,6 +606,9 @@ func TestComputeTriage_ParentChildOpenParentDoesNotBlockChild(t *testing.T) {
 	}
 	if triage.QuickRef.BlockedCount != 0 {
 		t.Fatalf("expected zero blocked issues, got %d", triage.QuickRef.BlockedCount)
+	}
+	if triage.QuickRef.NotActionableCount != 0 {
+		t.Fatalf("expected zero not-actionable issues, got %d", triage.QuickRef.NotActionableCount)
 	}
 
 	var childRec *Recommendation
