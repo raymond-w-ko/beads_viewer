@@ -187,8 +187,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -212,6 +212,9 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			issue.ID,
 			issue.Title,
 			issue.Description,
+			issue.Design,
+			issue.AcceptanceCriteria,
+			issue.Notes,
 			string(issue.Status),
 			issue.Priority,
 			string(issue.IssueType),
@@ -679,17 +682,20 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	result := make([]ExportIssue, len(e.Issues))
 	for i, issue := range e.Issues {
 		exp := ExportIssue{
-			ID:          issue.ID,
-			Title:       issue.Title,
-			Description: issue.Description,
-			Status:      issue.Status,
-			Priority:    issue.Priority,
-			IssueType:   issue.IssueType,
-			Assignee:    issue.Assignee,
-			Labels:      issue.Labels,
-			CreatedAt:   issue.CreatedAt,
-			UpdatedAt:   issue.UpdatedAt,
-			ClosedAt:    issue.ClosedAt,
+			ID:                 issue.ID,
+			Title:              issue.Title,
+			Description:        issue.Description,
+			Design:             issue.Design,
+			AcceptanceCriteria: issue.AcceptanceCriteria,
+			Notes:              issue.Notes,
+			Status:             issue.Status,
+			Priority:           issue.Priority,
+			IssueType:          issue.IssueType,
+			Assignee:           issue.Assignee,
+			Labels:             issue.Labels,
+			CreatedAt:          issue.CreatedAt,
+			UpdatedAt:          issue.UpdatedAt,
+			ClosedAt:           issue.ClosedAt,
 		}
 
 		if m := e.Metrics; m != nil {
