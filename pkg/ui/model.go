@@ -343,6 +343,18 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 			}
 		}
 
+		// History correlations are derived from the git history of the *JSONL*
+		// export, never the SQLite DB: the correlator runs `git log -p --follow`
+		// over the followed file, and a binary (and usually gitignored) beads.db
+		// yields zero lifecycle events. The smart data-source selector, however,
+		// hands us whatever source has the freshest mtime — and after a normal
+		// `br sync` the DB is routinely a few milliseconds newer than the JSONL,
+		// so beadsPath arrives pointing at beads.db and every correlation is lost
+		// (bv #171). The watch/load paths legitimately prefer the DB, so we scope
+		// the JSONL preference to *this* (correlation) path only and resolve the
+		// git-tracked JSONL ourselves whenever beadsPath is not already one.
+		correlationPath := resolveHistoryCorrelationPath(beadsPath, repoPath)
+
 		// Convert model.Issue to correlation.BeadInfo
 		beads := make([]correlation.BeadInfo, len(issues))
 		for i, issue := range issues {
@@ -353,7 +365,7 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 			}
 		}
 
-		correlator := correlation.NewCorrelator(repoPath, beadsPath)
+		correlator := correlation.NewCorrelator(repoPath, correlationPath)
 		opts := correlation.CorrelatorOptions{
 			Limit: 500, // Reasonable limit for TUI performance
 		}
@@ -361,6 +373,42 @@ func LoadHistoryCmd(issues []model.Issue, beadsPath string) tea.Cmd {
 		report, err := correlator.GenerateReport(beads, opts)
 		return HistoryLoadedMsg{Report: report, Error: err}
 	}
+}
+
+// resolveHistoryCorrelationPath returns the path the History correlator should
+// follow through git history. Correlations come from the git history of the
+// JSONL export, so if the selected source is already a .jsonl we keep it; if it
+// is anything else (most importantly .beads/beads.db, which the freshest-mtime
+// selector picks after sync bookkeeping makes the DB a few ms newer — bv #171),
+// we locate the git-tracked JSONL in the same .beads/ directory instead. When no
+// JSONL can be found we fall back to the original path so the correlator's own
+// default-file logic still runs (it degrades gracefully to "no commits").
+func resolveHistoryCorrelationPath(beadsPath, repoPath string) string {
+	if beadsPath == "" {
+		// Empty path: let the correlator discover the standard beads files.
+		return beadsPath
+	}
+	if strings.EqualFold(filepath.Ext(beadsPath), ".jsonl") {
+		// Already a JSONL export — the correct correlation source.
+		return beadsPath
+	}
+
+	// The selected source is not a JSONL (e.g. beads.db). Find the JSONL that
+	// lives alongside it so History follows git history rather than the binary DB.
+	beadsDir := filepath.Dir(beadsPath)
+	if jsonlPath, err := loader.FindJSONLPath(beadsDir); err == nil && jsonlPath != "" {
+		return jsonlPath
+	}
+	// As a secondary attempt, try the repo's standard .beads/ directory in case
+	// beadsPath used a non-standard layout.
+	if repoPath != "" {
+		if jsonlPath, err := loader.FindJSONLPath(filepath.Join(repoPath, ".beads")); err == nil && jsonlPath != "" {
+			return jsonlPath
+		}
+	}
+	// No JSONL found: preserve original behavior (correlator falls back to its
+	// own default beads-file resolution).
+	return beadsPath
 }
 
 func cloneIssuesForAsync(issues []model.Issue) []model.Issue {
@@ -7710,8 +7758,13 @@ func (m *Model) enterHistoryView() {
 		}
 	}
 
-	// Load correlation data
-	correlator := correlation.NewCorrelator(cwd, m.beadsPath)
+	// Load correlation data. History correlations come from the git history of
+	// the JSONL export, so redirect a DB (or other non-JSONL) selection to the
+	// git-tracked JSONL — see resolveHistoryCorrelationPath and bv #171. Without
+	// this, a beads.db that is a few ms newer than issues.jsonl (the normal state
+	// after `br sync`) silently yields a correlation-free history view.
+	correlationPath := resolveHistoryCorrelationPath(m.beadsPath, cwd)
+	correlator := correlation.NewCorrelator(cwd, correlationPath)
 	opts := correlation.CorrelatorOptions{
 		Limit: 500, // Reasonable limit for TUI performance
 	}
