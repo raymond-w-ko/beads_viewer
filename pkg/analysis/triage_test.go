@@ -1396,7 +1396,7 @@ func TestTriageGroupByTrack_SingleTrack(t *testing.T) {
 		totalRecs += len(g.Recommendations)
 		hasClaimableRec := false
 		for _, rec := range g.Recommendations {
-			if isClaimableRecommendation(rec) {
+			if isClaimableRecommendation(rec, nil, nil) {
 				hasClaimableRec = true
 				break
 			}
@@ -1563,7 +1563,7 @@ func TestTriageGroupByTrack_TopPickHasHighestScore(t *testing.T) {
 		}
 		// Top pick should have the highest score in the group
 		for _, rec := range g.Recommendations {
-			if !isClaimableRecommendation(rec) {
+			if !isClaimableRecommendation(rec, nil, nil) {
 				continue
 			}
 			if rec.Score > g.TopPick.Score {
@@ -1724,7 +1724,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 
 	// Test with limit of 3
-	picks := buildTopPicks(recommendations, 3)
+	picks := buildTopPicks(recommendations, 3, nil, nil)
 
 	// Should have exactly 3 picks (all actionable items)
 	if len(picks) != 3 {
@@ -1885,7 +1885,7 @@ func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	}
 
 	// Limit of 2
-	picks := buildTopPicks(recommendations, 2)
+	picks := buildTopPicks(recommendations, 2, nil, nil)
 	if len(picks) != 2 {
 		t.Errorf("expected 2 picks with limit=2, got %d", len(picks))
 	}
@@ -1903,7 +1903,7 @@ func TestBuildTopPicks_AllBlocked(t *testing.T) {
 		{ID: "b2", Title: "Blocked 2", Status: string(model.StatusOpen), Score: 90.0, BlockedBy: []string{"y"}},
 	}
 
-	picks := buildTopPicks(recommendations, 10)
+	picks := buildTopPicks(recommendations, 10, nil, nil)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
 	}
@@ -1941,12 +1941,111 @@ func TestBuildTopPicks_SkipsBlockedStatusAndAssigned(t *testing.T) {
 		},
 	}
 
-	picks := buildTopPicks(recommendations, 3)
+	picks := buildTopPicks(recommendations, 3, nil, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected only the claimable open issue, got %d picks: %#v", len(picks), picks)
 	}
 	if picks[0].ID != "ready-open" {
 		t.Fatalf("expected ready-open top pick, got %q", picks[0].ID)
+	}
+}
+
+// TestComputeTriage_NotReadyLabelExcludedFromTopPicks covers issue #173: an
+// open, unblocked, non-epic leaf carrying a configured not-ready label must not
+// be the claimable top pick, while behavior is unchanged when no labels are
+// configured.
+func TestComputeTriage_NotReadyLabelExcludedFromTopPicks(t *testing.T) {
+	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "RAW-1",
+			Title:     "Raw reopened leaf (not ready)",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"needs-polish"},
+			UpdatedAt: now,
+		},
+		{
+			ID:        "READY-1",
+			Title:     "Ready leaf",
+			Status:    model.StatusOpen,
+			Priority:  4,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+	}
+
+	// Default (no not-ready labels): RAW-1 is the higher-priority top pick.
+	base := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+	if len(base.QuickRef.TopPicks) == 0 || base.QuickRef.TopPicks[0].ID != "RAW-1" {
+		t.Fatalf("default: expected RAW-1 as top pick, got %#v", base.QuickRef.TopPicks)
+	}
+
+	// With needs-polish configured (case-insensitive): RAW-1 is excluded.
+	got := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		NotReadyLabels: []string{"NEEDS-POLISH"},
+	}, now)
+	if len(got.QuickRef.TopPicks) == 0 {
+		t.Fatalf("expected READY-1 top pick, got none")
+	}
+	if got.QuickRef.TopPicks[0].ID != "READY-1" {
+		t.Fatalf("expected READY-1 top pick after excluding needs-polish, got %q", got.QuickRef.TopPicks[0].ID)
+	}
+	for _, pick := range got.QuickRef.TopPicks {
+		if pick.ID == "RAW-1" {
+			t.Fatalf("RAW-1 (needs-polish) must not appear in claimable top picks")
+		}
+	}
+}
+
+// TestComputeTriage_ParentWithOpenChildrenNotTopPick covers issue #17 parity:
+// a non-epic parent with an OPEN child must not be the claimable top pick (the
+// epic-type gate alone misses non-epic parents). It remains actionable in the
+// count (beads_viewer#158 contract) and re-becomes claimable once its child
+// closes.
+func TestComputeTriage_ParentWithOpenChildrenNotTopPick(t *testing.T) {
+	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
+	parent := model.Issue{
+		ID:        "PARENT-1",
+		Title:     "Non-epic parent",
+		Status:    model.StatusOpen,
+		Priority:  1,
+		IssueType: model.TypeTask,
+		UpdatedAt: now,
+	}
+	child := model.Issue{
+		ID:        "PARENT-1.1",
+		Title:     "Open child",
+		Status:    model.StatusOpen,
+		Priority:  2,
+		IssueType: model.TypeTask,
+		UpdatedAt: now,
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT-1", Type: model.DepParentChild},
+		},
+	}
+
+	openChild := ComputeTriageWithOptionsAndTime([]model.Issue{parent, child}, TriageOptions{WaitForPhase2: true}, now)
+	// Both remain in the actionable count (rollup edge doesn't gate readiness).
+	if openChild.QuickRef.ActionableCount != 2 {
+		t.Fatalf("expected both parent and child actionable, got %d", openChild.QuickRef.ActionableCount)
+	}
+	if len(openChild.QuickRef.TopPicks) == 0 || openChild.QuickRef.TopPicks[0].ID != "PARENT-1.1" {
+		t.Fatalf("expected child PARENT-1.1 as claimable top pick, got %#v", openChild.QuickRef.TopPicks)
+	}
+	for _, pick := range openChild.QuickRef.TopPicks {
+		if pick.ID == "PARENT-1" {
+			t.Fatalf("parent with open children must not be a claimable top pick")
+		}
+	}
+
+	// Close the child: the parent becomes claimable again.
+	child.Status = model.StatusClosed
+	closedChild := ComputeTriageWithOptionsAndTime([]model.Issue{parent, child}, TriageOptions{WaitForPhase2: true}, now)
+	if len(closedChild.QuickRef.TopPicks) == 0 || closedChild.QuickRef.TopPicks[0].ID != "PARENT-1" {
+		t.Fatalf("expected PARENT-1 claimable after child closed, got %#v", closedChild.QuickRef.TopPicks)
 	}
 }
 

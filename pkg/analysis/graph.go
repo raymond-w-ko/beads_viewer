@@ -2470,6 +2470,14 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 	}
 
 	// Phase 4: Collect actionable issues (not closed, not blocked).
+	//
+	// NOTE: a standalone open parent with open children remains actionable here
+	// (parent-child is a rollup edge that never gates the parent's own
+	// readiness; see beads_viewer#158 and the ParentChildDoesntBlock tests).
+	// ActionableCount is a health metric and keeps that contract. The separate
+	// "don't surface a parent-with-open-children as a *claimable top pick*"
+	// rule (issue #17 parity) is enforced at the recommendation chokepoint via
+	// ParentsWithOpenChildren + isClaimableRecommendation, not here.
 	var ids []string
 	for id := range a.issueMap {
 		ids = append(ids, id)
@@ -2489,6 +2497,35 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 	}
 
 	return actionable
+}
+
+// ParentsWithOpenChildren returns the set of issue IDs that are a parent (via a
+// "parent-child" dependency) of at least one open-like (not closed/tombstone)
+// child. Such a parent is a planning container, not directly claimable work
+// while its children are open — it must not be surfaced as a robot claimable
+// top pick (issue #17 parity with the Rust viewer). This is type-agnostic: it
+// catches any parent with open children, not only issue_type=="epic", so it
+// also covers non-epic parents the epic-type claimability gate alone misses,
+// while never withholding a genuinely-leaf epic.
+func (a *Analyzer) ParentsWithOpenChildren() map[string]bool {
+	result := make(map[string]bool)
+	for _, issue := range a.issueMap {
+		for _, dep := range issue.Dependencies {
+			if dep == nil || dep.Type != model.DepParentChild {
+				continue
+			}
+			parentID := dep.DependsOnID
+			if _, exists := a.issueMap[parentID]; !exists {
+				continue
+			}
+			// issue is a child of parentID; if this child is open-like, the
+			// parent has open child work.
+			if !isClosedLikeStatus(issue.Status) {
+				result[parentID] = true
+			}
+		}
+	}
+	return result
 }
 
 // GetIssue returns a single issue by ID, or nil if not found

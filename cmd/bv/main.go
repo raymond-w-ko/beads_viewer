@@ -1372,6 +1372,7 @@ func main() {
 	robotTriageByTrack := flag.Bool("robot-triage-by-track", false, "Group triage recommendations by execution track (bv-87)")
 	robotTriageByLabel := flag.Bool("robot-triage-by-label", false, "Group triage recommendations by label (bv-87)")
 	robotNext := flag.Bool("robot-next", false, "Output only the top pick recommendation as JSON (minimal triage)")
+	robotNotReadyLabels := flag.String("robot-not-ready-labels", "", "Comma-separated labels marking a bead not-ready: excluded from claimable --robot-next/--robot-triage top picks (env: BV_ROBOT_NOT_READY_LABELS; #173)")
 	robotDiff := flag.Bool("robot-diff", false, "Output diff as JSON (use with --diff-since)")
 	robotRecipes := flag.Bool("robot-recipes", false, "Output available recipes as JSON for AI agents")
 	robotLabelHealth := flag.Bool("robot-label-health", false, "Output label health metrics as JSON for AI agents")
@@ -1617,6 +1618,7 @@ func main() {
 		NetworkDepth:            networkDepth,
 		CapacityAgents:          capacityAgents,
 		CapacityLabel:           capacityLabel,
+		NotReadyLabels:          robotNotReadyLabels,
 	})
 	rootCmd := newRootCommand(func() error {
 		modifierRules := []modifierFlagRule{
@@ -1644,6 +1646,7 @@ func main() {
 			{modifier: "history-since", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "history-limit", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
+			{modifier: "robot-not-ready-labels", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
 			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
@@ -3659,8 +3662,9 @@ func main() {
 
 			if *robotNext {
 				if err := handleRobotNext(robotDispatchContext, phaseThreeRobotHandlerConfig{
-					RobotNextFlag: robotNext,
-					GraphRoot:     graphRoot,
+					RobotNextFlag:  robotNext,
+					GraphRoot:      graphRoot,
+					NotReadyLabels: robotNotReadyLabels,
 				}); err != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding robot-next: %v\n", err)
 					os.Exit(1)

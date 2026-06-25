@@ -187,6 +187,10 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotCapacityFlag       *bool
 	CapacityAgents          *int
 	CapacityLabel           *string
+	// NotReadyLabels (issue #173): opt-in label-class excluded from claimable
+	// top picks. Resolved from --robot-not-ready-labels (comma-separated) with a
+	// BV_ROBOT_NOT_READY_LABELS env fallback; nil/empty disables the gate.
+	NotReadyLabels *string
 }
 
 func newRobotRegistry() RobotRegistry {
@@ -1724,6 +1728,32 @@ func resolveRobotHistoryTimeout(cfg phaseThreeRobotHandlerConfig) time.Duration 
 	return defaultRobotHistoryTimeout
 }
 
+// resolveNotReadyLabels returns the opt-in not-ready label-class (issue #173)
+// used to exclude graph-ready-but-not-work-ready beads from claimable robot top
+// picks. Precedence: the --robot-not-ready-labels flag (comma-separated) when
+// set, else the BV_ROBOT_NOT_READY_LABELS environment variable. Returns nil
+// (gate disabled, zero behavior change) when neither is configured. Labels are
+// trimmed; empty entries are dropped. Matching is case-insensitive (handled in
+// the analysis layer), so labels are returned as written.
+func resolveNotReadyLabels(cfg phaseThreeRobotHandlerConfig) []string {
+	raw := ""
+	if cfg.NotReadyLabels != nil && strings.TrimSpace(*cfg.NotReadyLabels) != "" {
+		raw = *cfg.NotReadyLabels
+	} else if env := strings.TrimSpace(os.Getenv("BV_ROBOT_NOT_READY_LABELS")); env != "" {
+		raw = env
+	}
+	if raw == "" {
+		return nil
+	}
+	var labels []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			labels = append(labels, trimmed)
+		}
+	}
+	return labels
+}
+
 // generateTriageHistoryBounded runs the expensive git-history correlation
 // prologue of --robot-triage under a hard time budget (issue #166).
 //
@@ -1824,13 +1854,14 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		seedHash = ctx.DataHash
 	}
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
-		GroupByTrack:  cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
-		GroupByLabel:  cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
-		WaitForPhase2: true,
-		UseFastConfig: true,
-		History:       historyReport,
-		RootIssueID:   rootIssueID,
-		SeedDataHash:  seedHash,
+		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
+		GroupByLabel:   cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
+		WaitForPhase2:  true,
+		UseFastConfig:  true,
+		History:        historyReport,
+		RootIssueID:    rootIssueID,
+		SeedDataHash:   seedHash,
+		NotReadyLabels: resolveNotReadyLabels(cfg),
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 	triage.Meta.HistoryStatus = historyStatus
@@ -2006,9 +2037,10 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 
 	now := robotNow()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
-		WaitForPhase2: true,
-		UseFastConfig: true,
-		RootIssueID:   rootIssueID,
+		WaitForPhase2:  true,
+		UseFastConfig:  true,
+		RootIssueID:    rootIssueID,
+		NotReadyLabels: resolveNotReadyLabels(cfg),
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 
