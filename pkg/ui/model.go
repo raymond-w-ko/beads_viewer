@@ -3016,6 +3016,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.handleHistoryKeys(msg)
 			return m, nil
 		}
+		// The label picker overlay has an always-focused text input. Like the
+		// search submodes above, it must consume keys BEFORE the global key
+		// block; otherwise printable input — most notably a lowercase q — leaks
+		// into the global q/esc view-toggle handlers and closes the picker
+		// instead of being typed into the filter (issue #176). Esc still cancels
+		// and enter still applies via handleLabelPickerKeys.
+		if m.focused == focusLabelPicker && m.showLabelPicker {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			m = m.handleLabelPickerKeys(msg)
+			return m, nil
+		}
 
 		// Handle keys when not filtering
 		if m.list.FilterState() != list.Filtering {
