@@ -29,13 +29,13 @@ const BeadsDirEnvVar = "BEADS_DIR"
 
 // BeadsDBEnvVar is the name of the environment variable for a specific database file
 // or .beads directory path. Takes priority over BEADS_DIR.
-// Can point to a specific file (e.g., /path/to/.beads/beads.jsonl) or a .beads directory.
+// Can point to a specific file (e.g., /path/to/.beads/issues.jsonl) or a .beads directory.
 const BeadsDBEnvVar = "BEADS_DB"
 
 // PreferredJSONLNames defines the priority order for looking up beads data files.
-// Priority order matches bd's canonical naming (beads.jsonl) to ensure bv watches
-// the same file that bd writes to in stealth/direct mode. Fixes bv-96.
-var PreferredJSONLNames = []string{"beads.jsonl", "issues.jsonl", "beads.base.jsonl"}
+// Priority order matches current br's canonical JSONL export first, with
+// legacy bd/beads.jsonl workspaces still supported as a fallback.
+var PreferredJSONLNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
 
 // GetBeadsDir returns the beads directory path, with the following priority:
 //  1. BEADS_DB env var (can point to a file or directory; if file, returns parent dir)
@@ -347,8 +347,8 @@ func getMainRepoRoot(repoPath string) (string, error) {
 }
 
 // FindJSONLPath locates the beads JSONL file in the given directory.
-// Prefers beads.jsonl (canonical per bd) over issues.jsonl (legacy) to match
-// the file that bd writes to in stealth/direct mode. Fixes bv-96.
+// Prefers issues.jsonl (current br) over beads.jsonl (legacy bd) and
+// beads.base.jsonl (daemon/base export). Skips backup files and merge artifacts.
 // Skips backup files and merge artifacts.
 func FindJSONLPath(beadsDir string) (string, error) {
 	return FindJSONLPathWithWarnings(beadsDir, nil)
@@ -404,8 +404,8 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 	}
 
 	// Priority order for beads files:
-	// Default (br stack): beads.jsonl -> issues.jsonl -> beads.base.jsonl
-	// In bd workspaces: issues.jsonl is the canonical compatibility export
+	// Current br stack: issues.jsonl -> beads.jsonl -> beads.base.jsonl
+	// Legacy bd workspaces remain readable through the beads.jsonl fallback.
 	preferredNames := PreferredJSONLNames
 	if IsBDWorkspace(beadsDir) {
 		preferredNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}

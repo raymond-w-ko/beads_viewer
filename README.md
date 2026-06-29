@@ -80,9 +80,9 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/insta
 
 ## Generating the JSONL File (`br` and `bd`)
 
-`bv` reads from `.beads/beads.jsonl`. Both the Rust-based `br` and the original Go-based `bd` can generate this file.
+`bv` reads Beads JSONL exports from `.beads/`. Current Rust-based `br` workspaces normally use `.beads/issues.jsonl`; older `bd` and legacy workspaces may use `.beads/beads.jsonl`. `bv` auto-discovers the supported file names.
 
-**Rust (`br`) users** — `br` writes `.beads/beads.jsonl` by default; no extra steps needed.
+**Rust (`br`) users** — run `br sync --flush-only` after Beads mutations so `.beads/issues.jsonl` is current.
 
 **Go (`bd`) users** — run:
 
@@ -139,7 +139,7 @@ No web page loads, no heavy clients. `bv` starts instantly and lets you fly thro
 *   **Split-View Dashboard:** On wider screens, see your list on the left and full details on the right.
 *   **Markdown Rendering:** Issue descriptions, comments, and notes are beautifully rendered with syntax highlighting, headers, and lists.
 *   **Instant Filtering:** Zero-latency filtering. Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
-*   **Live Reload:** Watches `.beads/beads.jsonl` and refreshes lists, details, and insights automatically when the file changes—no restart needed.
+*   **Live Reload:** Watches the active Beads JSONL file and refreshes lists, details, and insights automatically when the file changes—no restart needed.
 
 ### 🔎 Rich Context
 Don't just read the title. `bv` gives you the full picture:
@@ -158,7 +158,7 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Export:** Press `E` to export all issues to a timestamped Markdown file with Mermaid diagrams.
 *   **Graph Export (CLI):** `bv --robot-graph` outputs the dependency graph as JSON, DOT (Graphviz), or Mermaid format. Use `--graph-format=dot` for rendering with Graphviz, or `--graph-root=ID --graph-depth=3` to extract focused subgraphs.
 *   **Copy:** Press `C` to copy the selected issue as formatted Markdown to your clipboard.
-*   **Edit:** Press `O` to open the `.beads/beads.jsonl` file in your preferred GUI editor.
+*   **Edit:** Press `O` to open the active Beads JSONL file in your preferred GUI editor.
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison. Combined with History view (`h`), you can navigate to any commit and see exactly what changed.
 
 ### 🔌 Automation Hooks
@@ -171,7 +171,7 @@ Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, not
 ```
 ### Using bv as an AI sidecar
 
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
+bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` workspaces, with `.beads/beads.jsonl` supported for legacy/`bd` workspaces). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail).
 
@@ -256,7 +256,7 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 #### Understanding Robot Output
 
 **All robot JSON includes:**
-- `data_hash` — Fingerprint of source beads.jsonl (verify consistency across calls)
+- `data_hash` — Fingerprint of the source JSONL issue file (verify consistency across calls)
 - `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
 - `as_of` / `as_of_commit` — Present when using `--as-of`; contains ref and resolved SHA
 
@@ -277,7 +277,7 @@ bv --robot-label-health | jq '.results.labels[] | select(.health_level == "criti
 
 **Performance:** Phase 1 instant, Phase 2 async (500ms timeout). Prefer `--robot-plan` over `--robot-insights` when speed matters. Results cached by data hash.
 
-Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cycles, and parallel tracks deterministically.
+Use bv instead of parsing Beads JSONL directly—it computes PageRank, critical paths, cycles, and parallel tracks deterministically.
 ```
 
 ### Automatic Integration
@@ -308,7 +308,7 @@ bv --agents-dry-run           # Show what would happen without executing
 
 The blurb uses HTML comment markers for version tracking:
 ```
-<!-- bv-agent-instructions-v1 -->
+<!-- bv-agent-instructions-v3 -->
 ... content ...
 <!-- end-bv-agent-instructions -->
 ```
@@ -330,7 +330,7 @@ graph TD
     classDef output fill:#e8f5e9,stroke:#a5d6a7,stroke-width:2px,color:#2e7d32,rx:8
 
     subgraph storage [" 📂 Data Layer "]
-        A[".beads/beads.jsonl<br/>JSONL Issue Store"]:::data
+        A[".beads/issues.jsonl<br/>or legacy beads.jsonl<br/>JSONL Issue Store"]:::data
     end
 
     subgraph engine [" ⚙️ Analysis Engine "]
@@ -487,7 +487,7 @@ sequenceDiagram
     participant User
     participant Agent as 🤖 AI Agent
     participant BV as ⚡ bv
-    participant File as 📄 beads.jsonl
+    participant File as 📄 Beads JSONL
 
     User->>Agent: "Fix the next blocked task"
 
@@ -511,7 +511,7 @@ sequenceDiagram
 The primary design goal of the Robot Protocol is **Cognitive Offloading**.
 Large Language Models (LLMs) are probabilistic engines; they are excellent at semantic reasoning (coding, writing) but notoriously unreliable at algorithmic graph traversal (finding cycles, computing shortest paths). The two-phase analyzer returns degree/topo/density immediately and completes PageRank/Betweenness/HITS/Eigenvector/Critical Path/Cycles asynchronously with size-aware timeouts and hashed caching, so repeat robot calls stay fast when the graph hasn’t changed.
 
-If you feed an Agent raw `beads.jsonl` data, you are forcing the Agent to:
+If you feed an Agent raw Beads JSONL data, you are forcing the Agent to:
 1.  Parse thousands of lines of JSON.
 2.  Reconstruct the dependency graph in its context window.
 3.  "Hallucinate" a path traversal or cycle check.
@@ -3257,7 +3257,7 @@ discovery:
   max_depth: 2
 
 defaults:
-  beads_path: .beads      # Where to find beads.jsonl in each repo
+  beads_path: .beads      # Where to find Beads JSONL in each repo
 ```
 
 ### ID Namespacing
@@ -3433,7 +3433,7 @@ The updater (`pkg/updater/updater.go`) is architected for silence and safety:
 Reliability is key. `bv` doesn't assume a perfect environment; it actively handles common file system inconsistencies.
 
 ### 1. Intelligent Path Discovery
-The loader (`pkg/loader/loader.go`) doesn't just blindly open `.beads/beads.jsonl`. It employs a priority-based discovery algorithm:
+The loader (`pkg/loader/loader.go`) doesn't blindly open one hard-coded JSONL path. It employs a priority-based discovery algorithm:
 1.  **Canonical:** Checks for `issues.jsonl` (preferred by beads upstream).
 2.  **Legacy:** Fallback to `beads.jsonl` for backward compatibility.
 3.  **Base:** Checks `beads.base.jsonl` (used by `br` in daemon mode).
@@ -3455,7 +3455,7 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 `bv` adopts a **Graph-First** philosophy:
 1.  **Structure is Reality:** The dependency graph *is* the project. The list view is just a projection of that graph.
 2.  **Explicit Blocking:** We don't just "relate" tasks; we define strict "blocks". If A blocks B, you literally cannot mark B as "Ready" in `bv` until A is Closed.
-3.  **Local-First, Text-Based:** Your project data lives in your repo (`.beads/beads.jsonl`), not on a remote server. It travels with your code, branches with your git, and merges with your PRs.
+3.  **Local-First, Text-Based:** Your project data lives in your repo (`.beads/issues.jsonl`, or legacy `.beads/beads.jsonl`), not on a remote server. It travels with your code, branches with your git, and merges with your PRs.
 
 ---
 
@@ -3546,7 +3546,7 @@ These indicators mean the background worker hasn’t produced a fresh snapshot r
 A: A cycle (e.g., A → B → A) means your project logic is broken; no task can be finished first. Use the Insights Dashboard (`i`) to find the specific cycle members, then use `br` to remove one of the dependency links (e.g., `br unblock A --from B`).
 
 **Q: Does this work with Jira/GitHub?**
-A: `bv` is data-agnostic. The Beads data schema supports an `external_ref` field. If you populate your `.beads/beads.jsonl` file with issues from external trackers (e.g., using a custom script or sync tool), `bv` will render them alongside your local tasks. Future versions of the `br` CLI may support native syncing, but `bv` is ready for that data today.
+A: `bv` is data-agnostic. The Beads data schema supports an `external_ref` field. If you populate your Beads JSONL export with issues from external trackers (e.g., using a custom script or sync tool), `bv` will render them alongside your local tasks. Future versions of the `br` CLI may support native syncing, but `bv` is ready for that data today.
 
 **Q: What's the difference between "bead" and "issue"?**
 A: They're the same thing! In the Beads ecosystem, the unit of work is called a "bead" (hence the name). However, `bv` uses "issue" in many places since that's the more familiar term for most developers. The CLI flags use both interchangeably: `--robot-file-beads`, `--pages-include-closed` (issues), etc. Think of "bead" as the Beads-specific term and "issue" as the general concept.
@@ -3684,7 +3684,7 @@ bv has a comprehensive built-in help system:
 
 ## 🛠️ Configuration
 
-`bv` automatically detects your terminal capabilities to render the best possible UI. It looks for `.beads/beads.jsonl` in your current directory.
+`bv` automatically detects your terminal capabilities to render the best possible UI. It looks for `.beads/issues.jsonl`, `.beads/beads.jsonl`, or `.beads/beads.base.jsonl` in your current directory.
 
 ### Environment Variables
 
@@ -3792,7 +3792,7 @@ Copyright (c) 2025 Jeffrey Emanuel
 
 ## 🧭 Data Flow at a Glance
 ```
-.beads/beads.jsonl
+.beads/issues.jsonl or .beads/beads.jsonl
    ↓ tolerant loader (BOM strip, 10MB lines, skip malformed)
    ↓ graph builder (blocking deps only)
    ↓ analyzer (Phase 1 fast; Phase 2 centralities with timeouts)
