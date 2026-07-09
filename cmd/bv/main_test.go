@@ -544,6 +544,51 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 			args: []string{"robot-docs", "guide", "--json"},
 			want: []string{"--robot-docs", "guide", "--format", "json"},
 		},
+		{
+			name: "upgrade maps to --update",
+			args: []string{"upgrade"},
+			want: []string{"--update"},
+		},
+		{
+			name: "upgrade --yes skips confirmation",
+			args: []string{"upgrade", "--yes"},
+			want: []string{"--update", "--yes"},
+		},
+		{
+			name: "upgrade -y short flag skips confirmation",
+			args: []string{"upgrade", "-y"},
+			want: []string{"--update", "--yes"},
+		},
+		{
+			name: "upgrade --check maps to --check-update",
+			args: []string{"upgrade", "--check"},
+			want: []string{"--check-update"},
+		},
+		{
+			name: "upgrade check bare word maps to --check-update",
+			args: []string{"upgrade", "check"},
+			want: []string{"--check-update"},
+		},
+		{
+			name: "upgrade --dry-run maps to --update-dry-run",
+			args: []string{"upgrade", "--dry-run"},
+			want: []string{"--update-dry-run"},
+		},
+		{
+			name: "upgrade --rollback maps to --rollback",
+			args: []string{"upgrade", "--rollback"},
+			want: []string{"--rollback"},
+		},
+		{
+			name: "self-update alias maps to --update",
+			args: []string{"self-update"},
+			want: []string{"--update"},
+		},
+		{
+			name: "upgrade passes through unknown flags for cobra to report",
+			args: []string{"upgrade", "--bogus"},
+			want: []string{"--update", "--bogus"},
+		},
 	}
 
 	for _, tt := range tests {
