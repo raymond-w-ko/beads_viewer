@@ -24,6 +24,17 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 ### Added
 
+- **Reliable light/dark theme selection (bv-128, idea from PR #178).** New `--theme` flag
+  (`light` | `dark` | `auto`) plus a top-level `theme:` key in `~/.config/bv/config.yaml`,
+  resolved once at startup with the precedence `--theme` → `BV_THEME` → config → auto-detect.
+  The resolved preference is now applied to the **global** lipgloss renderer
+  (`lipgloss.SetHasDarkBackground`), fixing the pre-existing `BV_THEME` override, which only
+  touched per-model renderers while the bulk of the UI (package-global styles, badges, glamour
+  markdown) kept auto-detecting — and auto-detection falls back to *dark* whenever the terminal
+  doesn't answer the background query (common over SSH and in `tmux`/`screen`), leaving light
+  terminals with near-white, unreadable text and no working escape hatch. Invalid `--theme`
+  values warn on stderr and resolve to auto-detect.
+
 - **Bounded robot liveness for the triage history prologue (#166).** The git-history correlation
   step of `--robot-triage` / `--robot-next` now runs under a hard budget (default 10 s),
   overridable via `--robot-history-timeout-ms` or `BV_ROBOT_HISTORY_TIMEOUT_MS` (`0` =

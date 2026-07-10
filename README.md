@@ -3774,6 +3774,31 @@ The UI uses a visually distinct, high-contrast theme inspired by Dracula Princip
 *   **Status Open:** `#50FA7B` (Green)
 *   **Status Blocked:** `#FF5555` (Red)
 
+#### Light terminals (`--theme`)
+
+Every color ships as an adaptive light/dark pair (WCAG-AA tuned for each
+background), and `bv` normally picks the right variant by auto-detecting the
+terminal background. That detection can fail — over SSH, inside `tmux`/`screen`,
+or in emulators that don't answer the background query — in which case `bv`
+assumes a **dark** background, which makes text nearly unreadable on a light
+terminal. When that happens, pin the theme explicitly:
+
+```bash
+bv --theme light   # force the light palette (dark text)
+bv --theme dark    # force the dark palette (light text)
+bv --theme auto    # auto-detect (the default)
+```
+
+To make the choice persistent, set the `BV_THEME` environment variable
+(`light` | `dark`) in your shell profile, or add a top-level key to
+`~/.config/bv/config.yaml`:
+
+```yaml
+theme: light   # light | dark | auto
+```
+
+**Precedence:** `--theme` → `BV_THEME` → config file → auto-detect.
+
 ---
 
 ## 📄 License

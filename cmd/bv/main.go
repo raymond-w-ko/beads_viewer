@@ -77,6 +77,7 @@ var rootHelpSections = []flagHelpSection{
 				"profile-json",
 				"no-cache",
 				"force-full-analysis",
+				"theme",
 				"background-mode",
 				"no-background-mode",
 			)
@@ -1577,6 +1578,9 @@ func main() {
 	debugRender := flag.String("debug-render", "", "Render a view and output to file (views: insights, board)")
 	debugWidth := flag.Int("debug-width", 180, "Width for debug render")
 	debugHeight := flag.Int("debug-height", 50, "Height for debug render")
+	// Explicit light/dark palette selection for terminals where background
+	// auto-detection fails, e.g. over SSH or inside tmux (bv-128)
+	themeFlag := flag.String("theme", "", "Color theme: light, dark, or auto (default: detect terminal background)")
 	// Experimental background snapshot worker (bv-o11l)
 	backgroundMode := flag.Bool("background-mode", false, "Enable experimental background snapshot loading (TUI only)")
 	noBackgroundMode := flag.Bool("no-background-mode", false, "Disable experimental background snapshot loading (TUI only)")
@@ -1683,6 +1687,12 @@ func main() {
 		NotReadyLabels:          robotNotReadyLabels,
 	})
 	rootCmd := newRootCommand(func() error {
+		// Resolve and pin the color theme before anything renders, so every
+		// adaptive color — package-global styles, per-model renderers, and
+		// glamour markdown — agrees on light vs dark. Precedence:
+		// --theme > BV_THEME > ~/.config/bv/config.yaml > auto-detect. (bv-128)
+		ui.SetThemeOverride(effectiveThemePreference(*themeFlag, flag.CommandLine.Changed("theme"), os.Stderr))
+
 		modifierRules := []modifierFlagRule{
 			{modifier: "robot-diff", requires: []string{"diff-since"}},
 			{modifier: "robot-search", requires: []string{"search"}},
@@ -5585,6 +5595,76 @@ func countEdges(issues []model.Issue) int {
 		}
 	}
 	return count
+}
+
+// canonicalTheme maps user input to one of the recognized theme names
+// ("light", "dark", "auto"), ignoring case and surrounding whitespace.
+// Anything unrecognized (including empty) yields "".
+func canonicalTheme(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "light":
+		return "light"
+	case "dark":
+		return "dark"
+	case "auto":
+		return "auto"
+	}
+	return ""
+}
+
+// effectiveThemePreference resolves the color-theme preference with the
+// precedence: --theme flag > BV_THEME env var > `theme:` key in
+// ~/.config/bv/config.yaml > "" (auto-detect). An explicitly passed but
+// unrecognized --theme value warns on warnTo and resolves to "auto" — the flag
+// level is honored rather than silently falling through to a lower-precedence
+// source the user did not intend. (bv-128)
+func effectiveThemePreference(flagVal string, flagSet bool, warnTo io.Writer) string {
+	if flagSet {
+		if v := canonicalTheme(flagVal); v != "" {
+			return v
+		}
+		if warnTo != nil {
+			fmt.Fprintf(warnTo, "Warning: unknown --theme value %q (expected light, dark, or auto); using auto-detection\n", flagVal)
+		}
+		return "auto"
+	}
+	if v := canonicalTheme(os.Getenv("BV_THEME")); v != "" {
+		return v
+	}
+	if raw, ok := loadThemeFromUserConfig(); ok {
+		if v := canonicalTheme(raw); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// loadThemeFromUserConfig reads the top-level `theme:` key from
+// ~/.config/bv/config.yaml, returning (value, true) when present and
+// non-empty. Value validation is canonicalTheme's job. (bv-128)
+func loadThemeFromUserConfig() (string, bool) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return "", false
+	}
+	configPath := filepath.Join(homeDir, ".config", "bv", "config.yaml")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", false
+	}
+
+	var cfg struct {
+		Theme string `yaml:"theme"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", false
+	}
+	theme := strings.TrimSpace(cfg.Theme)
+	if theme == "" {
+		return "", false
+	}
+	return theme, true
 }
 
 func loadBackgroundModeFromUserConfig() (bool, bool) {
