@@ -2454,10 +2454,11 @@ func main() {
 			// No live reload for workspace mode (multiple files)
 			beadsPath = ""
 
-			// Automatically ensure .bv/ is in .gitignore at workspace root
+			// Automatically ensure .bv/ is git-ignored at the workspace root
+			// (prefers .git/info/exclude; opt out with BV_NO_GITIGNORE=1).
 			// Workspace config is typically at .bv/workspace.yaml, so project root is two levels up
 			workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
-			_ = loader.EnsureBVInGitignore(workspaceRoot)
+			_ = loader.EnsureBVIgnored(workspaceRoot)
 		} else {
 			// Load from single repo (original behavior)
 			var err error
@@ -2471,11 +2472,13 @@ func main() {
 			beadsDir, _ := loader.GetBeadsDir("")
 			beadsPath, _ = resolveSingleRepoWatchFile("")
 
-			// Automatically ensure .bv/ is in .gitignore to prevent polluting git
+			// Automatically ensure .bv/ is git-ignored to prevent polluting git
 			// with search indexes, baselines, and other bv-specific files.
+			// Prefers .git/info/exclude over the committed .gitignore; skipped
+			// outside git repos and when BV_NO_GITIGNORE=1 is set.
 			// This is done silently and only in single-repo mode.
 			projectDir := filepath.Dir(beadsDir)
-			_ = loader.EnsureBVInGitignore(projectDir)
+			_ = loader.EnsureBVIgnored(projectDir)
 		}
 		loadDuration := time.Since(loadStart)
 
@@ -8054,9 +8057,19 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 
-	// Generate correlation report
+	// Generate correlation report.
+	//
+	// Enable the persistent correlation caches for this process even though the
+	// export path does not run in robot mode (#182). GenerateReportCached is
+	// keyed on HEAD + beads + options, so a long-lived --watch-export watcher
+	// pays the full git-blob extraction once and then serves history.json
+	// incrementally: an unchanged committed history is a pure cache hit (no
+	// blob I/O), and a HEAD advance only re-reads the new commits' blobs via
+	// the per-commit event cache. Without this the watcher re-materialized the
+	// entire blob history on every re-export. BV_NO_CACHE=1 still opts out.
+	correlation.SetDiskCacheEnabled(true)
 	correlator := correlation.NewCorrelator(cwd, beadsPath)
-	report, err := correlator.GenerateReport(beadInfos, correlation.CorrelatorOptions{
+	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
 		Limit: 500, // Reasonable limit for time-travel
 	})
 	if err != nil {
